@@ -497,887 +497,2721 @@ class ASTIdentifier : public ASTWithAlias
 public:
     String name() const;
     void setShortName(const String & new_name);
-    
-    // Compound identifier support (database.table.column)
-    void restoreTable();
-    String shortName() const;
-    String databaseAndTable() const;
-    
-    void resetFullName();
-    void setFullName(const String & full_name);
+    void appendColumnName(WriteBuffer & ostr) const override;
     
     String getID(char delimiter) const override;
     ASTPtr clone() const override;
     void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
     
+    void updateTreeHashImpl(SipHash & hash_state) const override;
+    void forEachChild(std::function<void(const ASTPtr &)> func) const override;
+    
 private:
     String full_name;
-    std::vector<String> name_parts;
-    std::optional<String> semantic_name;
+    std::optional<String> semantic_hint;  // For disambiguation in complex queries
+    mutable std::optional<size_t> name_hash;  // Cached hash for performance
+};
+```
+
+**AST Node Specializations:**
+
+ClickHouse includes specialized AST nodes for different SQL constructs:
+
+```cpp
+class ASTLiteral : public ASTWithAlias
+{
+public:
+    Field value;
+    
+    // Optimization: pre-computed string representation
+    mutable std::optional<String> formatted_value;
+    
+    String getID(char delimiter) const override;
+    ASTPtr clone() const override;
+    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+    
+    void updateTreeHashImpl(SipHash & hash_state) const override;
+    
+    // Type-specific accessors
+    template<typename T>
+    T getValue() const { return value.get<T>(); }
+    
+    bool isNull() const { return value.isNull(); }
+    DataTypePtr getDataType() const;
+};
+
+class ASTTableExpression : public IAST
+{
+public:
+    ASTPtr database_and_table_name;
+    ASTPtr table_function;
+    ASTPtr subquery;
+    
+    // Join information
+    ASTPtr array_join;
+    ASTPtr join;
+    
+    String getID(char delimiter) const override;
+    ASTPtr clone() const override;
+    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+    
+    void forEachChild(std::function<void(const ASTPtr &)> func) const override;
+    
+    // Helper methods for query analysis
+    bool hasDatabase() const;
+    bool hasTable() const;
+    bool isSubquery() const;
+    bool isTableFunction() const;
 };
 ```
 
 #### 1.2.3 Visitor Pattern Implementation
 
-ClickHouse implements the Visitor pattern for AST traversal, allowing for separation of tree traversal logic from node-specific operations:
+ClickHouse implements a sophisticated visitor pattern for AST traversal and manipulation:
+
+**Base Visitor Interface:**
 
 ```cpp
-template <typename Derived>
+template<typename Derived>
 class ASTVisitor
 {
 public:
-    virtual ~ASTVisitor() = default;
-    
-    void visit(const ASTPtr & ast)
+    // CRTP pattern for static dispatch
+    template<typename T>
+    void visit(const T& node)
     {
-        if (!ast)
-            return;
-            
-        auto * derived = static_cast<Derived *>(this);
-        
-        if (auto * select = ast->as<ASTSelectQuery>())
-            derived->visitSelectQuery(*select);
-        else if (auto * function = ast->as<ASTFunction>())
-            derived->visitFunction(*function);
-        else if (auto * identifier = ast->as<ASTIdentifier>())
-            derived->visitIdentifier(*identifier);
-        // ... other node types
-        else
-            derived->visitOther(*ast);
+        static_cast<Derived*>(this)->visitImpl(node);
     }
     
-    virtual void visitSelectQuery(const ASTSelectQuery & node) { visitChildren(node); }
-    virtual void visitFunction(const ASTFunction & node) { visitChildren(node); }
-    virtual void visitIdentifier(const ASTIdentifier & node) { visitChildren(node); }
-    virtual void visitOther(const IAST & node) { visitChildren(node); }
-    
-private:
-    void visitChildren(const IAST & node)
+    template<typename T>
+    void visit(T& node)
     {
-        node.forEachChild([this](const ASTPtr & child) { visit(child); });
+        static_cast<Derived*>(this)->visitImpl(node);
+    }
+    
+    // Recursive traversal
+    void visitChildren(const IAST& node)
+    {
+        node.forEachChild([this](const ASTPtr& child) {
+            if (child)
+                visit(*child);
+        });
+    }
+    
+protected:
+    // Default implementation delegates to visitChildren
+    template<typename T>
+    void visitImpl(const T& node)
+    {
+        visitChildren(node);
     }
 };
 ```
 
-**Practical Visitor Implementations:**
+**Specialized Visitors:**
 
 ```cpp
-// Example: Collect all table names from a query
-class TableNameCollector : public ASTVisitor<TableNameCollector>
-{
-public:
-    std::set<String> table_names;
-    
-    void visitSelectQuery(const ASTSelectQuery & select)
-    {
-        if (select.tables())
-        {
-            visit(select.tables());
-        }
-        visitChildren(select);
-    }
-    
-    void visitTableExpression(const ASTTableExpression & table_expr)
-    {
-        if (table_expr.database_and_table_name)
-        {
-            if (auto * identifier = table_expr.database_and_table_name->as<ASTIdentifier>())
-            {
-                table_names.insert(identifier->name());
-            }
-        }
-        visitChildren(table_expr);
-    }
-};
-
-// Example: Replace function calls
-class FunctionReplacer : public ASTVisitor<FunctionReplacer>
+class ASTCloneVisitor : public ASTVisitor<ASTCloneVisitor>
 {
 private:
-    std::unordered_map<String, String> replacements;
+    std::unordered_map<const IAST*, ASTPtr> clone_map;
     
 public:
-    FunctionReplacer(std::unordered_map<String, String> replacements_)
-        : replacements(std::move(replacements_)) {}
-    
-    void visitFunction(ASTFunction & function)
+    ASTPtr getClone(const IAST& original)
     {
-        auto it = replacements.find(function.name);
-        if (it != replacements.end())
-        {
-            function.name = it->second;
-        }
-        visitChildren(function);
+        auto it = clone_map.find(&original);
+        return (it != clone_map.end()) ? it->second : nullptr;
     }
+    
+    void visitImpl(const ASTSelectQuery& node)
+    {
+        auto cloned = std::make_shared<ASTSelectQuery>();
+        
+        // Deep clone all children
+        cloned->distinct = node.distinct;
+        cloned->group_by_with_totals = node.group_by_with_totals;
+        // ... copy other flags
+        
+        // Clone child expressions
+        for (size_t i = 0; i < node.expressions.size(); ++i)
+        {
+            if (node.expressions[i])
+            {
+                visit(*node.expressions[i]);
+                cloned->expressions[i] = getClone(*node.expressions[i]);
+            }
+        }
+        
+        clone_map[&node] = cloned;
+    }
+    
+    void visitImpl(const ASTFunction& node)
+    {
+        auto cloned = std::make_shared<ASTFunction>();
+        
+        cloned->name = node.name;
+        cloned->is_window_function = node.is_window_function;
+        cloned->compute_after_aggregation = node.compute_after_aggregation;
+        
+        // Clone arguments
+        if (node.arguments)
+        {
+            visit(*node.arguments);
+            cloned->arguments = getClone(*node.arguments);
+        }
+        
+        // Clone parameters
+        if (node.parameters)
+        {
+            visit(*node.parameters);
+            cloned->parameters = getClone(*node.parameters);
+        }
+        
+        clone_map[&node] = cloned;
+    }
+    
+    // ... other node-specific implementations
+};
+
+class ASTHashVisitor : public ASTVisitor<ASTHashVisitor>
+{
+private:
+    SipHash hash_state;
+    
+public:
+    UInt64 getHash() const
+    {
+        return hash_state.get64();
+    }
+    
+    void visitImpl(const ASTFunction& node)
+    {
+        hash_state.update(node.name.data(), node.name.size());
+        hash_state.update(node.is_window_function);
+        hash_state.update(node.compute_after_aggregation);
+        
+        visitChildren(node);
+    }
+    
+    void visitImpl(const ASTLiteral& node)
+    {
+        node.value.updateHash(hash_state);
+    }
+    
+    void visitImpl(const ASTIdentifier& node)
+    {
+        String name = node.name();
+        hash_state.update(name.data(), name.size());
+    }
+    
+    // ... other implementations
 };
 ```
 
 #### 1.2.4 AST Optimization Passes
 
-ClickHouse performs multiple optimization passes on the AST before converting it to a query plan:
+ClickHouse implements multiple optimization passes that operate on the AST before query planning:
 
-**Constant Folding:**
+**Constant Folding Pass:**
 
 ```cpp
 class ConstantFoldingVisitor : public ASTVisitor<ConstantFoldingVisitor>
 {
+private:
+    ContextPtr context;
+    std::unordered_set<ASTPtr> modified_nodes;
+    
 public:
-    void visitFunction(ASTFunction & function)
+    explicit ConstantFoldingVisitor(ContextPtr context_) : context(context_) {}
+    
+    void visitImpl(ASTFunction& node)
     {
-        // First, optimize children
-        visitChildren(function);
+        // First, process children
+        visitChildren(node);
         
-        // Check if all arguments are constants
-        if (allArgumentsAreConstants(function))
+        // Check if all arguments are literals
+        if (node.arguments && allArgumentsAreLiterals(*node.arguments))
         {
             try
             {
-                // Evaluate the function with constant arguments
-                auto result = evaluateConstantExpression(function);
-                
-                // Replace the function with a literal
-                auto literal = std::make_shared<ASTLiteral>(result);
-                replaceNode(function, literal);
+                // Evaluate the function at compile time
+                auto result = evaluateConstantFunction(node);
+                if (result.has_value())
+                {
+                    // Replace function call with literal result
+                    auto literal = std::make_shared<ASTLiteral>();
+                    literal->value = result.value();
+                    
+                    // Replace in parent (requires parent tracking)
+                    replaceNode(&node, literal);
+                    modified_nodes.insert(literal);
+                }
             }
-            catch (...)
+            catch (const Exception&)
             {
-                // If evaluation fails, keep the original function
+                // Function cannot be evaluated at compile time
+                // (e.g., depends on runtime context)
             }
         }
     }
     
 private:
-    bool allArgumentsAreConstants(const ASTFunction & function)
+    bool allArgumentsAreLiterals(const IAST& arguments) const
     {
-        if (!function.arguments)
-            return true;
-            
-        for (const auto & arg : function.arguments->children)
+        bool all_literals = true;
+        arguments.forEachChild([&](const ASTPtr& child) {
+            if (!child->as<ASTLiteral>())
+                all_literals = false;
+        });
+        return all_literals;
+    }
+    
+    std::optional<Field> evaluateConstantFunction(const ASTFunction& node)
+    {
+        // Create a temporary block with literal values
+        Block block;
+        
+        // Extract argument values
+        std::vector<Field> arg_values;
+        if (node.arguments)
         {
-            if (!arg->as<ASTLiteral>())
-                return false;
+            node.arguments->forEachChild([&](const ASTPtr& child) {
+                if (auto literal = child->as<ASTLiteral>())
+                    arg_values.push_back(literal->value);
+            });
         }
-        return true;
+        
+        // Look up function in registry
+        auto function_builder = FunctionFactory::instance().get(node.name, context);
+        auto function = function_builder->build(/* column arguments */);
+        
+        // Execute function with constant arguments
+        // ... implementation details
+        
+        return std::nullopt;  // Placeholder
+    }
+    
+    void replaceNode(IAST* old_node, ASTPtr new_node)
+    {
+        // Implementation requires parent tracking
+        // This is a simplified version
     }
 };
 ```
 
-**Predicate Pushdown:**
+**Predicate Pushdown Pass:**
 
 ```cpp
 class PredicatePushdownVisitor : public ASTVisitor<PredicatePushdownVisitor>
 {
+private:
+    std::vector<ASTPtr> pushed_predicates;
+    
 public:
-    void visitSelectQuery(ASTSelectQuery & select)
+    void visitImpl(ASTSelectQuery& node)
     {
-        if (select.where() && select.tables())
+        // Extract predicates from WHERE clause
+        std::vector<ASTPtr> predicates;
+        if (node.refWhere())
         {
-            // Extract predicates that can be pushed down
-            auto predicates = extractPredicates(select.where());
-            
-            for (auto & predicate : predicates)
-            {
-                if (canPushDown(predicate, select))
-                {
-                    pushPredicateToTable(predicate, select);
-                    removePredicateFromWhere(predicate, select);
-                }
-            }
+            extractConjunctivePredicates(node.refWhere(), predicates);
         }
         
-        visitChildren(select);
+        // Try to push predicates down to subqueries
+        if (node.refTables())
+        {
+            pushPredicatesToTables(*node.refTables(), predicates);
+        }
+        
+        // Reconstruct WHERE clause with remaining predicates
+        if (!predicates.empty())
+        {
+            node.refWhere() = combinePredicates(predicates);
+        }
+        else
+        {
+            node.refWhere() = nullptr;
+        }
+        
+        visitChildren(node);
     }
     
 private:
-    std::vector<ASTPtr> extractPredicates(const ASTPtr & where_clause);
-    bool canPushDown(const ASTPtr & predicate, const ASTSelectQuery & select);
-    void pushPredicateToTable(const ASTPtr & predicate, ASTSelectQuery & select);
-    void removePredicateFromWhere(const ASTPtr & predicate, ASTSelectQuery & select);
+    void extractConjunctivePredicates(ASTPtr expr, std::vector<ASTPtr>& predicates)
+    {
+        if (auto function = expr->as<ASTFunction>())
+        {
+            if (function->name == "and" && function->arguments->children.size() == 2)
+            {
+                // Recursively extract from AND function
+                extractConjunctivePredicates(function->arguments->children[0], predicates);
+                extractConjunctivePredicates(function->arguments->children[1], predicates);
+                return;
+            }
+        }
+        
+        predicates.push_back(expr);
+    }
+    
+    void pushPredicatesToTables(IAST& tables, std::vector<ASTPtr>& predicates)
+    {
+        // Analyze which predicates can be pushed to which tables
+        // Based on column references and join conditions
+        // ... complex implementation
+    }
+    
+    ASTPtr combinePredicates(const std::vector<ASTPtr>& predicates)
+    {
+        if (predicates.empty())
+            return nullptr;
+        
+        if (predicates.size() == 1)
+            return predicates[0];
+        
+        // Combine with AND functions
+        auto result = predicates[0];
+        for (size_t i = 1; i < predicates.size(); ++i)
+        {
+            auto and_function = std::make_shared<ASTFunction>();
+            and_function->name = "and";
+            and_function->arguments = std::make_shared<ASTExpressionList>();
+            and_function->arguments->children = {result, predicates[i]};
+            result = and_function;
+        }
+        
+        return result;
+    }
 };
 ```
 
 #### 1.2.5 Type System Integration
 
-The AST integrates closely with ClickHouse's type system to enable type checking and inference:
+The AST integrates closely with ClickHouse's type system through the `IDataType` interface:
+
+**Type Inference Engine:**
 
 ```cpp
-class TypeChecker : public ASTVisitor<TypeChecker>
+class TypeInferenceVisitor : public ASTVisitor<TypeInferenceVisitor>
 {
 private:
     ContextPtr context;
-    std::unordered_map<IAST *, DataTypePtr> node_types;
+    std::unordered_map<const IAST*, DataTypePtr> type_map;
+    std::unordered_map<String, DataTypePtr> column_types;
     
 public:
-    explicit TypeChecker(ContextPtr context_) : context(context_) {}
+    explicit TypeInferenceVisitor(ContextPtr context_) : context(context_) {}
     
-    void visitFunction(const ASTFunction & function)
+    DataTypePtr getType(const IAST& node) const
     {
-        visitChildren(function);
-        
-        // Get argument types
-        DataTypes argument_types;
-        for (const auto & arg : function.arguments->children)
+        auto it = type_map.find(&node);
+        return (it != type_map.end()) ? it->second : nullptr;
+    }
+    
+    void setColumnType(const String& name, DataTypePtr type)
+    {
+        column_types[name] = type;
+    }
+    
+    void visitImpl(const ASTLiteral& node)
+    {
+        // Infer type from literal value
+        DataTypePtr type = inferTypeFromField(node.value);
+        type_map[&node] = type;
+    }
+    
+    void visitImpl(const ASTIdentifier& node)
+    {
+        // Look up column type
+        String name = node.name();
+        auto it = column_types.find(name);
+        if (it != column_types.end())
         {
-            auto it = node_types.find(arg.get());
-            if (it != node_types.end())
-                argument_types.push_back(it->second);
+            type_map[&node] = it->second;
+        }
+        else
+        {
+            throw Exception("Unknown column: " + name, ErrorCodes::UNKNOWN_IDENTIFIER);
+        }
+    }
+    
+    void visitImpl(const ASTFunction& node)
+    {
+        // First, infer types of arguments
+        visitChildren(node);
+        
+        // Collect argument types
+        DataTypes argument_types;
+        if (node.arguments)
+        {
+            node.arguments->forEachChild([&](const ASTPtr& child) {
+                auto arg_type = getType(*child);
+                if (!arg_type)
+                    throw Exception("Cannot infer type for function argument", ErrorCodes::TYPE_MISMATCH);
+                argument_types.push_back(arg_type);
+            });
         }
         
-        // Resolve function and determine return type
-        auto function_builder = FunctionFactory::instance().get(function.name, context);
-        auto function_base = function_builder->build(argument_types);
+        // Look up function and get return type
+        auto function_builder = FunctionFactory::instance().get(node.name, context);
+        auto function = function_builder->build(argument_types);
         
-        node_types[&function] = function_base->getReturnType();
+        DataTypePtr return_type = function->getResultType();
+        type_map[&node] = return_type;
     }
     
-    void visitIdentifier(const ASTIdentifier & identifier)
+private:
+    DataTypePtr inferTypeFromField(const Field& field)
     {
-        // Resolve identifier type from context
-        auto column_type = resolveIdentifierType(identifier);
-        node_types[&identifier] = column_type;
-    }
-    
-    DataTypePtr getNodeType(const IAST * node) const
-    {
-        auto it = node_types.find(node);
-        return it != node_types.end() ? it->second : nullptr;
+        switch (field.getType())
+        {
+            case Field::Types::Null:
+                return std::make_shared<DataTypeNothing>();
+            case Field::Types::UInt64:
+                return std::make_shared<DataTypeUInt64>();
+            case Field::Types::Int64:
+                return std::make_shared<DataTypeInt64>();
+            case Field::Types::Float64:
+                return std::make_shared<DataTypeFloat64>();
+            case Field::Types::String:
+                return std::make_shared<DataTypeString>();
+            case Field::Types::Array:
+            {
+                auto& array = field.get<Array>();
+                if (array.empty())
+                    return std::make_shared<DataTypeArray>(std::make_shared<DataTypeNothing>());
+                
+                // Infer element type from first element
+                DataTypePtr element_type = inferTypeFromField(array[0]);
+                return std::make_shared<DataTypeArray>(element_type);
+            }
+            default:
+                throw Exception("Cannot infer type from field", ErrorCodes::LOGICAL_ERROR);
+        }
     }
 };
 ```
 
-#### 1.2.6 AST Serialization and Debugging
-
-ClickHouse provides comprehensive debugging support for AST structures:
-
-**Tree Dumping:**
+**Type Compatibility Checker:**
 
 ```cpp
-void IAST::dumpTree(WriteBuffer & ostr, size_t indent) const
+class TypeCompatibilityChecker
 {
-    String indent_str(indent, ' ');
-    ostr << indent_str << getID() << "\n";
-    
-    forEachChild([&](const ASTPtr & child)
-    {
-        if (child)
-            child->dumpTree(ostr, indent + 2);
-        else
-            ostr << String(indent + 2, ' ') << "<NULL>\n";
-    });
-}
-```
-
-**Hash Computation for Caching:**
-
-```cpp
-void IAST::updateTreeHashImpl(SipHash & hash_state) const
-{
-    hash_state.update(getID());
-    
-    forEachChild([&](const ASTPtr & child)
-    {
-        if (child)
-        {
-            hash_state.update(child->getTreeHash());
-        }
-        else
-        {
-            hash_state.update(0);
-        }
-    });
-}
-```
-
-#### 1.2.7 Memory Layout Optimizations
-
-ClickHouse optimizes AST memory layout for performance:
-
-**Node Pooling:**
-
-```cpp
-class ASTPool
-{
-private:
-    std::vector<std::unique_ptr<char[]>> chunks;
-    size_t current_chunk_size = 4096;
-    size_t current_offset = 0;
-    
 public:
-    template<typename T, typename... Args>
-    T * allocate(Args&&... args)
+    static bool areCompatible(const DataTypePtr& left, const DataTypePtr& right)
     {
-        constexpr size_t size = sizeof(T);
-        constexpr size_t alignment = alignof(T);
+        // Check for exact match
+        if (left->equals(*right))
+            return true;
         
-        // Align current offset
-        current_offset = (current_offset + alignment - 1) & ~(alignment - 1);
+        // Check for numeric compatibility
+        if (isNumeric(left) && isNumeric(right))
+            return true;
         
-        if (current_offset + size > current_chunk_size)
+        // Check for string compatibility
+        if (isString(left) && isString(right))
+            return true;
+        
+        // Check for nullable compatibility
+        if (left->isNullable() || right->isNullable())
         {
-            allocateNewChunk(std::max(size, current_chunk_size));
-            current_offset = 0;
+            auto left_nested = removeNullable(left);
+            auto right_nested = removeNullable(right);
+            return areCompatible(left_nested, right_nested);
         }
         
-        T * result = reinterpret_cast<T *>(chunks.back().get() + current_offset);
-        current_offset += size;
+        return false;
+    }
+    
+    static DataTypePtr getCommonType(const DataTypes& types)
+    {
+        if (types.empty())
+            return nullptr;
         
-        new (result) T(std::forward<Args>(args)...);
+        DataTypePtr result = types[0];
+        for (size_t i = 1; i < types.size(); ++i)
+        {
+            result = getCommonTypeImpl(result, types[i]);
+            if (!result)
+                return nullptr;
+        }
+        
         return result;
     }
     
 private:
-    void allocateNewChunk(size_t size)
+    static bool isNumeric(const DataTypePtr& type)
     {
-        chunks.emplace_back(std::make_unique<char[]>(size));
-        current_chunk_size = size;
+        return type->isValueRepresentedByNumber();
+    }
+    
+    static bool isString(const DataTypePtr& type)
+    {
+        return isString(type) || isFixedString(type);
+    }
+    
+    static DataTypePtr removeNullable(const DataTypePtr& type)
+    {
+        if (auto nullable = typeid_cast<const DataTypeNullable*>(type.get()))
+            return nullable->getNestedType();
+        return type;
+    }
+    
+    static DataTypePtr getCommonTypeImpl(const DataTypePtr& left, const DataTypePtr& right)
+    {
+        // Complex type promotion logic
+        // ... implementation details
+        return nullptr;
     }
 };
 ```
 
-This comprehensive analysis of ClickHouse's AST construction demonstrates the sophisticated data structures and algorithms that enable efficient query representation and manipulation. The combination of smart memory management, visitor patterns, and optimization passes creates a robust foundation for query processing. hand-written recursive descent parser implemented in C++. The parser architecture consists of several key components:
+This detailed analysis of ClickHouse's AST construction demonstrates the sophisticated engineering behind query representation and manipulation. The combination of efficient memory management, flexible visitor patterns, comprehensive optimization passes, and tight type system integration creates a robust foundation for the entire query processing pipeline.
 
-**Core Parser Classes:**
-- `IParser` - Base interface for all parsers
-- `IParserBase` - Base implementation with common functionality
-- `TokenIterator` - Iterator for processing tokens
-- `ParserSelectQuery` - Main SELECT query parser
-- `ParserExpression` - Expression parser
-- `ParserCreateQuery` - DDL statement parser
+### 1.3 Query Analysis Engine (4,000 words)
 
-**Token Processing:**
+ClickHouse's query analysis engine represents one of the most sophisticated components of the entire system, responsible for transforming parsed AST into optimized execution plans. The system has undergone significant evolution, transitioning from a legacy analyzer to a modern, more powerful system that enables advanced optimizations and better query understanding.
+
+#### 1.3.1 Legacy vs New Analyzer Comparison
+
+ClickHouse has operated with two distinct analyzer systems, each with its own strengths and architectural decisions:
+
+**Legacy Analyzer Architecture:**
+
+The legacy analyzer, built around the `ExpressionAnalyzer` class, served ClickHouse well for many years but had several architectural limitations:
+
 ```cpp
-class TokenIterator {
-    const Token * tokens;
-    const Token * end;
-    size_t max_depth = 0;
-    size_t depth = 0;
+class ExpressionAnalyzer
+{
+private:
+    const ASTPtr query;
+    const SyntaxAnalyzerResultPtr syntax_analyzer_result;
+    ContextPtr context;
+    
+    // Legacy structures that became unwieldy
+    std::unordered_set<String> required_source_columns;
+    std::unordered_map<String, ASTPtr> aliases;
+    std::unordered_map<String, DataTypePtr> types;
+    
+    // Complex state management
+    mutable std::unordered_map<const IAST*, ExpressionActionsPtr> expression_actions_cache;
+    
+public:
+    ExpressionAnalyzer(
+        const ASTPtr & query_,
+        const SyntaxAnalyzerResultPtr & syntax_analyzer_result_,
+        ContextPtr context_);
+    
+    // Main analysis methods
+    ExpressionActionsPtr getActions(bool add_aliases = true, bool project_result = true);
+    ExpressionActionsPtr getConstActions();
+    
+    // Specialized analysis
+    bool hasAggregation() const;
+    bool hasWindow() const;
+    void collectUsedColumns(ExpressionActionsPtr & actions, bool visit_children = true);
+    
+    // Join analysis
+    JoinPtr makeTableJoin(const ASTTablesInSelectQueryElement & join_element);
+    
+private:
+    // Complex internal state management
+    void analyzeAggregation();
+    void analyzeWindow();
+    void makeSet(const ASTFunction * node, const Block & sample_block);
+    void makeExplicitSet(const ASTFunction * node, const Block & sample_block, bool create_ordered_set);
 };
 ```
 
-The parser processes tokens using a recursive descent approach where each parser component handles specific SQL constructs:
+**Problems with Legacy Analyzer:**
 
-**Parser Hierarchy:**
-- `ParserSelectQuery` recursively calls underlying parsers
-- `ParserExpressionWithOptionalAlias` handles expressions with aliases
-- `ParserTablesInSelectQuery` processes FROM/JOIN clauses
-- `ParserOrderByExpressionList` handles ORDER BY clauses
+1. **Monolithic Design**: The `ExpressionAnalyzer` became a massive class handling too many responsibilities
+2. **Complex State Management**: Mutable state scattered across multiple data structures
+3. **Limited Optimization Opportunities**: Difficult to implement advanced optimizations due to rigid structure
+4. **Poor Error Messages**: Complex control flow made it hard to provide meaningful error messages
+5. **Maintenance Burden**: Adding new features required understanding the entire complex system
 
-### 1.2 AST Node Structure
+**New Analyzer Architecture:**
 
-The Abstract Syntax Tree is represented by nodes implementing the `IAST` interface:
+The new analyzer, enabled by default since ClickHouse 24.3, introduces the `QueryTree` abstraction and a more modular design:
 
-**Core AST Classes:**
-- `IAST` - Base AST node interface
-- `ASTSelectQuery` - Represents SELECT statements
-- `ASTExpressionList` - List of expressions
-- `ASTFunction` - Function calls
-- `ASTIdentifier` - Column/table identifiers
-- `ASTLiteral` - Literal values
-
-**AST Memory Management:**
-AST nodes use shared ownership through `ASTPtr` (shared_ptr<IAST>). Each node contains:
-- Children nodes as `AST*` pointers
-- Position information for error reporting
-- Type information for semantic analysis
-
-### 1.3 Parsing Process Flow
-
-```
-SQL Text → Lexer → Tokens → TokenIterator → Parser → AST
-```
-
-**Detailed Steps:**
-1. **Lexical Analysis**: SQL text tokenized into keywords, identifiers, literals
-2. **Syntax Analysis**: Recursive descent parsing builds AST
-3. **Error Handling**: Position-aware error reporting with suggestions
-4. **Memory Management**: Automatic cleanup through shared_ptr
-
-## 2. Query Analysis and Semantic Processing
-
-### 2.1 Query Analyzer Architecture
-
-ClickHouse has two query analyzers:
-
-**Legacy Analyzer (`ExpressionAnalyzer`):**
-- Used for mutations and older query processing
-- Implements `ExpressionAnalyzer` and `ExpressionActions`
-- Handles semantic analysis and type checking
-
-**New Analyzer (`InterpreterSelectQueryAnalyzer`):**
-- Enabled by default in 24.3+
-- Uses `QueryTree` abstraction layer between AST and QueryPipeline
-- Implements advanced optimizations
-
-### 2.2 Query Tree Structure
-
-The new analyzer introduces the `QueryTree` representation:
-
-**Query Tree Components:**
-- `QueryNode` - Root query node
-- `TableNode` - Table references
-- `ColumnNode` - Column references
-- `FunctionNode` - Function calls
-- `JoinNode` - Join operations
-
-**Analyzer Pipeline:**
-```
-AST → QueryTree → Optimization Passes → QueryPlan → Pipeline
-```
-
-### 2.3 Type System and Inference
-
-**Type Resolution Process:**
-1. **Name Resolution**: Resolve table/column names to storage references
-2. **Type Checking**: Validate data types and implicit conversions
-3. **Function Resolution**: Resolve function overloads based on argument types
-4. **Aggregate Analysis**: Identify and validate aggregate functions
-
-**Key Classes:**
-- `IDataType` - Base type interface
-- `DataTypeFactory` - Type creation and resolution
-- `FunctionFactory` - Function resolution and instantiation
-
-## 3. Query Plan Generation
-
-### 3.1 QueryPlan Architecture
-
-The `QueryPlan` represents the logical execution plan:
-
-**Core Components:**
-- `QueryPlan` - Main plan container
-- `IQueryPlanStep` - Base step interface
-- `ReadFromMergeTree` - Table scan step
-- `FilterStep` - WHERE clause processing
-- `AggregatingStep` - GROUP BY operations
-
-**Step Types:**
 ```cpp
-class IQueryPlanStep {
-    virtual void transformPipeline(QueryPipelineBuilder & pipeline) = 0;
+class QueryAnalyzer
+{
+private:
+    ContextPtr context;
+    QueryTreeNodePtr query_tree;
+    AnalysisScope scope;
+    
+public:
+    explicit QueryAnalyzer(ContextPtr context_) : context(context_) {}
+    
+    QueryTreeNodePtr analyze(QueryTreeNodePtr query_tree_node);
+    
+private:
+    void analyzeImpl(QueryTreeNodePtr & node, AnalysisScope & scope);
+    void analyzeQuery(QueryNodePtr & query_node, AnalysisScope & scope);
+    void analyzeExpression(QueryTreeNodePtr & node, AnalysisScope & scope);
+    void analyzeFunction(FunctionNodePtr & function_node, AnalysisScope & scope);
+    void analyzeJoin(JoinNodePtr & join_node, AnalysisScope & scope);
+};
+
+// Separate, focused analyzer passes
+class QueryTreePassManager
+{
+private:
+    std::vector<std::unique_ptr<IQueryTreePass>> passes;
+    
+public:
+    void addPass(std::unique_ptr<IQueryTreePass> pass);
+    void run(QueryTreeNodePtr & query_tree, ContextPtr context);
+    
+private:
+    bool runSinglePass(IQueryTreePass & pass, QueryTreeNodePtr & query_tree, ContextPtr context);
+};
+```
+
+**Advantages of New Analyzer:**
+
+1. **Modular Design**: Separate concerns into focused components
+2. **Immutable Query Tree**: Reduces state management complexity
+3. **Extensible Pass System**: Easy to add new optimization passes
+4. **Better Error Reporting**: Clear error context and meaningful messages
+5. **Advanced Optimizations**: Enables sophisticated query transformations
+
+#### 1.3.2 QueryTree Abstraction
+
+The QueryTree represents a significant architectural advancement, providing a more structured and analyzable representation of queries:
+
+**QueryTree Node Hierarchy:**
+
+```cpp
+class IQueryTreeNode
+{
+public:
+    enum class NodeType
+    {
+        QUERY,
+        UNION,
+        TABLE,
+        TABLE_FUNCTION,
+        COLUMN,
+        CONSTANT,
+        FUNCTION,
+        LAMBDA,
+        SORT,
+        INTERPOLATE,
+        WINDOW,
+        ARRAY_JOIN,
+        JOIN,
+        LIST
+    };
+    
+    virtual ~IQueryTreeNode() = default;
+    
+    virtual NodeType getNodeType() const = 0;
     virtual String getName() const = 0;
+    virtual DataTypePtr getResultType() const = 0;
+    
+    // Tree navigation
+    virtual QueryTreeNodes getChildren() const = 0;
+    virtual void setChildren(QueryTreeNodes children) = 0;
+    
+    // Visitor support
+    virtual void dumpTreeImpl(WriteBuffer & buffer, FormatState & format_state, size_t indent) const = 0;
+    virtual bool isEqualImpl(const IQueryTreeNode & rhs) const = 0;
+    virtual void updateTreeHashImpl(HashState & hash_state) const = 0;
+    
+    // Cloning support
+    virtual QueryTreeNodePtr cloneImpl() const = 0;
+    
+protected:
+    // Common functionality
+    void dumpChildrenImpl(WriteBuffer & buffer, const QueryTreeNodes & children, FormatState & format_state, size_t indent) const;
+};
+
+using QueryTreeNodePtr = std::shared_ptr<IQueryTreeNode>;
+using QueryTreeNodes = std::vector<QueryTreeNodePtr>;
+```
+
+**Specialized Node Types:**
+
+```cpp
+class QueryNode : public IQueryTreeNode
+{
+private:
+    // Query structure
+    QueryTreeNodePtr projection;
+    QueryTreeNodePtr where;
+    QueryTreeNodePtr prewhere;
+    QueryTreeNodePtr having;
+    QueryTreeNodePtr group_by;
+    QueryTreeNodePtr order_by;
+    QueryTreeNodePtr limit_by;
+    QueryTreeNodePtr limit;
+    QueryTreeNodePtr offset;
+    
+    // Join table
+    QueryTreeNodePtr join_tree;
+    
+    // Query properties
+    bool is_subquery = false;
+    bool is_cte = false;
+    bool is_distinct = false;
+    bool has_totals = false;
+    
+    // Settings and context
+    SettingsChanges settings_changes;
+    
+public:
+    NodeType getNodeType() const override { return NodeType::QUERY; }
+    String getName() const override { return "Query"; }
+    
+    // Accessors
+    const QueryTreeNodePtr & getProjection() const { return projection; }
+    void setProjection(QueryTreeNodePtr projection_) { projection = std::move(projection_); }
+    
+    const QueryTreeNodePtr & getWhere() const { return where; }
+    void setWhere(QueryTreeNodePtr where_) { where = std::move(where_); }
+    
+    // ... other accessors
+    
+    DataTypePtr getResultType() const override;
+    QueryTreeNodes getChildren() const override;
+    void setChildren(QueryTreeNodes children) override;
+};
+
+class FunctionNode : public IQueryTreeNode
+{
+private:
+    String function_name;
+    QueryTreeNodes arguments;
+    QueryTreeNodes parameters;
+    
+    // Resolved function information
+    FunctionBasePtr function;
+    DataTypePtr result_type;
+    
+    // Function properties
+    bool is_aggregate_function = false;
+    bool is_window_function = false;
+    bool is_lambda_function = false;
+    
+public:
+    NodeType getNodeType() const override { return NodeType::FUNCTION; }
+    String getName() const override { return function_name; }
+    
+    const String & getFunctionName() const { return function_name; }
+    void setFunctionName(String function_name_) { function_name = std::move(function_name_); }
+    
+    const QueryTreeNodes & getArguments() const { return arguments; }
+    void setArguments(QueryTreeNodes arguments_) { arguments = std::move(arguments_); }
+    
+    // Function resolution
+    const FunctionBasePtr & getFunction() const { return function; }
+    void resolveFunction(FunctionBasePtr function_);
+    
+    DataTypePtr getResultType() const override { return result_type; }
+    QueryTreeNodes getChildren() const override;
+    void setChildren(QueryTreeNodes children) override;
+};
+
+class ColumnNode : public IQueryTreeNode
+{
+private:
+    ColumnIdentifier column_identifier;
+    DataTypePtr column_type;
+    
+    // Source information
+    QueryTreeNodePtr column_source;
+    std::optional<size_t> column_source_index;
+    
+public:
+    NodeType getNodeType() const override { return NodeType::COLUMN; }
+    String getName() const override { return column_identifier.getFullName(); }
+    
+    const ColumnIdentifier & getColumnIdentifier() const { return column_identifier; }
+    void setColumnIdentifier(ColumnIdentifier column_identifier_) { column_identifier = std::move(column_identifier_); }
+    
+    const QueryTreeNodePtr & getColumnSource() const { return column_source; }
+    void setColumnSource(QueryTreeNodePtr column_source_) { column_source = std::move(column_source_); }
+    
+    DataTypePtr getResultType() const override { return column_type; }
+    QueryTreeNodes getChildren() const override;
+    void setChildren(QueryTreeNodes children) override;
 };
 ```
 
-### 3.2 Optimization Phases
+#### 1.3.3 Semantic Analysis Phases
 
-**Query Plan Optimizations:**
-1. **Predicate Pushdown**: Move filters closer to data sources
-2. **Projection Pushdown**: Eliminate unnecessary columns early
-3. **Join Reordering**: Optimize join execution order
-4. **Index Selection**: Choose optimal indexes for execution
+The new analyzer performs semantic analysis through a series of well-defined phases:
 
-**Implementation Details:**
-- `QueryPlanOptimizationSettings` controls optimization behavior
-- `buildQueryPlan()` constructs the initial plan
-- `optimizeTree()` applies optimization passes
+**Phase 1: Scope Resolution**
 
-### 3.3 MergeTree Query Planning
-
-**ReadFromMergeTree Step:**
 ```cpp
-class ReadFromMergeTree : public ISourceStep {
+class AnalysisScope
+{
+private:
+    // Scope hierarchy
+    AnalysisScope * parent_scope = nullptr;
+    std::vector<std::unique_ptr<AnalysisScope>> child_scopes;
+    
+    // Available columns and aliases
+    std::unordered_map<String, QueryTreeNodePtr> alias_name_to_expression_node;
+    std::unordered_map<String, QueryTreeNodePtr> column_name_to_column_node;
+    
+    // Table information
+    std::unordered_map<String, QueryTreeNodePtr> table_name_to_table_node;
+    std::unordered_map<String, TableExpressionData> table_expression_name_to_table_expression_data;
+    
+    // CTE (Common Table Expressions)
+    std::unordered_map<String, QueryTreeNodePtr> cte_name_to_query_node;
+    
+    // Lambda parameters
+    std::unordered_set<String> lambda_argument_names;
+    
+public:
+    // Scope management
+    AnalysisScope * getParentScope() const { return parent_scope; }
+    AnalysisScope & createChildScope() {
+        auto child_scope = std::make_unique<AnalysisScope>();
+        child_scope->parent_scope = this;
+        auto & child_scope_ref = *child_scope;
+        child_scopes.push_back(std::move(child_scope));
+        return child_scope_ref;
+    }
+    
+    // Identifier resolution
+    IdentifierResolveResult tryResolveIdentifier(const Identifier & identifier) const;
+    QueryTreeNodePtr resolveIdentifier(const Identifier & identifier) const;
+    
+    // Alias management
+    void addAlias(const String & alias_name, QueryTreeNodePtr expression_node);
+    QueryTreeNodePtr tryResolveAlias(const String & alias_name) const;
+    
+    // Table management
+    void addTableExpression(const String & table_expression_name, QueryTreeNodePtr table_expression_node);
+    QueryTreeNodePtr tryResolveTableExpression(const String & table_expression_name) const;
+    
+    // CTE management
+    void addCTE(const String & cte_name, QueryTreeNodePtr cte_query_node);
+    QueryTreeNodePtr tryResolveCTE(const String & cte_name) const;
+};
+```
+
+**Phase 2: Type Resolution and Checking**
+
+```cpp
+class TypeAnalyzer
+{
+private:
+    ContextPtr context;
+    
+public:
+    explicit TypeAnalyzer(ContextPtr context_) : context(context_) {}
+    
+    void analyzeNode(QueryTreeNodePtr & node, AnalysisScope & scope)
+    {
+        switch (node->getNodeType())
+        {
+            case IQueryTreeNode::NodeType::FUNCTION:
+                analyzeFunctionNode(node, scope);
+                break;
+            case IQueryTreeNode::NodeType::COLUMN:
+                analyzeColumnNode(node, scope);
+                break;
+            case IQueryTreeNode::NodeType::CONSTANT:
+                analyzeConstantNode(node, scope);
+                break;
+            // ... other node types
+        }
+    }
+    
+private:
+    void analyzeFunctionNode(QueryTreeNodePtr & node, AnalysisScope & scope)
+    {
+        auto & function_node = node->as<FunctionNode &>();
+        
+        // Analyze arguments first
+        auto & arguments = function_node.getArguments();
+        for (auto & argument : arguments)
+            analyzeNode(argument, scope);
+        
+        // Collect argument types
+        DataTypes argument_types;
+        for (const auto & argument : arguments)
+            argument_types.push_back(argument->getResultType());
+        
+        // Resolve function
+        auto function_builder = FunctionFactory::instance().get(function_node.getFunctionName(), context);
+        auto function_base = function_builder->build(argument_types);
+        
+        function_node.resolveFunction(function_base);
+    }
+    
+    void analyzeColumnNode(QueryTreeNodePtr & node, AnalysisScope & scope)
+    {
+        auto & column_node = node->as<ColumnNode &>();
+        
+        // Resolve column source
+        auto column_source = scope.resolveIdentifier(column_node.getColumnIdentifier());
+        if (!column_source)
+            throw Exception("Unknown column: " + column_node.getColumnIdentifier().getFullName(), 
+                          ErrorCodes::UNKNOWN_IDENTIFIER);
+        
+        column_node.setColumnSource(column_source);
+        
+        // Set column type from source
+        if (auto table_node = column_source->as<TableNode>())
+        {
+            auto storage = table_node->getStorage();
+            auto metadata = storage->getInMemoryMetadataPtr();
+            auto column_type = metadata->getColumns().getPhysical(column_node.getColumnIdentifier().getColumnName()).type;
+            column_node.setColumnType(column_type);
+        }
+    }
+    
+    void analyzeConstantNode(QueryTreeNodePtr & node, AnalysisScope & scope)
+    {
+        auto & constant_node = node->as<ConstantNode &>();
+        
+        // Infer type from constant value
+        DataTypePtr type = inferTypeFromField(constant_node.getValue());
+        constant_node.setResultType(type);
+    }
+};
+```
+
+**Phase 3: Expression Optimization**
+
+```cpp
+class ExpressionOptimizer
+{
+private:
+    ContextPtr context;
+    
+public:
+    explicit ExpressionOptimizer(ContextPtr context_) : context(context_) {}
+    
+    void optimizeNode(QueryTreeNodePtr & node)
+    {
+        switch (node->getNodeType())
+        {
+            case IQueryTreeNode::NodeType::FUNCTION:
+                optimizeFunctionNode(node);
+                break;
+            case IQueryTreeNode::NodeType::QUERY:
+                optimizeQueryNode(node);
+                break;
+            // ... other node types
+        }
+        
+        // Recursively optimize children
+        auto children = node->getChildren();
+        for (auto & child : children)
+            optimizeNode(child);
+        node->setChildren(std::move(children));
+    }
+    
+private:
+    void optimizeFunctionNode(QueryTreeNodePtr & node)
+    {
+        auto & function_node = node->as<FunctionNode &>();
+        
+        // Constant folding
+        if (canFoldFunction(function_node))
+        {
+            auto result = evaluateConstantFunction(function_node);
+            if (result.has_value())
+            {
+                // Replace function with constant
+                auto constant_node = std::make_shared<ConstantNode>(result.value());
+                node = constant_node;
+                return;
+            }
+        }
+        
+        // Function-specific optimizations
+        if (function_node.getFunctionName() == "and")
+            optimizeAndFunction(function_node);
+        else if (function_node.getFunctionName() == "or")
+            optimizeOrFunction(function_node);
+        else if (function_node.getFunctionName() == "if")
+            optimizeIfFunction(function_node);
+    }
+    
+    void optimizeAndFunction(FunctionNode & function_node)
+    {
+        auto & arguments = function_node.getArguments();
+        
+        // Remove constant true arguments
+        arguments.erase(
+            std::remove_if(arguments.begin(), arguments.end(),
+                [](const QueryTreeNodePtr & arg) {
+                    if (auto constant = arg->as<ConstantNode>())
+                        return constant->getValue().get<bool>() == true;
+                    return false;
+                }),
+            arguments.end());
+        
+        // If any argument is constant false, replace entire expression with false
+        for (const auto & arg : arguments)
+        {
+            if (auto constant = arg->as<ConstantNode>())
+            {
+                if (constant->getValue().get<bool>() == false)
+                {
+                    function_node.setArguments({std::make_shared<ConstantNode>(Field(false))});
+                    return;
+                }
+            }
+        }
+        
+        // If only one argument remains, replace function with argument
+        if (arguments.size() == 1)
+        {
+            // This requires parent node update, simplified here
+        }
+    }
+    
+    bool canFoldFunction(const FunctionNode & function_node) const
+    {
+        // Check if all arguments are constants
+        for (const auto & arg : function_node.getArguments())
+        {
+            if (arg->getNodeType() != IQueryTreeNode::NodeType::CONSTANT)
+                return false;
+        }
+        return true;
+    }
+    
+    std::optional<Field> evaluateConstantFunction(const FunctionNode & function_node)
+    {
+        try
+        {
+            // Create temporary block with constant columns
+            Block block;
+            ColumnsWithTypeAndName arguments;
+            
+            for (const auto & arg : function_node.getArguments())
+            {
+                auto constant_node = arg->as<ConstantNode>();
+                auto constant_column = ColumnConst::create(
+                    constant_node->getResultType()->createColumn(),
+                    constant_node->getValue()
+                );
+                
+                arguments.emplace_back(
+                    std::move(constant_column),
+                    constant_node->getResultType(),
+                    "arg_" + std::to_string(arguments.size())
+                );
+            }
+            
+            // Execute function
+            auto function = function_node.getFunction();
+            auto result_column = function->execute(arguments, function->getResultType(), 1);
+            
+            // Extract constant value
+            if (auto const_column = typeid_cast<const ColumnConst *>(result_column.get()))
+                return const_column->getField();
+            
+            return std::nullopt;
+        }
+        catch (...)
+        {
+            return std::nullopt;
+        }
+    }
+};
+```
+
+#### 1.3.4 Symbol Resolution
+
+Symbol resolution in the new analyzer is more sophisticated and handles complex cases like nested scopes, CTEs, and ambiguous references:
+
+**Identifier Resolution Engine:**
+
+```cpp
+class IdentifierResolver
+{
+private:
+    AnalysisScope & scope;
+    ContextPtr context;
+    
+public:
+    IdentifierResolver(AnalysisScope & scope_, ContextPtr context_) 
+        : scope(scope_), context(context_) {}
+    
+    IdentifierResolveResult resolveIdentifier(const Identifier & identifier)
+    {
+        // Try different resolution strategies in order of precedence
+        
+        // 1. Lambda arguments (highest precedence)
+        if (auto result = tryResolveLambdaArgument(identifier))
+            return result;
+        
+        // 2. Aliases in current scope
+        if (auto result = tryResolveAlias(identifier))
+            return result;
+        
+        // 3. Columns from table expressions
+        if (auto result = tryResolveColumn(identifier))
+            return result;
+        
+        // 4. CTE (Common Table Expressions)
+        if (auto result = tryResolveCTE(identifier))
+            return result;
+        
+        // 5. Table names
+        if (auto result = tryResolveTable(identifier))
+            return result;
+        
+        // 6. Global scope (databases, functions, etc.)
+        if (auto result = tryResolveGlobal(identifier))
+            return result;
+        
+        throw Exception("Unknown identifier: " + identifier.getFullName(), 
+                       ErrorCodes::UNKNOWN_IDENTIFIER);
+    }
+    
+private:
+    IdentifierResolveResult tryResolveColumn(const Identifier & identifier)
+    {
+        std::vector<IdentifierResolveResult> candidates;
+        
+        // Search in all available table expressions
+        for (const auto & [table_name, table_data] : scope.getTableExpressions())
+        {
+            if (auto column_node = tryResolveColumnInTable(identifier, table_data))
+            {
+                candidates.emplace_back(IdentifierResolveResult{
+                    .resolved_identifier = column_node,
+                    .resolve_place = IdentifierResolvePlace::TABLE_EXPRESSION,
+                    .table_expression_name = table_name
+                });
+            }
+        }
+        
+        if (candidates.empty())
+            return {};
+        
+        if (candidates.size() == 1)
+            return candidates[0];
+        
+        // Handle ambiguous references
+        return resolveAmbiguousColumn(identifier, candidates);
+    }
+    
+    QueryTreeNodePtr tryResolveColumnInTable(const Identifier & identifier, const TableExpressionData & table_data)
+    {
+        // Handle qualified identifiers (table.column)
+        if (identifier.isCompound())
+        {
+            auto table_name = identifier.getParts()[0];
+            auto column_name = identifier.getParts()[1];
+            
+            if (table_name != table_data.table_name && table_name != table_data.table_alias)
+                return nullptr;
+            
+            return findColumnInTableMetadata(column_name, table_data);
+        }
+        
+        // Handle unqualified identifiers (column)
+        return findColumnInTableMetadata(identifier.getFullName(), table_data);
+    }
+    
+    QueryTreeNodePtr findColumnInTableMetadata(const String & column_name, const TableExpressionData & table_data)
+    {
+        if (auto table_node = table_data.table_expression->as<TableNode>())
+        {
+            auto storage = table_node->getStorage();
+            auto metadata = storage->getInMemoryMetadataPtr();
+            
+            if (metadata->getColumns().hasPhysical(column_name))
+            {
+                auto column_type = metadata->getColumns().getPhysical(column_name).type;
+                auto column_node = std::make_shared<ColumnNode>();
+                column_node->setColumnIdentifier(ColumnIdentifier(column_name));
+                column_node->setColumnType(column_type);
+                column_node->setColumnSource(table_data.table_expression);
+                return column_node;
+            }
+        }
+        
+        return nullptr;
+    }
+    
+    IdentifierResolveResult resolveAmbiguousColumn(const Identifier & identifier, 
+                                                  const std::vector<IdentifierResolveResult> & candidates)
+    {
+        // Strategy 1: Prefer columns from tables without aliases
+        std::vector<IdentifierResolveResult> unaliased_candidates;
+        for (const auto & candidate : candidates)
+        {
+            if (candidate.table_expression_name == candidate.table_expression_alias)
+                unaliased_candidates.push_back(candidate);
+        }
+        
+        if (unaliased_candidates.size() == 1)
+            return unaliased_candidates[0];
+        
+        // Strategy 2: Check if all candidates resolve to the same physical column
+        bool all_same = true;
+        auto first_column = candidates[0].resolved_identifier->as<ColumnNode>();
+        
+        for (size_t i = 1; i < candidates.size(); ++i)
+        {
+            auto candidate_column = candidates[i].resolved_identifier->as<ColumnNode>();
+            if (first_column->getColumnIdentifier() != candidate_column->getColumnIdentifier() ||
+                !first_column->getResultType()->equals(*candidate_column->getResultType()))
+            {
+                all_same = false;
+                break;
+            }
+        }
+        
+        if (all_same)
+            return candidates[0];
+        
+        // Strategy 3: Report ambiguous reference error
+        std::vector<String> candidate_sources;
+        for (const auto & candidate : candidates)
+            candidate_sources.push_back(candidate.table_expression_name);
+        
+        throw Exception(
+            "Ambiguous column reference: " + identifier.getFullName() + 
+            " could refer to columns from: " + boost::algorithm::join(candidate_sources, ", "),
+            ErrorCodes::AMBIGUOUS_IDENTIFIER);
+    }
+};
+
+struct IdentifierResolveResult
+{
+    QueryTreeNodePtr resolved_identifier;
+    IdentifierResolvePlace resolve_place;
+    String table_expression_name;
+    String table_expression_alias;
+    
+    bool isResolved() const { return resolved_identifier != nullptr; }
+};
+
+enum class IdentifierResolvePlace
+{
+    NONE,
+    LAMBDA_ARGUMENT,
+    ALIAS,
+    TABLE_EXPRESSION,
+    CTE,
+    TABLE,
+    GLOBAL
+};
+```
+
+This comprehensive query analysis engine provides the foundation for all subsequent query processing steps. The transition from the legacy analyzer to the new QueryTree-based system represents a significant architectural improvement, enabling more sophisticated optimizations, better error reporting, and easier maintenance of the codebase.
+
+The new analyzer's modular design, with its clear separation of concerns and well-defined interfaces, makes it much easier to extend ClickHouse with new SQL features and optimization passes. The QueryTree abstraction provides a clean, immutable representation of queries that can be safely transformed by multiple optimization passes without the complex state management issues that plagued the legacy system.
+
+Now let me continue with section 1.4 to complete Phase 1:
+
+### 1.4 Query Planning Architecture (3,000 words)
+
+ClickHouse's query planning architecture represents the critical bridge between analyzed queries and executable pipelines. The QueryPlan system provides a structured, optimizable representation of query execution steps that can be transformed through various optimization passes before being converted into actual execution pipelines.
+
+#### 1.4.1 QueryPlan Structure
+
+The QueryPlan serves as an intermediate representation that captures the logical execution steps required to process a query:
+
+```cpp
+class QueryPlan
+{
+private:
+    QueryPlanStepPtr root_step;
+    std::vector<std::unique_ptr<QueryPlanStep>> steps;
+    
+    // Optimization context
+    QueryPlanOptimizationSettings optimization_settings;
+    ContextPtr context;
+    
+public:
+    QueryPlan() = default;
+    ~QueryPlan() = default;
+    
+    // Plan construction
+    void addStep(QueryPlanStepPtr step);
+    void addStepToRoot(QueryPlanStepPtr step);
+    
+    // Plan structure access
+    QueryPlanStepPtr getRootStep() const { return root_step; }
+    const std::vector<std::unique_ptr<QueryPlanStep>>& getSteps() const { return steps; }
+    
+    // Optimization
+    void optimize(const QueryPlanOptimizationSettings & settings);
+    
+    // Pipeline construction
+    QueryPipelineBuilderPtr buildQueryPipeline(
+        const QueryPlanOptimizationSettings & optimization_settings,
+        const BuildQueryPipelineSettings & build_pipeline_settings);
+    
+    // Introspection
+    void explainPlan(WriteBuffer & buffer, const ExplainPlanOptions & options) const;
+    void explainPipeline(WriteBuffer & buffer, const ExplainPipelineOptions & options) const;
+    
+private:
+    void checkInitialized() const;
+    void checkNotCompleted() const;
+};
+```
+
+**QueryPlan Step Hierarchy:**
+
+```cpp
+class IQueryPlanStep
+{
+public:
+    virtual ~IQueryPlanStep() = default;
+    
+    virtual String getName() const = 0;
+    virtual String getStepDescription() const = 0;
+    
+    // Input/Output streams
+    virtual DataStreams getInputStreams() const = 0;
+    virtual DataStream getOutputStream() const = 0;
+    
+    // Pipeline construction
+    virtual QueryPipelineBuilderPtr updatePipeline(
+        QueryPipelineBuilders pipelines,
+        const BuildQueryPipelineSettings & settings) = 0;
+    
+    // Optimization
+    virtual void describePipeline(FormatSettings & settings) const {}
+    virtual void describeActions(JSONBuilder::JSONMap & map) const {}
+    virtual void describeIndexes(JSONBuilder::JSONMap & map) const {}
+    
+    // Step transformation
+    virtual void transformPipeline(const std::function<void(QueryPipelineBuilder &)> & transform) {}
+    
+protected:
+    // Child steps management
+    std::vector<std::unique_ptr<IQueryPlanStep>> children;
+    
+public:
+    void addChild(std::unique_ptr<IQueryPlanStep> child);
+    const std::vector<std::unique_ptr<IQueryPlanStep>>& getChildren() const { return children; }
+};
+```
+
+**Specialized Step Types:**
+
+```cpp
+class ReadFromMergeTree : public IQueryPlanStep
+{
+private:
     MergeTreeData & storage;
-    SelectQueryInfo & query_info;
+    StorageSnapshotPtr storage_snapshot;
+    
+    // Query parameters
     Names required_columns;
+    SelectQueryInfo query_info;
+    ContextPtr context;
+    
+    // Optimization results
+    MergeTreeDataSelectExecutor::PartitionIdToMaxBlock max_block_numbers_to_read;
+    Poco::Logger * log;
+    
+    // Performance characteristics
+    size_t requested_num_streams = 1;
+    size_t output_streams = 0;
+    
+public:
+    ReadFromMergeTree(
+        MergeTreeData & storage_,
+        StorageSnapshotPtr storage_snapshot_,
+        Names required_columns_,
+        SelectQueryInfo & query_info_,
+        ContextPtr context_,
+        size_t num_streams_);
+    
+    String getName() const override { return "ReadFromMergeTree"; }
+    String getStepDescription() const override;
+    
+    DataStreams getInputStreams() const override { return {}; }
+    DataStream getOutputStream() const override;
+    
+    QueryPipelineBuilderPtr updatePipeline(
+        QueryPipelineBuilders pipelines,
+        const BuildQueryPipelineSettings & settings) override;
+    
+    void describeIndexes(JSONBuilder::JSONMap & map) const override;
+    void describeActions(JSONBuilder::JSONMap & map) const override;
+    
+private:
+    void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings & settings);
+    Pipe readFromPool(const Names & column_names, size_t num_streams, size_t min_marks_for_concurrent_read);
+};
+
+class FilterStep : public IQueryPlanStep
+{
+private:
+    DataStream input_stream;
+    ActionsDAGPtr filter_actions;
+    String filter_column_name;
+    bool remove_filter_column;
+    
+public:
+    FilterStep(
+        const DataStream & input_stream_,
+        ActionsDAGPtr filter_actions_,
+        String filter_column_name_,
+        bool remove_filter_column_);
+    
+    String getName() const override { return "Filter"; }
+    String getStepDescription() const override;
+    
+    DataStreams getInputStreams() const override { return {input_stream}; }
+    DataStream getOutputStream() const override;
+    
+    QueryPipelineBuilderPtr updatePipeline(
+        QueryPipelineBuilders pipelines,
+        const BuildQueryPipelineSettings & settings) override;
+    
+    void describeActions(JSONBuilder::JSONMap & map) const override;
+    
+    const ActionsDAGPtr & getFilterActions() const { return filter_actions; }
+    const String & getFilterColumnName() const { return filter_column_name; }
+};
+
+class AggregatingStep : public IQueryPlanStep
+{
+private:
+    DataStream input_stream;
+    Aggregator::Params params;
+    GroupingSetsParamsList grouping_sets_params;
+    bool final;
     size_t max_block_size;
-    size_t max_streams;
+    size_t aggregation_in_order_max_block_bytes;
+    size_t merge_threads;
+    size_t temporary_data_merge_threads;
+    
+    // Optimization flags
+    bool storage_has_evenly_distributed_read;
+    bool group_by_use_nulls;
+    
+public:
+    AggregatingStep(
+        const DataStream & input_stream_,
+        Aggregator::Params params_,
+        GroupingSetsParamsList grouping_sets_params_,
+        bool final_,
+        size_t max_block_size_,
+        size_t aggregation_in_order_max_block_bytes_,
+        size_t merge_threads_,
+        size_t temporary_data_merge_threads_,
+        bool storage_has_evenly_distributed_read_,
+        bool group_by_use_nulls_);
+    
+    String getName() const override { return "Aggregating"; }
+    String getStepDescription() const override;
+    
+    DataStreams getInputStreams() const override { return {input_stream}; }
+    DataStream getOutputStream() const override;
+    
+    QueryPipelineBuilderPtr updatePipeline(
+        QueryPipelineBuilders pipelines,
+        const BuildQueryPipelineSettings & settings) override;
+    
+    void describeActions(JSONBuilder::JSONMap & map) const override;
+    void describePipeline(FormatSettings & settings) const override;
+    
+    const Aggregator::Params & getParams() const { return params; }
 };
 ```
 
-**Key Optimizations:**
-- **Index Usage**: Primary key and secondary indexes
-- **Part Pruning**: Skip irrelevant data parts
-- **Granule Selection**: Process only relevant granules
-- **Projection Usage**: Utilize materialized projections
+#### 1.4.2 Step Hierarchy and Relationships
 
-## 4. Pipeline Construction and Execution
+The QueryPlan step hierarchy is designed to represent all possible query operations in a composable manner:
 
-### 4.1 Processor-Based Pipeline
+**Data Source Steps:**
+- `ReadFromMergeTree`: Reads data from MergeTree tables with optimizations
+- `ReadFromMemoryStorage`: Reads from in-memory tables
+- `ReadFromRemote`: Reads data from remote shards in distributed queries
+- `ReadFromPreparedSource`: Reads from pre-prepared data sources
 
-ClickHouse uses a processor-based execution model:
+**Transformation Steps:**
+- `FilterStep`: Applies WHERE conditions and other filters
+- `ExpressionStep`: Evaluates expressions and projections
+- `SortingStep`: Sorts data according to ORDER BY clauses
+- `LimitStep`: Applies LIMIT and OFFSET restrictions
 
-**Core Interfaces:**
+**Aggregation Steps:**
+- `AggregatingStep`: Performs GROUP BY aggregations
+- `MergingAggregatedStep`: Merges pre-aggregated data
+- `TotalsHavingStep`: Handles HAVING conditions and TOTALS
+
+**Join Steps:**
+- `JoinStep`: Performs various types of joins
+- `FilledJoinStep`: Handles special join optimizations
+- `ArrayJoinStep`: Processes ARRAY JOIN operations
+
+**Output Steps:**
+- `LimitByStep`: Implements LIMIT BY functionality
+- `DistinctStep`: Removes duplicate rows
+- `ExtremesStep`: Calculates query extremes
+
+#### 1.4.3 Optimization Rules Engine
+
+ClickHouse employs a sophisticated rule-based optimization system that transforms QueryPlan structures:
+
 ```cpp
-class IProcessor {
+class QueryPlanOptimizationSettings
+{
+public:
+    // Optimization toggles
+    bool optimize_plan = true;
+    bool read_in_order = true;
+    bool distinct_in_order = true;
+    bool optimize_sorting = true;
+    bool optimize_duplicate_order_by_and_distinct = true;
+    bool optimize_monotonous_functions_in_order_by = true;
+    bool optimize_functions_to_subcolumns = true;
+    bool optimize_using_constraints = true;
+    bool optimize_substitute_columns = true;
+    bool optimize_count_from_files = true;
+    
+    // Performance tuning
+    size_t max_threads = 0;
+    size_t max_streams_to_max_threads_ratio = 1;
+    size_t max_streams_for_merge_tree_reading = 0;
+    
+    // Debugging
+    bool build_sets_from_right_part_of_join = true;
+    bool optimize_prewhere = true;
+    bool force_primary_key = false;
+    
+    void loadFromContext(ContextPtr context);
+};
+
+class QueryPlanOptimizer
+{
+private:
+    std::vector<std::unique_ptr<QueryPlanOptimizationRule>> rules;
+    QueryPlanOptimizationSettings settings;
+    
+public:
+    explicit QueryPlanOptimizer(const QueryPlanOptimizationSettings & settings_);
+    
+    void addRule(std::unique_ptr<QueryPlanOptimizationRule> rule);
+    void optimize(QueryPlan & plan) const;
+    
+private:
+    bool applyRules(QueryPlan & plan) const;
+    void collectRules();
+};
+```
+
+**Core Optimization Rules:**
+
+```cpp
+class MergeExpressions : public QueryPlanOptimizationRule
+{
+public:
+    String getName() const override { return "MergeExpressions"; }
+    String getDescription() const override { return "Merge consecutive Expression steps"; }
+    
+    bool match(const QueryPlanStepPtr & step) const override
+    {
+        if (const auto * expression = typeid_cast<const ExpressionStep *>(step.get()))
+        {
+            if (expression->getChildren().size() == 1)
+            {
+                return typeid_cast<const ExpressionStep *>(expression->getChildren()[0].get()) != nullptr;
+            }
+        }
+        return false;
+    }
+    
+    void transform(QueryPlanStepPtr & step) const override
+    {
+        auto * expression_step = static_cast<ExpressionStep *>(step.get());
+        auto * child_expression = static_cast<ExpressionStep *>(expression_step->getChildren()[0].get());
+        
+        // Merge the two expression steps
+        auto merged_actions = ActionsDAG::merge(
+            std::move(*child_expression->getActions()),
+            std::move(*expression_step->getActions())
+        );
+        
+        auto merged_step = std::make_unique<ExpressionStep>(
+            child_expression->getInputStreams()[0],
+            std::move(merged_actions)
+        );
+        
+        step = std::move(merged_step);
+    }
+};
+
+class PushDownFilterThroughExpression : public QueryPlanOptimizationRule
+{
+public:
+    String getName() const override { return "PushDownFilterThroughExpression"; }
+    String getDescription() const override { return "Push filter conditions through expression steps"; }
+    
+    bool match(const QueryPlanStepPtr & step) const override
+    {
+        if (const auto * filter = typeid_cast<const FilterStep *>(step.get()))
+        {
+            if (filter->getChildren().size() == 1)
+            {
+                return typeid_cast<const ExpressionStep *>(filter->getChildren()[0].get()) != nullptr;
+            }
+        }
+        return false;
+    }
+    
+    void transform(QueryPlanStepPtr & step) const override
+    {
+        auto * filter_step = static_cast<FilterStep *>(step.get());
+        auto * expression_step = static_cast<ExpressionStep *>(filter_step->getChildren()[0].get());
+        
+        // Analyze if filter can be pushed down
+        const auto & filter_actions = filter_step->getFilterActions();
+        const auto & expression_actions = expression_step->getActions();
+        
+        auto [pushable_filter, remaining_filter] = splitFilterActions(
+            filter_actions, 
+            expression_actions,
+            filter_step->getFilterColumnName()
+        );
+        
+        if (pushable_filter)
+        {
+            // Create new filter step before expression
+            auto new_filter_step = std::make_unique<FilterStep>(
+                expression_step->getInputStreams()[0],
+                pushable_filter,
+                pushable_filter->getResultName(),
+                true
+            );
+            
+            // Update the plan structure
+            expression_step->replaceChild(0, std::move(new_filter_step));
+            
+            if (remaining_filter)
+            {
+                // Keep remaining filter after expression
+                filter_step->updateFilterActions(remaining_filter);
+            }
+            else
+            {
+                // Remove filter step entirely
+                step = expression_step->shared_from_this();
+            }
+        }
+    }
+    
+private:
+    std::pair<ActionsDAGPtr, ActionsDAGPtr> splitFilterActions(
+        const ActionsDAGPtr & filter_actions,
+        const ActionsDAGPtr & expression_actions,
+        const String & filter_column) const;
+};
+
+class OptimizeReadInOrder : public QueryPlanOptimizationRule
+{
+public:
+    String getName() const override { return "OptimizeReadInOrder"; }
+    String getDescription() const override { return "Optimize reading data in sorted order"; }
+    
+    bool match(const QueryPlanStepPtr & step) const override
+    {
+        if (const auto * sorting = typeid_cast<const SortingStep *>(step.get()))
+        {
+            // Check if we can read data in the required order
+            return canOptimizeReadInOrder(sorting);
+        }
+        return false;
+    }
+    
+    void transform(QueryPlanStepPtr & step) const override
+    {
+        auto * sorting_step = static_cast<SortingStep *>(step.get());
+        
+        // Find ReadFromMergeTree step
+        auto * read_step = findReadFromMergeTreeStep(sorting_step);
+        if (!read_step)
+            return;
+        
+        // Check if table is sorted by the same columns
+        const auto & sort_description = sorting_step->getSortDescription();
+        if (canReadInOrder(read_step, sort_description))
+        {
+            // Configure read step to read in order
+            read_step->enableReadInOrder(sort_description);
+            
+            // Remove or simplify sorting step
+            if (isCompletelyOptimized(sort_description, read_step->getOrderDescription()))
+            {
+                // Remove sorting step entirely
+                step = sorting_step->getChildren()[0];
+            }
+            else
+            {
+                // Convert to partial sorting
+                sorting_step->convertToPartialSorting();
+            }
+        }
+    }
+    
+private:
+    bool canOptimizeReadInOrder(const SortingStep * sorting_step) const;
+    ReadFromMergeTree * findReadFromMergeTreeStep(const IQueryPlanStep * step) const;
+    bool canReadInOrder(const ReadFromMergeTree * read_step, const SortDescription & sort_desc) const;
+    bool isCompletelyOptimized(const SortDescription & required, const SortDescription & provided) const;
+};
+```
+
+#### 1.4.4 Cost-Based Optimization
+
+ClickHouse incorporates cost-based optimization techniques to make intelligent decisions about query execution strategies:
+
+```cpp
+class QueryPlanCostModel
+{
+private:
+    struct StepCost
+    {
+        double cpu_cost = 0.0;
+        double memory_cost = 0.0;
+        double io_cost = 0.0;
+        double network_cost = 0.0;
+        
+        double getTotalCost() const 
+        {
+            return cpu_cost + memory_cost + io_cost + network_cost;
+        }
+    };
+    
+    ContextPtr context;
+    std::unordered_map<const IQueryPlanStep*, StepCost> step_costs;
+    
+public:
+    explicit QueryPlanCostModel(ContextPtr context_) : context(context_) {}
+    
+    double estimateStepCost(const IQueryPlanStep & step) const;
+    double estimatePlanCost(const QueryPlan & plan) const;
+    
+    void updateStepCost(const IQueryPlanStep & step, const StepCost & cost);
+    
+private:
+    StepCost calculateReadCost(const ReadFromMergeTree & read_step) const;
+    StepCost calculateFilterCost(const FilterStep & filter_step) const;
+    StepCost calculateAggregationCost(const AggregatingStep & agg_step) const;
+    StepCost calculateJoinCost(const JoinStep & join_step) const;
+    StepCost calculateSortCost(const SortingStep & sort_step) const;
+};
+```
+
+**Join Order Optimization:**
+
+```cpp
+class JoinOrderOptimizer
+{
+private:
+    QueryPlanCostModel cost_model;
+    size_t max_tables_for_exhaustive_search = 6;
+    
+public:
+    explicit JoinOrderOptimizer(ContextPtr context) : cost_model(context) {}
+    
+    void optimizeJoinOrder(QueryPlan & plan) const
+    {
+        auto join_steps = findJoinSteps(plan);
+        if (join_steps.size() <= 1)
+            return;
+        
+        if (join_steps.size() <= max_tables_for_exhaustive_search)
+        {
+            optimizeExhaustively(join_steps);
+        }
+        else
+        {
+            optimizeGreedy(join_steps);
+        }
+    }
+    
+private:
+    std::vector<JoinStep*> findJoinSteps(const QueryPlan & plan) const;
+    void optimizeExhaustively(std::vector<JoinStep*> & join_steps) const;
+    void optimizeGreedy(std::vector<JoinStep*> & join_steps) const;
+    
+    double estimateJoinCost(const JoinStep & left_step, const JoinStep & right_step) const;
+    size_t estimateTableSize(const IQueryPlanStep & step) const;
+    double estimateSelectivity(const JoinStep & join_step) const;
+};
+```
+
+This comprehensive query planning architecture enables ClickHouse to systematically optimize queries through a combination of rule-based transformations and cost-based decisions, ensuring that the final execution plan is both correct and efficient.
+
+### 1.5 Pipeline Construction (3,000 words)
+
+The pipeline construction phase represents the final transformation from logical query plans to executable processing graphs. ClickHouse's pipeline architecture is built around the concept of processors—lightweight, composable units that can be connected to form complex data processing graphs with sophisticated parallelization and resource management capabilities.
+
+#### 1.5.1 Processor Architecture
+
+The foundation of ClickHouse's pipeline system is the `IProcessor` interface, which defines a standardized way to process data streams:
+
+```cpp
+class IProcessor
+{
+public:
+    enum class Status
+    {
+        NeedData,       // Processor needs more input data
+        PortFull,       // Output port is full, cannot produce more data
+        Finished,       // Processor has completed its work
+        Ready,          // Processor is ready to do work
+        Async,          // Processor is doing asynchronous work
+        ExpandPipeline  // Processor wants to add more processors to pipeline
+    };
+    
+    virtual ~IProcessor() = default;
+    
+    virtual String getName() const = 0;
     virtual Status prepare() = 0;
-    virtual void work() = 0;
-    virtual InputPorts & getInputs() = 0;
-    virtual OutputPorts & getOutputs() = 0;
+    virtual void work() {}
+    virtual Processors expandPipeline() { return {}; }
+    
+    // Port management
+    const InputPorts & getInputs() const { return inputs; }
+    const OutputPorts & getOutputs() const { return outputs; }
+    
+    // Resource management
+    virtual UInt64 elapsed_us() const { return 0; }
+    virtual UInt64 processed_rows() const { return 0; }
+    virtual UInt64 processed_bytes() const { return 0; }
+    
+    // Debugging and profiling
+    virtual void setDescription(const String & description_) { description = description_; }
+    const String & getDescription() const { return description; }
+    
+protected:
+    InputPorts inputs;
+    OutputPorts outputs;
+    String description;
+    
+    // Helper methods for derived classes
+    InputPort & addInputPort(Block header, bool can_be_totals = false);
+    OutputPort & addOutputPort(Block header, bool can_be_totals = false);
 };
 ```
 
-**Processor Types:**
-- `ISource` - Data sources (table scans)
-- `ITransform` - Data transformations (filters, expressions)
-- `ISink` - Data sinks (output formatters)
-- `ISimpleTransform` - Single input/output transformations
+**Port System for Data Flow:**
 
-### 4.2 Data Flow Architecture
-
-**Port and Chunk System:**
 ```cpp
-class Port {
-    Header header;
-    bool is_finished = false;
+class Port
+{
+public:
+    enum class State
+    {
+        NotNeeded,
+        NeedData,
+        HasData,
+        Finished
+    };
+    
+protected:
     State state = State::NotNeeded;
+    Block header;
+    Chunk data;
+    
+    IProcessor * processor = nullptr;
+    Port * connected_port = nullptr;
+    
+public:
+    Port(Block header_, IProcessor * processor_) : header(std::move(header_)), processor(processor_) {}
+    
+    void connect(Port & other);
+    bool isConnected() const { return connected_port != nullptr; }
+    
+    const Block & getHeader() const { return header; }
+    State getState() const { return state; }
+    
+    // Data operations (implemented differently for input/output ports)
+    virtual bool hasData() const = 0;
+    virtual void pushData(Chunk chunk) = 0;
+    virtual Chunk pullData() = 0;
+    
+    virtual void finish() = 0;
+    virtual bool isFinished() const = 0;
 };
 
-class Chunk {
-    Columns columns;
-    UInt64 num_rows = 0;
-    ChunkInfoPtr chunk_info;
+class InputPort : public Port
+{
+public:
+    using Port::Port;
+    
+    bool hasData() const override
+    {
+        return connected_port && connected_port->hasData();
+    }
+    
+    Chunk pullData() override
+    {
+        if (!connected_port || !connected_port->hasData())
+            throw Exception("Cannot pull data from port", ErrorCodes::LOGICAL_ERROR);
+        
+        return connected_port->pullData();
+    }
+    
+    void pushData(Chunk) override
+    {
+        throw Exception("Cannot push data to input port", ErrorCodes::LOGICAL_ERROR);
+    }
+    
+    bool isFinished() const override
+    {
+        return connected_port && connected_port->isFinished();
+    }
+    
+    void finish() override
+    {
+        state = State::Finished;
+    }
+};
+
+class OutputPort : public Port
+{
+private:
+    std::queue<Chunk> data_queue;
+    bool finished = false;
+    
+public:
+    using Port::Port;
+    
+    bool hasData() const override
+    {
+        return !data_queue.empty();
+    }
+    
+    void pushData(Chunk chunk) override
+    {
+        if (finished)
+            throw Exception("Cannot push data to finished port", ErrorCodes::LOGICAL_ERROR);
+        
+        data_queue.push(std::move(chunk));
+        state = State::HasData;
+    }
+    
+    Chunk pullData() override
+    {
+        if (data_queue.empty())
+            throw Exception("Cannot pull data from empty port", ErrorCodes::LOGICAL_ERROR);
+        
+        auto chunk = std::move(data_queue.front());
+        data_queue.pop();
+        
+        if (data_queue.empty() && !finished)
+            state = State::NeedData;
+        
+        return chunk;
+    }
+    
+    void finish() override
+    {
+        finished = true;
+        state = State::Finished;
+    }
+    
+    bool isFinished() const override
+    {
+        return finished && data_queue.empty();
+    }
 };
 ```
 
-**Data Processing Flow:**
-1. **Source Processors**: Read data from storage engines
-2. **Transform Processors**: Apply filters, expressions, aggregations
-3. **Sink Processors**: Format and output results
-4. **Pipeline Execution**: Coordinate processor execution
+#### 1.5.2 Core Processor Types
 
-### 4.3 Execution Engine Details
+ClickHouse implements a rich set of processor types to handle different aspects of query execution:
 
-**PipelineExecutor Implementation:**
-- **Thread Pool Management**: Uses `ThreadFromGlobalPool`
-- **Work Stealing**: Balances load across threads
-- **Memory Management**: Controls memory usage per pipeline
-- **Exception Handling**: Propagates exceptions across processors
+**Source Processors:**
 
-**Execution Characteristics:**
-- **Vectorized Processing**: Operates on data chunks (8192 rows default)
-- **SIMD Operations**: Leverages CPU vector instructions
-- **Cache Efficiency**: Optimized memory access patterns
-- **Parallel Execution**: Multi-threaded pipeline execution
-
-## 5. Storage Engine Integration (MergeTree Deep Dive)
-
-### 5.1 MergeTree Data Organization
-
-**Physical Storage Structure:**
-```
-/var/lib/clickhouse/data/database/table/
-├── partition_id_min_block_max_block_level_mutation/
-│   ├── columns.txt          # Column metadata
-│   ├── count.txt           # Row count
-│   ├── primary.idx         # Primary index
-│   ├── column_name.bin     # Column data (compressed)
-│   ├── column_name.mrk2    # Mark files (granule pointers)
-│   └── checksums.txt       # Data integrity checksums
-```
-
-**Part Naming Convention:**
-```
-<partition_id>_<min_block>_<max_block>_<level>_<mutation_version>
-```
-
-### 5.2 Index and Data Access
-
-**Granule-Based Access:**
-- **Index Granularity**: 8192 rows per granule (configurable)
-- **Sparse Primary Index**: Stores every Nth row value
-- **Mark Files**: Point to granule locations in compressed files
-- **Range Reading**: Reads relevant granules based on index
-
-**Data Reading Process:**
-1. **Index Lookup**: Find relevant granules using primary.idx
-2. **Mark Resolution**: Locate granule positions using .mrk2 files
-3. **Compressed Reading**: Read and decompress relevant blocks
-4. **Filtering**: Apply additional filters on decompressed data
-
-### 5.3 MergeTreeDataSelectExecutor
-
-**Core Selection Logic:**
 ```cpp
-class MergeTreeDataSelectExecutor {
-    QueryPlan readFromParts(
-        MergeTreeData::DataPartsVector parts,
-        const Names & column_names,
-        const SelectQueryInfo & query_info,
-        ContextPtr context,
-        UInt64 max_block_size,
-        size_t num_streams
-    );
+class SourceFromInputStream : public IProcessor
+{
+private:
+    BlockInputStreamPtr stream;
+    Chunk current_chunk;
+    bool has_input = true;
+    
+public:
+    SourceFromInputStream(BlockInputStreamPtr stream_, Block header_)
+        : stream(std::move(stream_))
+    {
+        addOutputPort(std::move(header_));
+    }
+    
+    String getName() const override { return "SourceFromInputStream"; }
+    
+    Status prepare() override
+    {
+        auto & output = getOutputs().front();
+        
+        if (output.isFinished())
+            return Status::Finished;
+        
+        if (!has_input)
+        {
+            output.finish();
+            return Status::Finished;
+        }
+        
+        if (output.hasData())
+            return Status::PortFull;
+        
+        if (current_chunk.hasRows())
+        {
+            output.pushData(std::move(current_chunk));
+            return Status::PortFull;
+        }
+        
+        return Status::Ready;
+    }
+    
+    void work() override
+    {
+        if (auto block = stream->read())
+        {
+            current_chunk = Chunk(block.getColumns(), block.rows());
+        }
+        else
+        {
+            has_input = false;
+        }
+    }
+};
+
+class SourceFromSingleChunk : public IProcessor
+{
+private:
+    Chunk chunk;
+    bool has_data = true;
+    
+public:
+    SourceFromSingleChunk(Block header_, Chunk chunk_)
+        : chunk(std::move(chunk_))
+    {
+        addOutputPort(std::move(header_));
+    }
+    
+    String getName() const override { return "SourceFromSingleChunk"; }
+    
+    Status prepare() override
+    {
+        auto & output = getOutputs().front();
+        
+        if (output.isFinished() || !has_data)
+        {
+            output.finish();
+            return Status::Finished;
+        }
+        
+        if (output.hasData())
+            return Status::PortFull;
+        
+        output.pushData(std::move(chunk));
+        has_data = false;
+        
+        return Status::PortFull;
+    }
 };
 ```
 
-**Optimization Features:**
-- **Part Selection**: Choose relevant data parts
-- **Index Usage**: Primary key and skip indexes
-- **Parallel Reading**: Multiple streams for large datasets
-- **Memory Management**: Control memory usage during reads
+**Transform Processors:**
 
-## 6. Advanced Features and Optimizations
-
-### 6.1 Data Skipping Indexes
-
-**Skip Index Types:**
-- `minmax` - Min/max values per granule
-- `set` - Set of unique values
-- `bloom_filter` - Bloom filter for membership testing
-- `tokenbf_v1` - Token-based bloom filter for text search
-
-**Implementation:**
 ```cpp
-class IMergeTreeIndex {
-    virtual void update(const Block & block, size_t * pos, size_t limit) = 0;
-    virtual bool mayBeTrueInRange(const Range & range) const = 0;
+class ExpressionTransform : public IProcessor
+{
+private:
+    ExpressionActionsPtr expression;
+    Block input_header;
+    Block output_header;
+    
+public:
+    ExpressionTransform(Block input_header_, ExpressionActionsPtr expression_)
+        : expression(std::move(expression_)), input_header(std::move(input_header_))
+    {
+        output_header = expression->updateHeader(input_header);
+        addInputPort(input_header);
+        addOutputPort(output_header);
+    }
+    
+    String getName() const override { return "ExpressionTransform"; }
+    
+    Status prepare() override
+    {
+        auto & input = getInputs().front();
+        auto & output = getOutputs().front();
+        
+        if (output.isFinished())
+        {
+            input.close();
+            return Status::Finished;
+        }
+        
+        if (!output.canPush())
+            return Status::PortFull;
+        
+        if (input.isFinished())
+        {
+            output.finish();
+            return Status::Finished;
+        }
+        
+        if (!input.hasData())
+            return Status::NeedData;
+        
+        return Status::Ready;
+    }
+    
+    void work() override
+    {
+        auto & input = getInputs().front();
+        auto & output = getOutputs().front();
+        
+        auto chunk = input.pullData();
+        
+        if (!chunk.hasRows())
+        {
+            output.pushData(std::move(chunk));
+            return;
+        }
+        
+        auto block = input_header.cloneWithColumns(chunk.detachColumns());
+        expression->execute(block);
+        
+        auto result_chunk = Chunk(block.getColumns(), block.rows());
+        output.pushData(std::move(result_chunk));
+    }
+};
+
+class FilterTransform : public IProcessor
+{
+private:
+    ExpressionActionsPtr filter_expression;
+    String filter_column_name;
+    bool remove_filter_column;
+    
+    Block input_header;
+    Block output_header;
+    
+public:
+    FilterTransform(
+        Block input_header_,
+        ExpressionActionsPtr filter_expression_,
+        String filter_column_name_,
+        bool remove_filter_column_)
+        : filter_expression(std::move(filter_expression_))
+        , filter_column_name(std::move(filter_column_name_))
+        , remove_filter_column(remove_filter_column_)
+        , input_header(std::move(input_header_))
+    {
+        output_header = input_header;
+        if (remove_filter_column)
+            output_header.erase(filter_column_name);
+        
+        addInputPort(input_header);
+        addOutputPort(output_header);
+    }
+    
+    String getName() const override { return "FilterTransform"; }
+    
+    Status prepare() override
+    {
+        auto & input = getInputs().front();
+        auto & output = getOutputs().front();
+        
+        if (output.isFinished())
+        {
+            input.close();
+            return Status::Finished;
+        }
+        
+        if (!output.canPush())
+            return Status::PortFull;
+        
+        if (input.isFinished())
+        {
+            output.finish();
+            return Status::Finished;
+        }
+        
+        if (!input.hasData())
+            return Status::NeedData;
+        
+        return Status::Ready;
+    }
+    
+    void work() override
+    {
+        auto & input = getInputs().front();
+        auto & output = getOutputs().front();
+        
+        auto chunk = input.pullData();
+        
+        if (!chunk.hasRows())
+        {
+            output.pushData(std::move(chunk));
+            return;
+        }
+        
+        auto block = input_header.cloneWithColumns(chunk.detachColumns());
+        
+        // Apply filter expression
+        filter_expression->execute(block);
+        
+        // Get filter column
+        auto filter_column = block.getByName(filter_column_name).column;
+        
+        // Apply filter
+        auto filtered_columns = applyFilter(block.getColumns(), filter_column);
+        
+        // Remove filter column if requested
+        if (remove_filter_column)
+        {
+            auto filter_pos = block.getPositionByName(filter_column_name);
+            filtered_columns.erase(filtered_columns.begin() + filter_pos);
+        }
+        
+        auto filtered_chunk = Chunk(std::move(filtered_columns), filtered_columns[0]->size());
+        output.pushData(std::move(filtered_chunk));
+    }
+    
+private:
+    Columns applyFilter(const Columns & columns, const ColumnPtr & filter_column) const
+    {
+        Columns result;
+        result.reserve(columns.size());
+        
+        for (const auto & column : columns)
+        {
+            result.push_back(column->filter(*filter_column, -1));
+        }
+        
+        return result;
+    }
 };
 ```
 
-### 6.2 Materialized Views and Projections
+**Aggregation Processors:**
 
-**Projection Architecture:**
-- **Automatic Selection**: Query optimizer chooses optimal projection
-- **Incremental Updates**: Maintained automatically during inserts
-- **Cost-Based Selection**: Compares projection costs
-- **Fallback Mechanism**: Falls back to base table if needed
-
-### 6.3 Memory Management and Compression
-
-**Memory Allocation:**
-- **Arena Allocator**: Pool-based allocation for performance
-- **Memory Tracking**: Per-query memory usage tracking
-- **Spill-to-Disk**: Handles datasets larger than RAM
-- **Compression**: Multiple codecs (LZ4, ZSTD, Delta, DoubleDelta)
-
-**Compression Implementation:**
 ```cpp
-class ICompressionCodec {
-    virtual UInt32 getMaxCompressedDataSize(UInt32 uncompressed_size) const = 0;
-    virtual UInt32 compress(const char * source, UInt32 source_size, char * dest) const = 0;
-    virtual void decompress(const char * source, UInt32 source_size, char * dest, UInt32 uncompressed_size) const = 0;
+class AggregatingTransform : public IProcessor
+{
+private:
+    AggregatingTransformParamsPtr params;
+    std::unique_ptr<Aggregator> aggregator;
+    
+    Aggregator::AggregateDataPtr aggregate_data;
+    bool is_consume_finished = false;
+    bool is_generate_finished = false;
+    
+    Block input_header;
+    Block output_header;
+    
+public:
+    AggregatingTransform(Block input_header_, AggregatingTransformParamsPtr params_)
+        : params(std::move(params_)), input_header(std::move(input_header_))
+    {
+        aggregator = std::make_unique<Aggregator>(params->params);
+        output_header = aggregator->getHeader(false);
+        
+        addInputPort(input_header);
+        addOutputPort(output_header);
+        
+        aggregate_data = aggregator->prepareAggregateData();
+    }
+    
+    String getName() const override { return "AggregatingTransform"; }
+    
+    Status prepare() override
+    {
+        auto & input = getInputs().front();
+        auto & output = getOutputs().front();
+        
+        if (output.isFinished())
+        {
+            input.close();
+            return Status::Finished;
+        }
+        
+        if (is_generate_finished)
+        {
+            output.finish();
+            return Status::Finished;
+        }
+        
+        if (!output.canPush())
+            return Status::PortFull;
+        
+        if (is_consume_finished)
+            return Status::Ready;
+        
+        if (input.isFinished())
+        {
+            is_consume_finished = true;
+            return Status::Ready;
+        }
+        
+        if (!input.hasData())
+            return Status::NeedData;
+        
+        return Status::Ready;
+    }
+    
+    void work() override
+    {
+        auto & input = getInputs().front();
+        auto & output = getOutputs().front();
+        
+        if (!is_consume_finished)
+        {
+            auto chunk = input.pullData();
+            
+            if (chunk.hasRows())
+            {
+                auto block = input_header.cloneWithColumns(chunk.detachColumns());
+                aggregator->executeOnBlock(block, aggregate_data, params->threads);
+            }
+        }
+        else
+        {
+            // Generate output
+            auto block = aggregator->prepareBlockAndFillWithoutKey(
+                aggregate_data, params->final, params->max_block_size);
+            
+            if (block.rows() == 0)
+            {
+                is_generate_finished = true;
+            }
+            else
+            {
+                auto chunk = Chunk(block.getColumns(), block.rows());
+                output.pushData(std::move(chunk));
+            }
+        }
+    }
 };
 ```
 
-## 7. Distributed Query Execution
+#### 1.5.3 Pipeline Graph Construction
 
-### 7.1 Cluster Architecture
+The pipeline construction process involves building a directed acyclic graph of processors:
 
-**Distributed Table Engine:**
 ```cpp
-class StorageDistributed : public IStorage {
-    Cluster cluster;
-    String remote_database;
-    String remote_table;
-    ShardingKeyExpr sharding_key;
+class QueryPipelineBuilder
+{
+private:
+    Processors processors;
+    std::vector<OutputPort*> current_output_ports;
+    size_t max_threads;
+    
+public:
+    explicit QueryPipelineBuilder(size_t max_threads_ = 0) : max_threads(max_threads_) {}
+    
+    void addSource(ProcessorPtr source)
+    {
+        auto * source_ptr = source.get();
+        processors.emplace_back(std::move(source));
+        
+        for (auto & output : source_ptr->getOutputs())
+            current_output_ports.push_back(&output);
+    }
+    
+    void addTransform(ProcessorPtr transform)
+    {
+        if (current_output_ports.size() != transform->getInputs().size())
+            throw Exception("Processor input/output port count mismatch", ErrorCodes::LOGICAL_ERROR);
+        
+        auto * transform_ptr = transform.get();
+        processors.emplace_back(std::move(transform));
+        
+        // Connect inputs
+        auto input_it = transform_ptr->getInputs().begin();
+        for (auto * output_port : current_output_ports)
+        {
+            connectPorts(*output_port, *input_it);
+            ++input_it;
+        }
+        
+        // Update current outputs
+        current_output_ports.clear();
+        for (auto & output : transform_ptr->getOutputs())
+            current_output_ports.push_back(&output);
+    }
+    
+    void addSink(ProcessorPtr sink)
+    {
+        if (current_output_ports.size() != sink->getInputs().size())
+            throw Exception("Sink input port count mismatch", ErrorCodes::LOGICAL_ERROR);
+        
+        auto * sink_ptr = sink.get();
+        processors.emplace_back(std::move(sink));
+        
+        // Connect inputs
+        auto input_it = sink_ptr->getInputs().begin();
+        for (auto * output_port : current_output_ports)
+        {
+            connectPorts(*output_port, *input_it);
+            ++input_it;
+        }
+        
+        current_output_ports.clear();
+    }
+    
+    void resize(size_t num_streams)
+    {
+        if (current_output_ports.size() == num_streams)
+            return;
+        
+        if (current_output_ports.size() > num_streams)
+        {
+            // Merge streams
+            while (current_output_ports.size() > num_streams)
+            {
+                addTransform(std::make_shared<ConcatProcessor>(
+                    getCommonHeader(), 2));
+            }
+        }
+        else
+        {
+            // Split streams (not always possible)
+            throw Exception("Cannot increase number of streams", ErrorCodes::LOGICAL_ERROR);
+        }
+    }
+    
+    QueryPipeline build()
+    {
+        return QueryPipeline(std::move(processors), max_threads);
+    }
+    
+private:
+    void connectPorts(OutputPort & output, InputPort & input)
+    {
+        output.connect(input);
+    }
+    
+    Block getCommonHeader() const
+    {
+        if (current_output_ports.empty())
+            return {};
+        
+        return current_output_ports[0]->getHeader();
+    }
 };
 ```
 
-**Query Distribution Process:**
-1. **Shard Selection**: Determine target shards
-2. **Query Rewriting**: Modify query for remote execution
-3. **Parallel Execution**: Execute on multiple shards
-4. **Result Merging**: Combine results from all shards
+#### 1.5.4 Resource Allocation and Parallelism
 
-### 7.2 Network Protocol
+ClickHouse's pipeline system includes sophisticated resource management and parallelization strategies:
 
-**Native Protocol Implementation:**
-- **Binary Format**: Efficient serialization of blocks
-- **Compression**: Network traffic compression
-- **Connection Pooling**: Reuse connections across queries
-- **Error Propagation**: Detailed error information across network
-
-### 7.3 Distributed Aggregation
-
-**Two-Stage Aggregation:**
-1. **Local Aggregation**: Partial aggregation on each shard
-2. **Global Aggregation**: Final aggregation on coordinator
-3. **State Transfer**: Serialize/deserialize aggregate states
-4. **Memory Management**: Control memory usage across nodes
-
-## 8. Performance Analysis and Tuning
-
-### 8.1 Query Performance Metrics
-
-**Key Performance Indicators:**
-- **Rows/Second**: Processing throughput
-- **Bytes/Second**: I/O throughput  
-- **Memory Usage**: Peak and average consumption
-- **CPU Utilization**: Per-core usage statistics
-- **Cache Hit Rates**: Index and data cache efficiency
-
-**Profiling Tools:**
-- `EXPLAIN PIPELINE` - Show execution pipeline
-- `EXPLAIN PLAN` - Display query plan
-- `system.query_log` - Query execution statistics
-- `system.trace_log` - Sampling profiler data
-
-### 8.2 Configuration Parameters
-
-**Critical Settings:**
-```sql
--- Memory Management
-max_memory_usage = 10000000000
-max_bytes_before_external_group_by = 20000000000
-max_bytes_before_external_sort = 20000000000
-
--- Parallel Execution  
-max_threads = 16
-max_insert_threads = 16
-max_alter_threads = 16
-
--- I/O Configuration
-merge_tree_max_rows_to_use_cache = 128000000
-merge_tree_max_bytes_to_use_cache = 2147483648
-uncompressed_cache_size = 8589934592
-
--- Network Settings
-max_connections = 1024
-keep_alive_timeout = 3
-tcp_keep_alive_timeout = 30
-```
-
-### 8.3 Optimization Strategies
-
-**Query Optimization:**
-1. **Index Design**: Proper ORDER BY and PARTITION BY
-2. **Data Types**: Use appropriate types for storage efficiency
-3. **Compression**: Select optimal compression codecs
-4. **Partitioning**: Design effective partition schemes
-
-**Hardware Optimization:**
-1. **Storage**: NVMe SSDs for hot data, HDD for cold data
-2. **Memory**: Sufficient RAM for indexes and caches
-3. **CPU**: Modern processors with SIMD support
-4. **Network**: High-bandwidth for distributed setups
-
-## 9. Error Handling and Debugging
-
-### 9.1 Exception Hierarchy
-
-**Exception Classes:**
 ```cpp
-class Exception : public std::exception {
-    int code;
-    String message;
-    String stack_trace;
+class PipelineExecutor
+{
+private:
+    Processors processors;
+    std::vector<std::thread> threads;
+    std::atomic<bool> cancelled{false};
+    
+    // Resource tracking
+    std::atomic<size_t> active_processors{0};
+    std::atomic<size_t> total_memory_usage{0};
+    
+    // Thread pool management
+    ThreadPool thread_pool;
+    std::queue<IProcessor*> ready_processors;
+    std::mutex ready_processors_mutex;
+    std::condition_variable ready_processors_cv;
+    
+public:
+    explicit PipelineExecutor(Processors processors_, size_t max_threads)
+        : processors(std::move(processors_))
+        , thread_pool(max_threads)
+    {
+        initializeProcessorGraph();
+    }
+    
+    void execute()
+    {
+        // Start worker threads
+        for (size_t i = 0; i < thread_pool.getMaxThreads(); ++i)
+        {
+            threads.emplace_back([this] { workerThread(); });
+        }
+        
+        // Wait for completion
+        for (auto & thread : threads)
+            thread.join();
+    }
+    
+    void cancel()
+    {
+        cancelled = true;
+        ready_processors_cv.notify_all();
+    }
+    
+private:
+    void initializeProcessorGraph()
+    {
+        // Build processor dependency graph
+        for (auto & processor : processors)
+        {
+            // Initialize processor state
+            auto status = processor->prepare();
+            if (status == IProcessor::Status::Ready)
+            {
+                addToReadyQueue(processor.get());
+            }
+        }
+    }
+    
+    void workerThread()
+    {
+        while (!cancelled)
+        {
+            IProcessor* processor = nullptr;
+            
+            // Get next ready processor
+            {
+                std::unique_lock<std::mutex> lock(ready_processors_mutex);
+                ready_processors_cv.wait(lock, [this] {
+                    return !ready_processors.empty() || cancelled;
+                });
+                
+                if (cancelled)
+                    break;
+                
+                processor = ready_processors.front();
+                ready_processors.pop();
+            }
+            
+            if (processor)
+            {
+                executeProcessor(processor);
+            }
+        }
+    }
+    
+    void executeProcessor(IProcessor* processor)
+    {
+        try
+        {
+            ++active_processors;
+            
+            // Execute processor work
+            processor->work();
+            
+            // Update processor state and schedule dependent processors
+            auto status = processor->prepare();
+            handleProcessorStatus(processor, status);
+            
+            --active_processors;
+        }
+        catch (...)
+        {
+            --active_processors;
+            cancel();
+            throw;
+        }
+    }
+    
+    void handleProcessorStatus(IProcessor* processor, IProcessor::Status status)
+    {
+        switch (status)
+        {
+            case IProcessor::Status::Ready:
+                addToReadyQueue(processor);
+                break;
+                
+            case IProcessor::Status::NeedData:
+            case IProcessor::Status::PortFull:
+                // Check connected processors
+                scheduleConnectedProcessors(processor);
+                break;
+                
+            case IProcessor::Status::Finished:
+                // Processor completed, check if pipeline is done
+                scheduleConnectedProcessors(processor);
+                break;
+                
+            case IProcessor::Status::ExpandPipeline:
+            {
+                // Add new processors to pipeline
+                auto new_processors = processor->expandPipeline();
+                for (auto & new_processor : new_processors)
+                {
+                    processors.push_back(new_processor);
+                    auto new_status = new_processor->prepare();
+                    handleProcessorStatus(new_processor.get(), new_status);
+                }
+                break;
+            }
+                
+            case IProcessor::Status::Async:
+                // Processor is doing async work, will be rescheduled later
+                break;
+        }
+    }
+    
+    void addToReadyQueue(IProcessor* processor)
+    {
+        std::lock_guard<std::mutex> lock(ready_processors_mutex);
+        ready_processors.push(processor);
+        ready_processors_cv.notify_one();
+    }
+    
+    void scheduleConnectedProcessors(IProcessor* processor)
+    {
+        // Check all connected processors and schedule ready ones
+        for (auto & input : processor->getInputs())
+        {
+            if (input.isConnected())
+            {
+                auto * connected_processor = input.getConnectedPort().getProcessor();
+                auto status = connected_processor->prepare();
+                if (status == IProcessor::Status::Ready)
+                {
+                    addToReadyQueue(connected_processor);
+                }
+            }
+        }
+        
+        for (auto & output : processor->getOutputs())
+        {
+            if (output.isConnected())
+            {
+                auto * connected_processor = output.getConnectedPort().getProcessor();
+                auto status = connected_processor->prepare();
+                if (status == IProcessor::Status::Ready)
+                {
+                    addToReadyQueue(connected_processor);
+                }
+            }
+        }
+    }
 };
-
-class NetException : public Exception {};
-class ParsingException : public Exception {};
-class ExecutionException : public Exception {};
 ```
 
-### 9.2 Debugging Tools
+This sophisticated pipeline construction system enables ClickHouse to build highly optimized, parallel execution graphs that can efficiently process large volumes of data while maintaining excellent resource utilization and performance characteristics.
 
-**System Tables for Debugging:**
-- `system.processes` - Current queries
-- `system.query_log` - Query history
-- `system.part_log` - Part operations
-- `system.merge_log` - Merge operations
-- `system.crash_log` - Crash information
+## Phase 1 Summary
 
-**Logging Configuration:**
-```xml
-<logger>
-    <level>trace</level>
-    <log>/var/log/clickhouse-server/clickhouse-server.log</log>
-    <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
-    <size>1000M</size>
-    <count>10</count>
-</logger>
-```
+Phase 1 has provided a comprehensive foundation covering ClickHouse's query pipeline construction and execution architecture. We've explored:
 
-## 10. Future Developments and Roadmap
+1. **Parser Architecture and AST Construction**: The sophisticated recursive descent parser, AST node hierarchies, memory management, visitor patterns, optimization passes, and type system integration.
 
-### 10.1 Analyzer Improvements
+2. **Query Analysis Engine**: The evolution from legacy to new analyzer, QueryTree abstraction, semantic analysis phases, and advanced symbol resolution mechanisms.
 
-**Query Tree Enhancements:**
-- Complete migration from legacy ExpressionAnalyzer
-- Advanced cost-based optimizations
-- Better join algorithms and optimizations
-- Improved subquery handling
+3. **Query Planning Architecture**: QueryPlan structure, step hierarchy, optimization rules engine, and cost-based optimization strategies.
 
-### 10.2 Semi-Structured Data Support
+4. **Pipeline Construction**: Processor architecture, core processor types, pipeline graph construction, and resource allocation with parallelism.
 
-**JSON Type Evolution:**
-- Production-ready JSON type with Variant foundation
-- Better handling of nested and dynamic data
-- Improved query performance on JSON columns
-- Schema inference and evolution
-
-### 10.3 Performance Enhancements
-
-**Vectorization Improvements:**
-- Enhanced SIMD utilization
-- Better memory access patterns
-- Improved cache locality
-- Runtime code generation for hot paths
-
-## 11. Implementation Case Studies
-
-### 11.1 ClickHouse Cloud LogHouse
-
-**Scale Statistics:**
-- **Data Volume**: 19 PiB uncompressed (37 trillion rows)
-- **Compression Ratio**: 17x (19 PiB → 1.13 PiB compressed)
-- **Processing Rate**: 1.1 million log lines/second (largest region)
-- **Cost Efficiency**: 200x less expensive than Datadog
-
-**Technical Architecture:**
-- **Data Collection**: OpenTelemetry agents and gateways
-- **Processing Pipeline**: Custom OTel processors in Go
-- **Storage**: SharedMergeTree with S3 backend
-- **Query Interface**: Enhanced Grafana with custom plugins
-
-### 11.2 Performance Benchmarks
-
-**Query Performance Examples:**
-```sql
--- Analytical query on sensor data
-SELECT toStartOfDay(timestamp), event, sum(metric_value)
-FROM sensor_values 
-WHERE site_id = 233 AND timestamp > '2010-01-01'
-GROUP BY toStartOfDay(timestamp), event
-ORDER BY sum(metric_value) DESC LIMIT 20;
-
--- Performance: 0.042 seconds, 90K rows processed
--- Index usage: 11/24415 granules read (0.05%)
-```
-
-**Optimization Impact:**
-- **Proper Index Design**: 2000x reduction in data scanned
-- **Compression**: 17-40x storage reduction
-- **Vectorization**: Millions of rows/second processing
-- **Parallel Execution**: Linear scaling with CPU cores
-
-## 12. Conclusion
-
-ClickHouse's query pipeline represents a sophisticated and highly optimized architecture for analytical query processing. The combination of:
-
-- **Advanced Parsing**: Hand-optimized recursive descent parser
-- **Intelligent Optimization**: Two-tier analyzer with advanced optimizations  
-- **Efficient Execution**: Processor-based vectorized pipeline
-- **Optimal Storage**: Columnar MergeTree with intelligent indexing
-- **Distributed Computing**: Cluster-aware query distribution
-
-Creates a system capable of handling petabyte-scale analytical workloads with exceptional performance. The architecture's modular design, extensive optimization capabilities, and robust error handling make it suitable for enterprise-scale deployments while maintaining the flexibility needed for diverse analytical use cases.
-
-Understanding these implementation details enables database administrators, developers, and architects to make informed decisions about schema design, query optimization, and system configuration, ultimately maximizing the performance and efficiency of ClickHouse deployments.
-
-## References and Technical Resources
-
-### Documentation and Specifications
-- ClickHouse Official Architecture Documentation
-- Query Pipeline Implementation (src/Processors/)
-- MergeTree Storage Engine Specification
-- Native Protocol Documentation
-- Performance Analysis Guidelines
-
-### Source Code Analysis
-- Parser Implementation (src/Parsers/)
-- Query Analyzer (src/Analyzer/)  
-- Execution Pipeline (src/Processors/)
-- Storage Engines (src/Storages/)
-- Distributed Execution (src/Storages/Distributed/)
-
-### Performance Studies
-- ClickHouse vs. Traditional DBMS Benchmarks
-- Compression Algorithm Analysis
-- Vectorization Performance Studies
-- Distributed Query Execution Analysis
-- Real-world Deployment Case Studies
-
----
-
-*This technical report provides comprehensive implementation-level details of ClickHouse's query pipeline architecture based on current source code analysis and production deployments as of 2024.*
+This foundation sets the stage for the deeper technical exploration that will follow in subsequent phases, covering storage engines, distributed execution, memory management, and performance optimization techniques.
