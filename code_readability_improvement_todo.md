@@ -88,13 +88,15 @@ ASTPtr optimizeExpression(ASTPtr expression);
 - ✅ Added IQueryPlanStep interface enhancements
 - ✅ Added step type categorization and purposes
 
-### 🔴 TODO-10: ReadFromMergeTree step (Line 2090)
+### ✅ TODO-10: ReadFromMergeTree step (Line 2090) **COMPLETED**
 **Issue**: Complex storage reading logic without explanation
-**Action**: Add examples of part selection and parallelization
-```cpp
-void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings & settings) override;
-// Missing: How parts are selected, how parallelism is determined
-```
+**Action**: ✅ Added examples of part selection and parallelization
+- ✅ Added comprehensive step-by-step process explanation
+- ✅ Added advanced optimization features with detailed examples
+- ✅ Added partition pruning, primary key analysis, skip indexes
+- ✅ Added PREWHERE optimization explanations
+- ✅ Added parallelization decision logic
+- ✅ Added performance characteristics and benefits analysis
 
 ### 🟡 TODO-11: MergeExpressions optimization (Line 2298)
 **Issue**: Expression merging logic without examples
@@ -235,13 +237,15 @@ bool mayBeTrueInRange(const Range & range) const;
 
 ## PHASE 3: Processor Pipeline Classes (10 items)
 
-### 🔴 TODO-28: TransformProcessor (Line 6924)
+### ✅ TODO-28: TransformProcessor (Line 6924) **COMPLETED**
 **Issue**: Base transform without clear state machine explanation
-**Action**: Add state transition examples for transform processors
-```cpp
-Status prepare() override; void work() override;
-// Missing: How transform state machine works
-```
+**Action**: ✅ Added state transition examples for transform processors
+- ✅ Added comprehensive state machine implementation with detailed comments
+- ✅ Added practical examples (FilterTransform, ExpressionTransform, LimitTransform)
+- ✅ Added advanced patterns (AggregatingTransform with multi-phase processing)
+- ✅ Added step-by-step execution flow examples
+- ✅ Added performance metrics and benefits analysis
+- ✅ Added design principles and composability explanations
 
 ### 🔴 TODO-29: SynchronizedPortSystem (Line 7113)
 **Issue**: Thread-safe data transfer without examples
@@ -251,13 +255,15 @@ bool tryTransferData(OutputPort & output, InputPort & input);
 // Missing: How thread safety is achieved, performance impact
 ```
 
-### 🔴 TODO-30: Chunk class (Line 7163)
+### ✅ TODO-30: Chunk class (Line 7163) **COMPLETED**
 **Issue**: Core data structure without memory layout explanation
-**Action**: Add examples of chunk construction and manipulation
-```cpp
-Chunk(Columns columns_, UInt64 num_rows_);
-// Missing: How chunks are structured, memory efficiency
-```
+**Action**: ✅ Added examples of chunk construction and manipulation
+- ✅ Added comprehensive chunk flow examples through pipeline stages
+- ✅ Added chunk size optimization strategies and real-world examples
+- ✅ Added advanced chunk metadata (ChunkInfo) for specialized processing
+- ✅ Added memory characteristics and performance benefits analysis
+- ✅ Added data integrity validation and error handling
+- ✅ Added practical usage patterns for different data types
 
 ### 🟡 TODO-31: JoinProcessor (Line 7262)
 **Issue**: Join implementation without algorithm explanation

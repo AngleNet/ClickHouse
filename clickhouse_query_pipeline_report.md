@@ -2544,52 +2544,276 @@ WriteToSink               // Sink: outputs result
 
 **Specialized Step Types:**
 
+**ReadFromMergeTree Step - Advanced Storage Access:**
+
+The ReadFromMergeTree step is one of the most sophisticated components in ClickHouse's query planning, responsible for efficiently reading data from MergeTree storage engines with extensive optimizations.
+
 ```cpp
 class ReadFromMergeTree : public IQueryPlanStep
 {
 private:
-    MergeTreeData & storage;
-    StorageSnapshotPtr storage_snapshot;
+    MergeTreeData & storage;                    // Reference to the actual table storage
+    StorageSnapshotPtr storage_snapshot;        // Consistent view of table schema during query
     
-    // Query parameters
-    Names required_columns;
-    SelectQueryInfo query_info;
-    ContextPtr context;
+    // Query parameters - what data to read and how
+    Names required_columns;                     // Columns actually needed by the query
+    SelectQueryInfo query_info;                 // Contains WHERE conditions, PREWHERE, etc.
+    ContextPtr context;                         // Query execution context with settings
     
-    // Optimization results
+    // Optimization results - computed during plan construction
     MergeTreeDataSelectExecutor::PartitionIdToMaxBlock max_block_numbers_to_read;
-    Poco::Logger * log;
+    Poco::Logger * log;                         // For debugging and monitoring
     
-    // Performance characteristics
-    size_t requested_num_streams = 1;
-    size_t output_streams = 0;
+    // Performance characteristics - parallelization decisions
+    size_t requested_num_streams = 1;           // How many parallel streams requested
+    size_t output_streams = 0;                  // Actual streams that will be created
     
 public:
+    // Constructor performs initial analysis and optimization
     ReadFromMergeTree(
-        MergeTreeData & storage_,
-        StorageSnapshotPtr storage_snapshot_,
-        Names required_columns_,
-        SelectQueryInfo & query_info_,
-        ContextPtr context_,
-        size_t num_streams_);
+        MergeTreeData & storage_,               // Table to read from
+        StorageSnapshotPtr storage_snapshot_,   // Schema snapshot
+        Names required_columns_,                // Columns to read (projection)
+        SelectQueryInfo & query_info_,          // Query conditions and hints
+        ContextPtr context_,                    // Execution context
+        size_t num_streams_);                   // Parallelism hint
     
     String getName() const override { return "ReadFromMergeTree"; }
     String getStepDescription() const override;
     
+    // Source step - no input streams, produces data from storage
     DataStreams getInputStreams() const override { return {}; }
     DataStream getOutputStream() const override;
     
+    // Core method: creates processor pipeline for reading data
     QueryPipelineBuilderPtr updatePipeline(
         QueryPipelineBuilders pipelines,
         const BuildQueryPipelineSettings & settings) override;
     
+    // EXPLAIN support - shows what indexes and optimizations are used
     void describeIndexes(JSONBuilder::JSONMap & map) const override;
     void describeActions(JSONBuilder::JSONMap & map) const override;
     
 private:
+    // Pipeline construction helpers
     void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings & settings);
     Pipe readFromPool(const Names & column_names, size_t num_streams, size_t min_marks_for_concurrent_read);
+    
+    // Part selection and analysis
+    MergeTreeDataSelectExecutor::PartitionIdToMaxBlock analyzePartitions() const;
+    RangesInDataParts selectPartsToRead() const;
+    size_t estimateNumMarksToRead(const RangesInDataParts & parts) const;
+    
+    // Index analysis and optimization
+    void analyzeIndexes();
+    void applyPrimaryKeyCondition();
+    void applySkippingIndexes();
+    void applyPrewhereConditions();
+    
+    // Parallelization decisions
+    size_t selectNumStreams() const;
+    void distributeMarksAmongStreams();
 };
+```
+
+**How ReadFromMergeTree Works:**
+
+```cpp
+// Example: SELECT name, age FROM users WHERE age > 18 AND created_date >= '2023-01-01'
+
+// Step 1: Part Selection based on partition pruning
+auto parts_to_read = selectPartsToRead();
+// Result: Only parts with created_date >= '2023-01-01' are selected
+// If table is partitioned by toYYYYMM(created_date), only relevant months
+
+// Step 2: Primary key analysis for each selected part
+applyPrimaryKeyCondition();
+// Uses primary key index to skip ranges where condition can't be satisfied
+// For primary key (user_id, created_date), skips ranges where age condition is impossible
+
+// Step 3: Secondary index analysis
+applySkippingIndexes();
+// If there's a minmax index on 'age' column, uses it to skip data parts
+// where min(age) > 18 is false (meaning no rows in part satisfy age > 18)
+
+// Step 4: PREWHERE optimization
+applyPrewhereConditions();
+// Determines if age > 18 should be applied as PREWHERE for early filtering
+// PREWHERE reads minimal columns first, applies condition, then reads remaining columns
+
+// Step 5: Parallelization decision
+size_t num_streams = selectNumStreams();
+// Considers:
+// - Number of marks to read
+// - Available CPU cores
+// - I/O characteristics
+// - Memory constraints
+
+// Step 6: Pipeline creation
+QueryPipelineBuilderPtr updatePipeline(...) {
+    auto pipe = readFromPool(required_columns, num_streams, min_marks_per_stream);
+    // Creates MergeTreeSource processors, one per stream
+    // Each processor reads from assigned parts/ranges
+    return std::make_unique<QueryPipelineBuilder>(std::move(pipe));
+}
+```
+
+**Advanced Optimization Features:**
+
+```cpp
+class ReadFromMergeTree : public IQueryPlanStep {
+private:
+    // Part selection optimization
+    struct PartSelectionStrategy {
+        // Partition pruning - eliminate entire partitions based on conditions
+        void prunePartitions(const SelectQueryInfo & query_info) {
+            for (auto & part : all_parts) {
+                if (!partitionSatisfiesCondition(part.partition_id, query_info.condition)) {
+                    excluded_parts.insert(part.name);
+                }
+            }
+        }
+        
+        // TTL-based pruning - skip parts that are expired
+        void pruneTTLExpiredParts() {
+            auto now = std::time(nullptr);
+            for (auto & part : all_parts) {
+                if (part.ttl_info.part_min_ttl <= now) {
+                    excluded_parts.insert(part.name);
+                }
+            }
+        }
+        
+        // Size-based optimization - prefer reading larger parts first
+        void optimizePartOrder() {
+            std::sort(selected_parts.begin(), selected_parts.end(),
+                [](const auto & a, const auto & b) {
+                    return a.bytes_on_disk > b.bytes_on_disk;
+                });
+        }
+    };
+    
+    // Index utilization strategies
+    struct IndexOptimizer {
+        // Primary key optimization
+        MarkRanges applyPrimaryKeyCondition(
+            const KeyCondition & condition,
+            const MergeTreeData::DataPartPtr & part) {
+            
+            MarkRanges result;
+            size_t marks_count = part->index_granularity.getMarksCount();
+            
+            for (size_t mark = 0; mark < marks_count; ++mark) {
+                // Check if this mark range can contain satisfying rows
+                if (condition.mayBeTrueInRange(mark, mark + 1, part->index)) {
+                    result.emplace_back(mark, mark + 1);
+                }
+            }
+            
+            return result;
+        }
+        
+        // Skip index optimization
+        MarkRanges applySkipIndex(
+            const MergeTreeIndexPtr & index,
+            const SelectQueryInfo & query_info,
+            const MarkRanges & initial_ranges) {
+            
+            MarkRanges result;
+            auto condition = index->createIndexCondition(query_info);
+            
+            for (const auto & range : initial_ranges) {
+                // Apply skip index to narrow down the range
+                auto filtered_range = condition->mayBeTrueInRange(range.begin, range.end);
+                if (filtered_range.has_value()) {
+                    result.push_back(filtered_range.value());
+                }
+            }
+            
+            return result;
+        }
+    };
+    
+    // PREWHERE optimization
+    struct PrewhereOptimizer {
+        PrewhereInfoPtr buildPrewhereInfo(const SelectQueryInfo & query_info) {
+            auto prewhere_info = std::make_shared<PrewhereInfo>();
+            
+            // Analyze filter conditions for PREWHERE candidacy
+            auto conditions = extractConditions(query_info.query);
+            
+            for (auto & condition : conditions) {
+                if (shouldUseAsPrewhere(condition)) {
+                    prewhere_info->prewhere_actions = buildActionsDAG(condition);
+                    prewhere_info->prewhere_column_name = condition.result_name;
+                    prewhere_info->remove_prewhere_column = true;
+                    break;
+                }
+            }
+            
+            return prewhere_info;
+        }
+        
+        bool shouldUseAsPrewhere(const ConditionInfo & condition) {
+            // PREWHERE is beneficial when:
+            // 1. Condition has high selectivity (filters many rows)
+            // 2. Condition uses few columns (reduces I/O)
+            // 3. Condition is computationally cheap
+            
+            double selectivity = estimateSelectivity(condition);
+            size_t columns_used = condition.required_columns.size();
+            size_t total_columns = all_columns.size();
+            
+            return selectivity < 0.5 && columns_used < total_columns / 2;
+        }
+    };
+};
+```
+
+**Performance Characteristics:**
+
+```cpp
+// Example optimization results for a query:
+// SELECT name, email FROM users WHERE age > 25 AND city = 'New York' AND created_date >= '2023-01-01'
+
+struct OptimizationResults {
+    // Partition pruning results
+    size_t total_partitions = 24;        // 2 years of monthly partitions
+    size_t selected_partitions = 3;      // Only Jan-Mar 2023 selected
+    double partition_pruning_ratio = 87.5%; // 21/24 partitions eliminated
+    
+    // Part selection results  
+    size_t total_parts = 120;            // Parts across selected partitions
+    size_t selected_parts = 45;          // Parts after primary key analysis
+    double part_selection_ratio = 62.5%; // 75/120 parts eliminated
+    
+    // Mark range optimization
+    size_t total_marks = 50000;          // Marks in selected parts
+    size_t selected_marks = 12000;       // Marks after index analysis
+    double mark_selection_ratio = 76%;   // 38000/50000 marks skipped
+    
+    // PREWHERE optimization
+    bool uses_prewhere = true;
+    String prewhere_condition = "city = 'New York'"; // High selectivity condition
+    double prewhere_selectivity = 0.15;  // Only 15% of rows match
+    
+    // Parallelization
+    size_t num_streams = 8;               // 8 parallel reading streams
+    size_t marks_per_stream = 1500;      // ~1500 marks per stream
+    
+    // Performance estimate
+    double estimated_read_time_sec = 2.3;
+    size_t estimated_bytes_read = 256 * 1024 * 1024; // 256 MB instead of 2 GB
+};
+```
+
+**Benefits of ReadFromMergeTree Optimizations:**
+- **Partition Pruning**: Eliminates entire date ranges from consideration
+- **Primary Key Utilization**: Skips irrelevant data blocks efficiently  
+- **Skip Index Acceleration**: Uses specialized indexes for fast filtering
+- **PREWHERE Optimization**: Reduces I/O by reading fewer columns initially
+- **Parallel Processing**: Distributes work across multiple CPU cores
+- **Memory Efficiency**: Processes data in manageable chunks
 
 class FilterStep : public IQueryPlanStep
 {
@@ -7163,39 +7387,311 @@ ClickHouse's modern query execution engine is built around a sophisticated proce
 
 The `IProcessor` interface represents a fundamental shift from traditional database execution models. Each processor is a self-contained execution unit that can consume data from input ports, perform transformations, and produce results through output ports. The interface is designed around a state machine pattern that enables non-blocking, asynchronous execution:
 
+**Transform Processor - The Foundation of Data Processing:**
+
+The TransformProcessor class provides the base implementation for most data transformation operations in ClickHouse pipelines. It implements the standard single-input, single-output pattern that forms the backbone of query execution.
+
 ```cpp
-class IProcessor
+class TransformProcessor : public IProcessor
 {
 public:
-    /// Processor states for execution control - each state indicates what the processor needs
-    enum class Status
+    /// Constructor establishes input/output structure
+    TransformProcessor(Block input_header, Block output_header)
+        : input(inputs.emplace_back(std::move(input_header)))
+        , output(outputs.emplace_back(std::move(output_header)))
     {
-        NeedData,       /// Processor needs more input data to continue
-        PortFull,       /// Output port is full, cannot produce more data  
-        Finished,       /// Processor has completed its work permanently
-        Ready,          /// Processor is ready to perform work() immediately
-        Async,          /// Processor is doing async work (e.g., reading from disk)
-        ExpandPipeline  /// Processor wants to add new processors to pipeline dynamically
-    };
+        // Transform processors always have exactly one input and one output
+    }
 
-    /// Main execution method - performs actual data processing
-    /// Only called when prepare() returns Status::Ready
-    /// Should process a reasonable chunk of data and return quickly
-    virtual Status work() = 0;
-    
-    /// Preparation method - checks processor state without doing heavy work
-    /// Called by scheduler to determine if work() should be called
-    /// Must be lightweight and return quickly
-    virtual Status prepare() = 0;
-    
-    /// Access to input/output ports for data flow
-    virtual InputPorts & getInputs() = 0;
-    virtual OutputPorts & getOutputs() = 0;
-    
-    /// Human-readable name for debugging and monitoring
-    virtual String getName() const = 0;
+    String getName() const override { return "Transform"; }
+
+    /// The core state machine implementation for transform processors
+    Status prepare() override
+    {
+        /// Check if we've finished processing all data
+        if (output.isFinished())
+        {
+            input.close();
+            return Status::Finished;
+        }
+
+        /// Check if downstream is blocked (output port full)
+        if (output.hasData())
+            return Status::PortFull;    // Wait for downstream to consume
+
+        /// Check if we have input data to process
+        if (input.hasData())
+        {
+            current_chunk = input.pull();   // Get data chunk
+            return Status::Ready;           // Ready to transform data
+        }
+
+        /// Check if upstream has finished
+        if (input.isFinished())
+        {
+            output.finish();               // Signal downstream we're done
+            return Status::Finished;
+        }
+
+        /// Need more input data
+        input.setNeeded();                 // Tell upstream we need data
+        return Status::NeedData;
+    }
+
+    /// Actual data transformation happens here
+    Status work() override
+    {
+        /// Transform the current chunk
+        auto transformed_chunk = transform(std::move(current_chunk));
+        
+        /// Push result to output (or handle empty result)
+        if (!transformed_chunk.empty())
+            output.push(std::move(transformed_chunk));
+        
+        return Status::Ready;   // Check state again immediately
+    }
+
+protected:
+    /// Derived classes implement this to define their transformation logic
+    virtual Chunk transform(Chunk chunk) = 0;
+
+    /// Access to input/output ports
+    InputPort & input;
+    OutputPort & output;
+
+private:
+    Chunk current_chunk;    /// Data currently being processed
 };
 ```
+
+**How Transform State Machine Works:**
+
+```cpp
+// Example: FilterTransform implementing WHERE age > 18
+
+class FilterTransform : public TransformProcessor
+{
+private:
+    ExpressionActionsPtr filter_expression;
+    String filter_column_name;
+    
+public:
+    FilterTransform(Block header, ExpressionActionsPtr filter_expr, String filter_col)
+        : TransformProcessor(header, header)  // Same input/output structure
+        , filter_expression(filter_expr)
+        , filter_column_name(filter_col)
+    {}
+
+    /// Implement the transformation logic
+    Chunk transform(Chunk chunk) override
+    {
+        if (chunk.empty())
+            return chunk;
+
+        /// Step 1: Apply filter expression to chunk
+        Block block = getHeader().cloneWithColumns(chunk.detachColumns());
+        filter_expression->execute(block);
+
+        /// Step 2: Extract filter column (contains boolean results)
+        auto filter_column = block.getByName(filter_column_name).column;
+        const auto * filter_data = typeid_cast<const ColumnUInt8 *>(filter_column.get());
+
+        /// Step 3: Filter all columns based on boolean mask
+        Columns filtered_columns;
+        size_t filtered_rows = 0;
+
+        for (size_t col_idx = 0; col_idx < block.columns(); ++col_idx)
+        {
+            if (block.getByPosition(col_idx).name == filter_column_name)
+                continue;  // Skip the filter column itself
+
+            auto filtered_col = block.getByPosition(col_idx).column->filter(
+                filter_data->getData(), -1);  // -1 means count filtered rows
+            
+            if (filtered_columns.empty())
+                filtered_rows = filtered_col->size();
+                
+            filtered_columns.push_back(std::move(filtered_col));
+        }
+
+        /// Step 4: Return filtered chunk
+        return Chunk(std::move(filtered_columns), filtered_rows);
+    }
+};
+
+// State machine execution example:
+// 1. Scheduler calls prepare() -> Status::NeedData (no input yet)
+// 2. Upstream sends data -> prepare() -> Status::Ready
+// 3. Scheduler calls work() -> transforms data, pushes to output -> Status::Ready  
+// 4. prepare() -> Status::PortFull (output buffer full)
+// 5. Downstream consumes -> prepare() -> Status::NeedData (ready for more input)
+// 6. Eventually input finishes -> prepare() -> Status::Finished
+```
+
+**Advanced Transform Patterns:**
+
+```cpp
+// Example: ExpressionTransform for SELECT calculations
+class ExpressionTransform : public TransformProcessor
+{
+private:
+    ExpressionActionsPtr expression;
+    
+public:
+    Chunk transform(Chunk chunk) override
+    {
+        /// Execute arbitrary expressions: computed columns, function calls, etc.
+        Block block = getHeader().cloneWithColumns(chunk.detachColumns());
+        expression->execute(block);  // Modifies block in-place
+        
+        return Chunk(block.getColumns(), block.rows());
+    }
+};
+
+// Example: LimitTransform for LIMIT clause
+class LimitTransform : public TransformProcessor
+{
+private:
+    size_t limit;
+    size_t rows_processed = 0;
+    
+public:
+    Chunk transform(Chunk chunk) override
+    {
+        if (rows_processed >= limit)
+            return {};  // Return empty chunk (filtering out all data)
+        
+        size_t rows_in_chunk = chunk.getNumRows();
+        size_t rows_to_take = std::min(rows_in_chunk, limit - rows_processed);
+        
+        rows_processed += rows_to_take;
+        
+        if (rows_to_take == rows_in_chunk)
+            return chunk;  // Take entire chunk
+        
+        /// Partial chunk - cut to exact limit
+        Columns cut_columns;
+        for (const auto & column : chunk.getColumns())
+            cut_columns.push_back(column->cut(0, rows_to_take));
+        
+        return Chunk(std::move(cut_columns), rows_to_take);
+    }
+};
+
+// Example: AggregatingTransform (more complex, multiple phases)
+class AggregatingTransform : public TransformProcessor
+{
+private:
+    AggregatorParams params;
+    Aggregator aggregator;
+    
+    /// Aggregation happens in phases
+    enum class Phase
+    {
+        Consume,    // Consuming input data, building hash tables
+        Generate    // Generating output from completed aggregation
+    };
+    
+    Phase current_phase = Phase::Consume;
+    BlocksList aggregated_blocks;  // Results ready for output
+    
+public:
+    Status prepare() override
+    {
+        /// Override to handle multi-phase processing
+        if (current_phase == Phase::Generate)
+        {
+            if (!aggregated_blocks.empty())
+            {
+                if (output.hasData())
+                    return Status::PortFull;
+                return Status::Ready;  // Ready to output next block
+            }
+            else
+            {
+                output.finish();
+                return Status::Finished;
+            }
+        }
+        
+        /// Phase::Consume - use standard transform logic
+        return TransformProcessor::prepare();
+    }
+    
+    Chunk transform(Chunk chunk) override
+    {
+        if (chunk.empty())
+        {
+            /// Input finished - switch to output phase
+            aggregated_blocks = aggregator.convertToBlocks();
+            current_phase = Phase::Generate;
+            return {};  // No output yet, will generate in next work() call
+        }
+        
+        /// Consume chunk into aggregator
+        Block block = getHeader().cloneWithColumns(chunk.detachColumns());
+        aggregator.consumeBlock(block);
+        
+        return {};  // No output during consumption phase
+    }
+    
+    Status work() override
+    {
+        if (current_phase == Phase::Generate && !aggregated_blocks.empty())
+        {
+            /// Output next aggregated block
+            auto block = std::move(aggregated_blocks.front());
+            aggregated_blocks.pop_front();
+            
+            Chunk chunk;
+            chunk.setColumns(block.getColumns(), block.rows());
+            output.push(std::move(chunk));
+        }
+        
+        return Status::Ready;
+    }
+};
+```
+
+**Benefits of Transform Processor Design:**
+
+1. **Standardized Interface**: All transforms follow the same prepare/work pattern
+2. **Efficient State Management**: Minimal state, easy to reason about 
+3. **Pipeline Composability**: Transforms can be chained arbitrarily
+4. **Resource Control**: Scheduler has full control over execution timing
+5. **Debugging Support**: Clear state transitions aid in troubleshooting
+
+**Performance Characteristics:**
+
+```cpp
+// Transform processor performance metrics
+struct TransformMetrics {
+    // Timing metrics
+    size_t total_prepare_calls = 0;
+    size_t total_work_calls = 0;
+    double total_work_time_ms = 0.0;
+    
+    // Throughput metrics  
+    size_t chunks_processed = 0;
+    size_t rows_processed = 0;
+    size_t bytes_processed = 0;
+    
+    // State distribution
+    size_t need_data_count = 0;
+    size_t port_full_count = 0;
+    size_t ready_count = 0;
+    
+    double getAvgWorkTime() const {
+        return total_work_calls > 0 ? total_work_time_ms / total_work_calls : 0.0;
+    }
+    
+    double getThroughputMBps() const {
+        return total_work_time_ms > 0 ? (bytes_processed / 1024.0 / 1024.0) / (total_work_time_ms / 1000.0) : 0.0;
+    }
+};
+```
+
+The TransformProcessor foundation enables ClickHouse to build complex query pipelines from simple, composable building blocks while maintaining excellent performance and debuggability.
 
 **Understanding the Two-Phase Execution Model:**
 
@@ -7617,38 +8113,62 @@ The processor architecture is built around chunk-based data processing, where op
 
 Chunks are represented by the `Chunk` class, which contains multiple columns and associated metadata:
 
+**Chunk Class - The Fundamental Data Unit:**
+
+The Chunk class represents the core data unit that flows through ClickHouse's processor pipelines. It encapsulates a collection of columns with a consistent row count, providing the foundation for efficient batch processing.
+
 ```cpp
 class Chunk
 {
 private:
-    Columns columns;          /// Vector of IColumn shared pointers
-    UInt64 num_rows;         /// Number of rows in all columns
-    ChunkInfoPtr chunk_info; /// Optional metadata for special processing
+    Columns columns;          /// Vector of IColumn shared pointers - actual data storage
+    UInt64 num_rows;         /// Number of rows in all columns (must be consistent)
+    ChunkInfoPtr chunk_info; /// Optional metadata for special processing contexts
     
 public:
     /// Construction and basic access
-    Chunk() : num_rows(0) {}
+    Chunk() : num_rows(0) {}  /// Empty chunk for pipeline initialization
+    
+    /// Primary constructor - establishes data consistency
     Chunk(Columns columns_, UInt64 num_rows_)
         : columns(std::move(columns_)), num_rows(num_rows_)
     {
-        checkColumnsConsistency();
+        checkColumnsConsistency();  /// Validates all columns have same row count
     }
     
-    /// Column access and manipulation
+    /// Column access and manipulation - provides controlled access to underlying data
     const Columns & getColumns() const { return columns; }
     void setColumns(Columns columns_) 
     { 
         columns = std::move(columns_);
-        checkColumnsConsistency();
+        checkColumnsConsistency();  /// Always validate after modification
     }
     
-    /// Row count management
+    /// Individual column access for specialized processing
+    MutableColumnPtr mutateColumn(size_t position)
+    {
+        if (position >= columns.size())
+            throw Exception("Column index out of bounds");
+        return IColumn::mutate(std::move(columns[position]));
+    }
+    
+    void addColumn(ColumnPtr column)
+    {
+        if (!columns.empty() && column->size() != num_rows)
+            throw Exception("New column size doesn't match chunk row count");
+        columns.push_back(std::move(column));
+        if (columns.size() == 1)
+            num_rows = columns[0]->size();
+    }
+    
+    /// Row count management - maintains data integrity
     UInt64 getNumRows() const { return num_rows; }
     void setNumRows(UInt64 num_rows_) { num_rows = num_rows_; }
     
-    /// Chunk operations
+    /// Advanced chunk operations for pipeline processing
     Chunk clone() const
     {
+        /// Deep copy for parallel processing branches
         Columns cloned_columns;
         cloned_columns.reserve(columns.size());
         
@@ -7658,6 +8178,22 @@ public:
         return Chunk(std::move(cloned_columns), num_rows);
     }
     
+    /// Efficient slicing for range operations (LIMIT, pagination)
+    Chunk cut(size_t offset, size_t length) const
+    {
+        if (offset + length > num_rows)
+            throw Exception("Cut range exceeds chunk boundaries");
+        
+        Columns cut_columns;
+        cut_columns.reserve(columns.size());
+        
+        for (const auto & column : columns)
+            cut_columns.push_back(column->cut(offset, length));
+        
+        return Chunk(std::move(cut_columns), length);
+    }
+    
+    /// Resource management and cleanup
     void clear() 
     { 
         columns.clear(); 
@@ -7667,12 +8203,12 @@ public:
     
     bool empty() const { return num_rows == 0; }
     
-    /// Memory management
+    /// Memory analysis for performance monitoring
     size_t bytes() const
     {
         size_t total_bytes = 0;
         for (const auto & column : columns)
-            total_bytes += column->byteSize();
+            total_bytes += column->byteSize();  /// Actual data size
         return total_bytes;
     }
     
@@ -7680,11 +8216,24 @@ public:
     {
         size_t total_bytes = 0;
         for (const auto & column : columns)
-            total_bytes += column->allocatedBytes();
+            total_bytes += column->allocatedBytes();  /// Including overhead
         return total_bytes;
     }
     
+    /// Performance metrics for pipeline optimization
+    double compressionRatio() const
+    {
+        size_t allocated = allocatedBytes();
+        size_t used = bytes();
+        return allocated > 0 ? static_cast<double>(used) / allocated : 1.0;
+    }
+    
+    /// Metadata access for specialized processors
+    const ChunkInfoPtr & getChunkInfo() const { return chunk_info; }
+    void setChunkInfo(ChunkInfoPtr chunk_info_) { chunk_info = std::move(chunk_info_); }
+    
 private:
+    /// Data integrity validation - critical for correctness
     void checkColumnsConsistency() const
     {
         if (columns.empty())
@@ -7697,11 +8246,169 @@ private:
         for (const auto & column : columns)
         {
             if (column->size() != num_rows)
-                throw Exception("Column size mismatch in chunk");
+                throw Exception(fmt::format(
+                    "Column size mismatch in chunk: expected {}, got {}", 
+                    num_rows, column->size()));
         }
     }
 };
 ```
+
+**How Chunks Flow Through Pipelines:**
+
+```cpp
+// Example: Processing a chunk through FilterTransform -> ExpressionTransform -> AggregatingTransform
+
+// Step 1: Input chunk creation (from storage)
+Columns input_columns = {
+    std::make_shared<ColumnUInt64>(std::vector<UInt64>{1, 2, 3, 4, 5}),      // user_id
+    std::make_shared<ColumnUInt32>(std::vector<UInt32>{25, 30, 18, 45, 22}), // age
+    std::make_shared<ColumnString>(strings{"A", "B", "C", "D", "E"})          // category
+};
+Chunk input_chunk(std::move(input_columns), 5);  // 5 rows
+
+// Step 2: FilterTransform (WHERE age > 20)
+auto filter_transform = std::make_unique<FilterTransform>(header, filter_expr, "age_filter");
+Chunk filtered_chunk = filter_transform->transform(std::move(input_chunk));
+// Result: 4 rows (ages 25, 30, 45, 22)
+
+// Step 3: ExpressionTransform (SELECT user_id, age * 12 as age_months)
+auto expr_transform = std::make_unique<ExpressionTransform>(header, expression_actions);
+Chunk computed_chunk = expr_transform->transform(std::move(filtered_chunk));
+// Result: 2 columns (user_id, age_months), 4 rows
+
+// Step 4: AggregatingTransform (GROUP BY category)
+auto agg_transform = std::make_unique<AggregatingTransform>(header, aggregator_params);
+Chunk aggregated_chunk = agg_transform->transform(std::move(computed_chunk));
+// Result: Aggregated data grouped by category
+```
+
+**Chunk Size Optimization:**
+
+```cpp
+// Chunk sizing strategy for optimal performance
+class ChunkSizeOptimizer {
+public:
+    static size_t calculateOptimalSize(const Context & context, const Block & header) {
+        // Base size from configuration
+        size_t base_size = context.getSettings().max_block_size;  // Typically 65536
+        
+        // Adjust based on column types and count
+        size_t column_count = header.columns();
+        size_t avg_column_size = estimateAvgColumnSize(header);
+        
+        // Memory-based adjustment
+        size_t available_memory = context.getSettings().max_memory_usage_for_query;
+        size_t max_chunk_memory = available_memory / 100;  // Use max 1% per chunk
+        
+        size_t memory_limited_size = max_chunk_memory / (column_count * avg_column_size);
+        
+        // Vectorization-based adjustment (prefer powers of 2 for SIMD)
+        size_t optimal_size = std::min(base_size, memory_limited_size);
+        optimal_size = roundToPowerOfTwo(optimal_size);
+        
+        // Ensure minimum size for vectorization efficiency
+        return std::max(optimal_size, static_cast<size_t>(1024));
+    }
+    
+private:
+    static size_t estimateAvgColumnSize(const Block & header) {
+        size_t total_size = 0;
+        for (const auto & column_with_type : header) {
+            total_size += column_with_type.type->getSizeOfValueInMemory();
+        }
+        return total_size / header.columns();
+    }
+    
+    static size_t roundToPowerOfTwo(size_t value) {
+        if (value <= 1) return 1;
+        return static_cast<size_t>(1) << (64 - __builtin_clzl(value - 1));
+    }
+};
+
+// Real-world chunk size examples:
+// - Small aggregations: 8,192 rows (better for hash table efficiency)
+// - Large scans: 65,536 rows (maximizes I/O throughput)
+// - String-heavy data: 16,384 rows (balances memory vs. vectorization)
+// - Wide tables (100+ columns): 4,096 rows (avoids excessive memory usage)
+```
+
+**Advanced Chunk Metadata:**
+
+```cpp
+// ChunkInfo provides context for specialized processing
+class ChunkInfo {
+public:
+    virtual ~ChunkInfo() = default;
+    virtual std::shared_ptr<ChunkInfo> clone() const = 0;
+};
+
+// Example: Aggregation state tracking
+class AggregatedChunkInfo : public ChunkInfo {
+public:
+    bool is_overflows = false;           // Indicates hash table overflow occurred
+    Int32 bucket_num = -1;              // For distributed aggregation
+    bool has_two_level = false;         // Uses two-level hash table
+    
+    std::shared_ptr<ChunkInfo> clone() const override {
+        auto result = std::make_shared<AggregatedChunkInfo>();
+        result->is_overflows = is_overflows;
+        result->bucket_num = bucket_num;
+        result->has_two_level = has_two_level;
+        return result;
+    }
+};
+
+// Example: Sort state for optimization
+class SortedChunkInfo : public ChunkInfo {
+public:
+    SortDescription sort_description;    // How the chunk is sorted
+    UInt64 rows_before_limit = 0;       // For LIMIT optimization
+    
+    std::shared_ptr<ChunkInfo> clone() const override {
+        auto result = std::make_shared<SortedChunkInfo>();
+        result->sort_description = sort_description;
+        result->rows_before_limit = rows_before_limit;
+        return result;
+    }
+};
+```
+
+**Performance Benefits of Chunk Design:**
+
+1. **Vectorized Processing**: Chunks enable SIMD operations across column data
+2. **Memory Locality**: Columnar storage provides excellent cache efficiency  
+3. **Batch Optimization**: Reduces function call overhead through batch processing
+4. **Parallel Processing**: Chunks can be processed independently across cores
+5. **Memory Management**: Controlled memory allocation prevents excessive usage
+
+**Memory Characteristics:**
+
+```cpp
+// Typical chunk memory usage patterns
+struct ChunkMemoryProfile {
+    // Example: 65,536 rows with mixed data types
+    size_t num_rows = 65536;
+    
+    // Column sizes for different data types
+    size_t uint64_column_size = num_rows * 8;              // 512 KB
+    size_t string_column_size = num_rows * 20;             // ~1.3 MB (avg 20 chars)
+    size_t nullable_uint32_size = num_rows * (4 + 1);     // 320 KB (data + null mask)
+    
+    // Total memory for a typical chunk (5 columns)
+    size_t total_memory = uint64_column_size * 2 +         // 2 numeric columns
+                         string_column_size +              // 1 string column  
+                         nullable_uint32_size * 2;         // 2 nullable columns
+    // Result: ~3.4 MB per chunk
+    
+    // Memory overhead (column objects, chunk metadata)
+    size_t overhead = sizeof(Chunk) + columns.size() * sizeof(ColumnPtr);
+    
+    double overhead_ratio = static_cast<double>(overhead) / total_memory;  // ~0.01%
+};
+```
+
+The Chunk class provides the essential data abstraction that enables ClickHouse's high-performance columnar processing while maintaining strong data integrity guarantees and efficient memory utilization.
 
 The chunk size is dynamically determined based on several factors:
 - **Memory constraints**: Chunks are sized to fit comfortably in CPU cache while avoiding excessive memory usage
