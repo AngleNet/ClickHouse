@@ -987,65 +987,100 @@ private:
 
 **Predicate Pushdown Pass:**
 
+Predicate pushdown is a critical optimization that moves WHERE conditions as close to data sources as possible, reducing the amount of data that flows through the query pipeline. This optimization can dramatically improve performance by filtering data early.
+
 ```cpp
 class PredicatePushdownVisitor : public ASTVisitor<PredicatePushdownVisitor>
 {
 private:
-    std::vector<ASTPtr> pushed_predicates;
+    std::vector<ASTPtr> pushed_predicates;    // Track successfully pushed predicates
     
 public:
+    // Main entry point for SELECT query optimization
     void visitImpl(ASTSelectQuery& node)
     {
-        // Extract predicates from WHERE clause
+        // Step 1: Extract all predicates from WHERE clause
+        // Break down complex WHERE conditions into individual predicates
         std::vector<ASTPtr> predicates;
         if (node.refWhere())
         {
             extractConjunctivePredicates(node.refWhere(), predicates);
         }
         
-        // Try to push predicates down to subqueries
+        // Step 2: Analyze and push predicates to appropriate tables/subqueries
+        // This is where the real optimization happens
         if (node.refTables())
         {
             pushPredicatesToTables(*node.refTables(), predicates);
         }
         
-        // Reconstruct WHERE clause with remaining predicates
+        // Step 3: Reconstruct WHERE clause with predicates that couldn't be pushed
+        // Only predicates that must remain at this level are kept
         if (!predicates.empty())
         {
             node.refWhere() = combinePredicates(predicates);
         }
         else
         {
-            node.refWhere() = nullptr;
+            node.refWhere() = nullptr;  // All predicates were successfully pushed down
         }
         
+        // Continue processing child nodes
         visitChildren(node);
     }
     
 private:
+    // Recursively extract individual predicates from AND-connected expressions
+    // Example: "a > 5 AND b < 10 AND c = 'x'" becomes three separate predicates
     void extractConjunctivePredicates(ASTPtr expr, std::vector<ASTPtr>& predicates)
     {
         if (auto function = expr->as<ASTFunction>())
         {
             if (function->name == "and" && function->arguments->children.size() == 2)
             {
-                // Recursively extract from AND function
+                // Recursively extract from both sides of AND
                 extractConjunctivePredicates(function->arguments->children[0], predicates);
                 extractConjunctivePredicates(function->arguments->children[1], predicates);
                 return;
             }
         }
         
+        // Base case: this is a single predicate (not an AND expression)
         predicates.push_back(expr);
     }
     
+    // Core optimization logic: determine which predicates can be pushed to which tables
     void pushPredicatesToTables(IAST& tables, std::vector<ASTPtr>& predicates)
     {
-        // Analyze which predicates can be pushed to which tables
-        // Based on column references and join conditions
-        // ... complex implementation
+        // This method analyzes column references in each predicate and determines
+        // if the predicate can be safely moved to a subquery or table scan
+        
+        std::vector<ASTPtr> remaining_predicates;
+        
+        for (auto& predicate : predicates)
+        {
+            // Analyze which tables/columns this predicate references
+            auto referenced_tables = analyzeTableReferences(predicate);
+            
+            if (referenced_tables.size() == 1)
+            {
+                // Predicate only references one table - can be pushed down
+                auto table_name = *referenced_tables.begin();
+                if (pushPredicateToTable(tables, predicate, table_name))
+                {
+                    pushed_predicates.push_back(predicate);
+                    continue;  // Successfully pushed, don't keep in remaining
+                }
+            }
+            
+            // Couldn't push this predicate - keep it at current level
+            remaining_predicates.push_back(predicate);
+        }
+        
+        predicates = std::move(remaining_predicates);
     }
     
+    // Combine multiple predicates back into a single AND expression
     ASTPtr combinePredicates(const std::vector<ASTPtr>& predicates)
     {
         if (predicates.empty())
@@ -1054,7 +1089,7 @@ private:
         if (predicates.size() == 1)
             return predicates[0];
         
-        // Combine with AND functions
+        // Build nested AND functions: ((pred1 AND pred2) AND pred3) AND pred4...
         auto result = predicates[0];
         for (size_t i = 1; i < predicates.size(); ++i)
         {
@@ -1067,7 +1102,74 @@ private:
         
         return result;
     }
+    
+    // Helper methods for predicate analysis
+    std::set<String> analyzeTableReferences(const ASTPtr& predicate) const
+    {
+        std::set<String> tables;
+        
+        // Visit all identifier nodes in the predicate to find table references
+        class TableReferenceVisitor : public ConstInDepthNodeVisitor<TableReferenceVisitor, true>
+        {
+        public:
+            std::set<String>& tables;
+            explicit TableReferenceVisitor(std::set<String>& tables_) : tables(tables_) {}
+            
+            void visit(const ASTPtr& node)
+            {
+                if (auto identifier = node->as<ASTIdentifier>())
+                {
+                    // Extract table name from qualified column reference
+                    auto parts = identifier->name_parts;
+                    if (parts.size() >= 2)
+                    {
+                        tables.insert(parts[0]);  // table.column -> table
+                    }
+                }
+            }
+        };
+        
+        TableReferenceVisitor visitor(tables);
+        visitor.visit(const_cast<ASTPtr&>(predicate));
+        return tables;
+    }
+    
+    bool pushPredicateToTable(IAST& tables, const ASTPtr& predicate, const String& table_name)
+    {
+        // Implementation would locate the specific table/subquery and add the predicate
+        // to its WHERE clause or create one if it doesn't exist
+        // Returns true if push was successful, false if not possible
+        return false;  // Simplified for this example
+    }
 };
+```
+
+**Example of Predicate Pushdown in Action:**
+
+```cpp
+// Original query:
+// SELECT * FROM 
+//   (SELECT id, name FROM users) u
+//   JOIN (SELECT id, category FROM products) p ON u.id = p.id
+// WHERE u.name LIKE 'John%' AND p.category = 'electronics'
+
+// After predicate pushdown:
+// SELECT * FROM 
+//   (SELECT id, name FROM users WHERE name LIKE 'John%') u
+//   JOIN (SELECT id, category FROM products WHERE category = 'electronics') p ON u.id = p.id
+
+// Benefits:
+// - users subquery processes fewer rows (early filtering)
+// - products subquery processes fewer rows
+// - JOIN operates on smaller datasets
+// - Overall query performance dramatically improved
+```
+
+**Performance Impact:**
+- **Early Filtering**: Reduces data volume early in the pipeline
+- **Reduced I/O**: Fewer rows read from storage
+- **Lower Memory Usage**: Smaller intermediate results
+- **Faster JOINs**: Smaller datasets to join together
 ```
 
 #### 1.2.5 Type System Integration
@@ -1076,38 +1178,45 @@ The AST integrates closely with ClickHouse's type system through the `IDataType`
 
 **Type Inference Engine:**
 
+The type inference system determines the data types of all expressions in a query, enabling type safety and optimization opportunities. This is crucial for generating efficient execution code and catching type errors early.
+
 ```cpp
 class TypeInferenceVisitor : public ASTVisitor<TypeInferenceVisitor>
 {
 private:
-    ContextPtr context;
-    std::unordered_map<const IAST*, DataTypePtr> type_map;
-    std::unordered_map<String, DataTypePtr> column_types;
+    ContextPtr context;                                           // Execution context with type info
+    std::unordered_map<const IAST*, DataTypePtr> type_map;      // Maps AST nodes to their inferred types
+    std::unordered_map<String, DataTypePtr> column_types;       // Available column types from tables
     
 public:
     explicit TypeInferenceVisitor(ContextPtr context_) : context(context_) {}
     
+    // Get the inferred type for any AST node
     DataTypePtr getType(const IAST& node) const
     {
         auto it = type_map.find(&node);
         return (it != type_map.end()) ? it->second : nullptr;
     }
     
+    // Register column types from table schemas
     void setColumnType(const String& name, DataTypePtr type)
     {
         column_types[name] = type;
     }
     
+    // Type inference for literal values (constants)
     void visitImpl(const ASTLiteral& node)
     {
-        // Infer type from literal value
+        // Infer type directly from the literal value
+        // Examples: 42 -> Int64, 'hello' -> String, [1,2,3] -> Array(Int64)
         DataTypePtr type = inferTypeFromField(node.value);
         type_map[&node] = type;
     }
     
+    // Type inference for column references
     void visitImpl(const ASTIdentifier& node)
     {
-        // Look up column type
+        // Look up column type in available schemas
         String name = node.name();
         auto it = column_types.find(name);
         if (it != column_types.end())
@@ -1120,12 +1229,13 @@ public:
         }
     }
     
+    // Type inference for function calls - the most complex case
     void visitImpl(const ASTFunction& node)
     {
-        // First, infer types of arguments
+        // Step 1: First, infer types of all arguments recursively
         visitChildren(node);
         
-        // Collect argument types
+        // Step 2: Collect argument types for function resolution
         DataTypes argument_types;
         if (node.arguments)
         {
@@ -1137,15 +1247,24 @@ public:
             });
         }
         
-        // Look up function and get return type
-        auto function_builder = FunctionFactory::instance().get(node.name, context);
-        auto function = function_builder->build(argument_types);
-        
-        DataTypePtr return_type = function->getResultType();
-        type_map[&node] = return_type;
+        // Step 3: Look up function in registry and resolve overload
+        // Functions may have multiple overloads for different argument types
+        try {
+            auto function_builder = FunctionFactory::instance().get(node.name, context);
+            auto function = function_builder->build(argument_types);
+            
+            // Step 4: Get the return type from the resolved function
+            DataTypePtr return_type = function->getResultType();
+            type_map[&node] = return_type;
+        }
+        catch (const Exception& e) {
+            throw Exception("Cannot resolve function '" + node.name + "' with arguments " + 
+                          formatArgumentTypes(argument_types), ErrorCodes::UNKNOWN_FUNCTION);
+        }
     }
     
 private:
+    // Infer data type from a literal field value
     DataTypePtr inferTypeFromField(const Field& field)
     {
         switch (field.getType())
@@ -1174,30 +1293,97 @@ private:
                 throw Exception("Cannot infer type from field", ErrorCodes::LOGICAL_ERROR);
         }
     }
+    
+    // Helper method to format argument types for error messages
+    String formatArgumentTypes(const DataTypes& types) const
+    {
+        if (types.empty())
+            return "()";
+        
+        String result = "(";
+        for (size_t i = 0; i < types.size(); ++i)
+        {
+            if (i > 0) result += ", ";
+            result += types[i]->getName();
+        }
+        result += ")";
+        return result;
+    }
 };
 ```
 
+**Type Inference Examples in Practice:**
+
+```cpp
+// Example 1: Simple literal types
+// SQL: SELECT 42, 'hello', 3.14
+visitImpl(ASTLiteral{42})      // Infers: Int64
+visitImpl(ASTLiteral{'hello'}) // Infers: String  
+visitImpl(ASTLiteral{3.14})    // Infers: Float64
+
+// Example 2: Column references
+// For table users(id Int64, name String, age Int32)
+setColumnType("id", std::make_shared<DataTypeInt64>());
+setColumnType("name", std::make_shared<DataTypeString>());
+setColumnType("age", std::make_shared<DataTypeInt32>());
+
+visitImpl(ASTIdentifier{"id"})   // Infers: Int64
+visitImpl(ASTIdentifier{"name"}) // Infers: String
+
+// Example 3: Function calls with type resolution
+// SQL: plus(age, 5)
+// Step 1: Infer argument types: [Int32, Int64]  
+// Step 2: Look up plus() function
+// Step 3: Find overload: plus(Int32, Int64) -> Int64
+// Result: Function expression has type Int64
+
+// Example 4: Complex nested expressions
+// SQL: length(concat(name, ' - ', toString(age)))
+// Step 1: toString(age): Int32 -> String
+// Step 2: concat(name, ' - ', toString_result): (String, String, String) -> String  
+// Step 3: length(concat_result): String -> UInt64
+// Final result: UInt64
+
+// Example 5: Type error detection
+// SQL: plus(name, age)  -- String + Int32
+// Result: Exception "Cannot resolve function 'plus' with arguments (String, Int32)"
+```
+
+**Benefits of Type Inference:**
+- **Early Error Detection**: Type mismatches caught during planning, not execution
+- **Optimization Opportunities**: Known types enable specialized code generation
+- **Function Overload Resolution**: Correct function variant selected based on argument types
+- **Memory Layout Optimization**: Fixed-width types can use more efficient storage
+- **Vectorization**: Type information enables SIMD optimizations
+```
+
 **Type Compatibility Checker:**
+
+The type compatibility system determines which data types can be used together in operations, enabling automatic type conversions and preventing invalid operations at compile time.
 
 ```cpp
 class TypeCompatibilityChecker
 {
 public:
+    // Main compatibility check - determines if two types can be used together
     static bool areCompatible(const DataTypePtr& left, const DataTypePtr& right)
     {
-        // Check for exact match
+        // Rule 1: Exact type match - always compatible
         if (left->equals(*right))
             return true;
         
-        // Check for numeric compatibility
+        // Rule 2: Numeric types can be converted between each other
+        // Examples: Int32 + Int64, Float32 + Int32, UInt8 + Int64
         if (isNumeric(left) && isNumeric(right))
             return true;
         
-        // Check for string compatibility
+        // Rule 3: String types are mutually compatible
+        // Examples: String + FixedString, String + LowCardinality(String)
         if (isString(left) && isString(right))
             return true;
         
-        // Check for nullable compatibility
+        // Rule 4: Nullable types - check compatibility of nested types
+        // Examples: Nullable(Int32) + Int32, Nullable(String) + Nullable(String)
         if (left->isNullable() || right->isNullable())
         {
             auto left_nested = removeNullable(left);
@@ -1205,9 +1391,23 @@ public:
             return areCompatible(left_nested, right_nested);
         }
         
-        return false;
+        // Rule 5: Array types - check element compatibility
+        if (isArray(left) && isArray(right))
+        {
+            auto left_element = getArrayElementType(left);
+            auto right_element = getArrayElementType(right);
+            return areCompatible(left_element, right_element);
+        }
+        
+        // Rule 6: Date/DateTime family compatibility
+        if (isDateOrDateTime(left) && isDateOrDateTime(right))
+            return true;
+        
+        return false;  // No compatibility rules matched
     }
     
+    // Find the most specific common type that can represent all given types
+    // Used for UNION queries, array construction, conditional expressions, etc.
     static DataTypePtr getCommonType(const DataTypes& types)
     {
         if (types.empty())
@@ -1218,13 +1418,14 @@ public:
         {
             result = getCommonTypeImpl(result, types[i]);
             if (!result)
-                return nullptr;
+                return nullptr;  // No common type exists
         }
         
         return result;
     }
     
 private:
+    // Helper methods for type classification
     static bool isNumeric(const DataTypePtr& type)
     {
         return type->isValueRepresentedByNumber();
@@ -1232,7 +1433,19 @@ private:
     
     static bool isString(const DataTypePtr& type)
     {
-        return isString(type) || isFixedString(type);
+        return isStringOrFixedString(type) || isLowCardinalityString(type);
+    }
+    
+    static bool isArray(const DataTypePtr& type)
+    {
+        return typeid_cast<const DataTypeArray*>(type.get()) != nullptr;
+    }
+    
+    static bool isDateOrDateTime(const DataTypePtr& type)
+    {
+        return typeid_cast<const DataTypeDate*>(type.get()) != nullptr ||
+               typeid_cast<const DataTypeDateTime*>(type.get()) != nullptr ||
+               typeid_cast<const DataTypeDateTime64*>(type.get()) != nullptr;
     }
     
     static DataTypePtr removeNullable(const DataTypePtr& type)
@@ -1242,13 +1455,110 @@ private:
         return type;
     }
     
-    static DataTypePtr getCommonTypeImpl(const DataTypePtr& left, const DataTypePtr& right)
+    static DataTypePtr getArrayElementType(const DataTypePtr& type)
     {
-        // Complex type promotion logic
-        // ... implementation details
+        if (auto array_type = typeid_cast<const DataTypeArray*>(type.get()))
+            return array_type->getNestedType();
         return nullptr;
     }
+    
+    // Find common type between two specific types
+    static DataTypePtr getCommonTypeImpl(const DataTypePtr& left, const DataTypePtr& right)
+    {
+        // Exact match
+        if (left->equals(*right))
+            return left;
+        
+        // Numeric type promotion (Int32 + Int64 -> Int64, Int32 + Float32 -> Float32)
+        if (isNumeric(left) && isNumeric(right))
+            return promoteNumericTypes(left, right);
+        
+        // String types -> String
+        if (isString(left) && isString(right))
+            return std::make_shared<DataTypeString>();
+        
+        // Nullable promotion
+        if (left->isNullable() != right->isNullable())
+        {
+            auto common_nested = getCommonTypeImpl(removeNullable(left), removeNullable(right));
+            if (common_nested)
+                return std::make_shared<DataTypeNullable>(common_nested);
+        }
+        
+        return nullptr;  // No common type found
+    }
+    
+    static DataTypePtr promoteNumericTypes(const DataTypePtr& left, const DataTypePtr& right)
+    {
+        // Simplified numeric promotion rules
+        // Float types take precedence over integer types
+        // Larger bit width takes precedence over smaller
+        
+        if (isFloatingPoint(left) || isFloatingPoint(right))
+        {
+            // Promote to largest floating point type
+            if (isFloat64(left) || isFloat64(right))
+                return std::make_shared<DataTypeFloat64>();
+            return std::make_shared<DataTypeFloat32>();
+        }
+        
+        // Both are integers - promote to largest
+        auto left_bits = getIntegerBitWidth(left);
+        auto right_bits = getIntegerBitWidth(right);
+        auto max_bits = std::max(left_bits, right_bits);
+        
+        bool is_signed = isSignedInteger(left) || isSignedInteger(right);
+        
+        if (max_bits <= 8)
+            return is_signed ? std::make_shared<DataTypeInt8>() : std::make_shared<DataTypeUInt8>();
+        if (max_bits <= 16)
+            return is_signed ? std::make_shared<DataTypeInt16>() : std::make_shared<DataTypeUInt16>();
+        if (max_bits <= 32)
+            return is_signed ? std::make_shared<DataTypeInt32>() : std::make_shared<DataTypeUInt32>();
+        
+        return is_signed ? std::make_shared<DataTypeInt64>() : std::make_shared<DataTypeUInt64>();
+    }
 };
+```
+
+**Type Compatibility Examples:**
+
+```cpp
+// Example 1: Numeric type compatibility
+areCompatible(Int32, Int64);      // true  - both numeric
+areCompatible(Float32, Int32);    // true  - numeric promotion
+areCompatible(String, Int32);     // false - incompatible types
+
+// Example 2: Common type resolution for UNION
+// SQL: SELECT 42 UNION SELECT 3.14 UNION SELECT NULL
+DataTypes union_types = {Int64, Float64, Nullable(Nothing)};
+auto common = getCommonType(union_types);  // Result: Nullable(Float64)
+
+// Example 3: Array type compatibility
+areCompatible(Array(Int32), Array(Int64));     // true  - element types compatible
+areCompatible(Array(String), Array(Int32));   // false - element types incompatible
+
+// Example 4: Nullable type handling
+areCompatible(Nullable(Int32), Int32);         // true  - nullable unwrapped
+areCompatible(Nullable(String), String);      // true  - compatible after unwrapping
+
+// Example 5: Conditional expression type resolution
+// SQL: CASE WHEN x > 0 THEN 42 ELSE 3.14 END
+auto condition_result = getCommonType({Int64, Float64});  // Result: Float64
+
+// Example 6: Function argument validation
+// SQL: plus(age, salary) where age:Int32, salary:Float32
+if (areCompatible(Int32, Float32)) {
+    // Arguments are compatible, function can proceed
+    auto result_type = promoteNumericTypes(Int32, Float32);  // Result: Float32
+}
+```
+
+**Performance Benefits:**
+- **Compile-Time Validation**: Type errors caught during query planning
+- **Optimal Conversions**: Minimal type promotions chosen automatically  
+- **Vectorization**: Compatible types enable SIMD operations
+- **Memory Efficiency**: Unnecessary conversions avoided
 ```
 
 This detailed analysis of ClickHouse's AST construction demonstrates the sophisticated engineering behind query representation and manipulation. The combination of efficient memory management, flexible visitor patterns, comprehensive optimization passes, and tight type system integration creates a robust foundation for the entire query processing pipeline.
@@ -2005,50 +2315,106 @@ ClickHouse's query planning architecture represents the critical bridge between 
 
 #### 1.4.1 QueryPlan Structure
 
-The QueryPlan serves as an intermediate representation that captures the logical execution steps required to process a query:
+The QueryPlan serves as an intermediate representation that captures the logical execution steps required to process a query. Think of it as a recipe that describes exactly how to execute a query, step by step.
 
 ```cpp
 class QueryPlan
 {
 private:
-    QueryPlanStepPtr root_step;
-    std::vector<std::unique_ptr<QueryPlanStep>> steps;
+    QueryPlanStepPtr root_step;                                    // The final step that produces query results
+    std::vector<std::unique_ptr<QueryPlanStep>> steps;           // All steps in execution order
     
     // Optimization context
-    QueryPlanOptimizationSettings optimization_settings;
-    ContextPtr context;
+    QueryPlanOptimizationSettings optimization_settings;          // Controls which optimizations to apply
+    ContextPtr context;                                           // Execution context with settings
     
 public:
     QueryPlan() = default;
     ~QueryPlan() = default;
     
-    // Plan construction
+    // Plan construction - building the execution recipe
+    // addStep(): Adds a new step and connects it to existing steps
     void addStep(QueryPlanStepPtr step);
+    
+    // addStepToRoot(): Makes the new step the final output step
     void addStepToRoot(QueryPlanStepPtr step);
     
     // Plan structure access
     QueryPlanStepPtr getRootStep() const { return root_step; }
     const std::vector<std::unique_ptr<QueryPlanStep>>& getSteps() const { return steps; }
     
-    // Optimization
+    // Optimization - transforms the plan for better performance
+    // Applies rules like filter pushdown, expression merging, join reordering
     void optimize(const QueryPlanOptimizationSettings & settings);
     
-    // Pipeline construction
+    // Pipeline construction - converts logical plan to executable processors
     QueryPipelineBuilderPtr buildQueryPipeline(
         const QueryPlanOptimizationSettings & optimization_settings,
         const BuildQueryPipelineSettings & build_pipeline_settings);
     
-    // Introspection
+    // Introspection - helps understand what the query will do
+    // explainPlan(): Shows logical steps (like SQL EXPLAIN)
     void explainPlan(WriteBuffer & buffer, const ExplainPlanOptions & options) const;
+    
+    // explainPipeline(): Shows physical execution plan with processors
     void explainPipeline(WriteBuffer & buffer, const ExplainPipelineOptions & options) const;
     
 private:
-    void checkInitialized() const;
-    void checkNotCompleted() const;
+    void checkInitialized() const;     // Ensures plan is in valid state
+    void checkNotCompleted() const;    // Prevents modification of completed plans
 };
 ```
 
+**How QueryPlan Works in Practice:**
+
+```cpp
+// Example: Building a plan for "SELECT name FROM users WHERE age > 18 ORDER BY name"
+
+QueryPlan plan;
+
+// Step 1: Add reading from storage
+auto read_step = std::make_unique<ReadFromMergeTree>(
+    storage,                    // users table
+    storage_snapshot,
+    {"name", "age"},           // columns needed
+    query_info,                // contains WHERE age > 18
+    context,
+    4                          // use 4 parallel streams
+);
+plan.addStep(std::move(read_step));
+
+// Step 2: Add filtering (WHERE age > 18)
+auto filter_step = std::make_unique<FilterStep>(
+    plan.getCurrentDataStream(),
+    filter_actions,            // age > 18 expression
+    "age_filter_result",      // filter column name
+    true                      // remove filter column after filtering
+);
+plan.addStep(std::move(filter_step));
+
+// Step 3: Add sorting (ORDER BY name)
+auto sort_step = std::make_unique<SortingStep>(
+    plan.getCurrentDataStream(),
+    sort_description,          // sort by name ascending
+    0,                        // no limit
+    SizeLimits{}              // no memory limits
+);
+plan.addStep(std::move(sort_step));
+
+// Step 4: Add projection (SELECT name)
+auto projection_step = std::make_unique<ExpressionStep>(
+    plan.getCurrentDataStream(),
+    projection_actions         // extract only 'name' column
+);
+plan.addStep(std::move(projection_step));
+
+// The plan now represents: Read -> Filter -> Sort -> Project
+```
+```
+
 **QueryPlan Step Hierarchy:**
+
+Each step in the query plan represents a specific operation (like reading data, filtering, sorting) that transforms input data streams into output streams.
 
 ```cpp
 class IQueryPlanStep
@@ -2056,34 +2422,124 @@ class IQueryPlanStep
 public:
     virtual ~IQueryPlanStep() = default;
     
+    // Identity and description
+    // getName(): Returns the type of operation (e.g., "ReadFromMergeTree", "Filter", "Aggregating")
     virtual String getName() const = 0;
+    
+    // getStepDescription(): Human-readable description for EXPLAIN output
     virtual String getStepDescription() const = 0;
     
-    // Input/Output streams
+    // Data flow specification - defines what data flows into and out of this step
+    
+    // getInputStreams(): What data this step expects to receive
+    // Empty for source steps (like table reads), non-empty for transform steps
     virtual DataStreams getInputStreams() const = 0;
+    
+    // getOutputStream(): What data this step produces
+    // Defines column names, types, and estimated row count
     virtual DataStream getOutputStream() const = 0;
     
-    // Pipeline construction
+    // Pipeline construction - converts logical step to physical processors
+    // pipelines: input data pipelines from child steps
+    // settings: configuration for processor creation
+    // Returns: pipeline builder with processors implementing this step
     virtual QueryPipelineBuilderPtr updatePipeline(
         QueryPipelineBuilders pipelines,
         const BuildQueryPipelineSettings & settings) = 0;
     
-    // Optimization
+    // Optimization and introspection support
+    
+    // describePipeline(): Adds pipeline details to EXPLAIN output
     virtual void describePipeline(FormatSettings & settings) const {}
+    
+    // describeActions(): Adds expression/action details to EXPLAIN output
     virtual void describeActions(JSONBuilder::JSONMap & map) const {}
+    
+    // describeIndexes(): Adds index usage information to EXPLAIN output
     virtual void describeIndexes(JSONBuilder::JSONMap & map) const {}
     
-    // Step transformation
+    // Step transformation - allows modification of pipeline during optimization
     virtual void transformPipeline(const std::function<void(QueryPipelineBuilder &)> & transform) {}
     
 protected:
-    // Child steps management
+    // Child steps management - forms the execution tree
     std::vector<std::unique_ptr<IQueryPlanStep>> children;
     
 public:
     void addChild(std::unique_ptr<IQueryPlanStep> child);
     const std::vector<std::unique_ptr<IQueryPlanStep>>& getChildren() const { return children; }
 };
+```
+
+**Step Types and Their Purposes:**
+
+```cpp
+// Source Steps - produce data from storage or external sources
+class ReadFromMergeTree : public IQueryPlanStep {
+    // Reads data from MergeTree table parts
+    // Can apply primary key filtering, skip unused columns
+    // Supports parallel reading from multiple parts
+};
+
+class ReadFromMemoryStorage : public IQueryPlanStep {
+    // Reads data from in-memory tables
+    // Very fast, no I/O involved
+};
+
+// Transform Steps - modify data flowing through the pipeline
+class FilterStep : public IQueryPlanStep {
+    // Applies WHERE conditions
+    // Can eliminate rows early to reduce downstream processing
+};
+
+class ExpressionStep : public IQueryPlanStep {
+    // Evaluates expressions (column calculations, function calls)
+    // Used for SELECT list processing, computed columns
+};
+
+class AggregatingStep : public IQueryPlanStep {
+    // Performs GROUP BY aggregation
+    // Can use hash tables or sorting-based aggregation
+};
+
+class SortingStep : public IQueryPlanStep {
+    // Sorts data by specified columns
+    // Can spill to disk for large datasets
+};
+
+// Join Steps - combine data from multiple sources
+class JoinStep : public IQueryPlanStep {
+    // Performs various join types (INNER, LEFT, RIGHT, FULL)
+    // Uses hash join or sort-merge join algorithms
+};
+
+// Sink Steps - output data to final destinations
+class WriteToSink : public IQueryPlanStep {
+    // Writes query results to output format
+    // Handles various output formats (TabSeparated, JSON, etc.)
+};
+```
+
+**Step Interconnection Example:**
+
+```cpp
+// For query: SELECT count(*) FROM users WHERE age > 18
+// Plan structure:
+
+ReadFromMergeTree          // Source: reads users table
+    ↓ DataStream{columns: [age], rows: ~1M}
+FilterStep                 // Transform: applies WHERE age > 18
+    ↓ DataStream{columns: [age], rows: ~100K}  
+AggregatingStep           // Transform: computes count(*)
+    ↓ DataStream{columns: [count], rows: 1}
+WriteToSink               // Sink: outputs result
+
+// Each step's updatePipeline() method creates processors:
+// ReadFromMergeTree -> creates MergeTreeSource processors
+// FilterStep -> creates FilterTransform processors  
+// AggregatingStep -> creates AggregatingTransform processors
+// WriteToSink -> creates OutputFormat processors
+```
 ```
 
 **Specialized Step Types:**

@@ -1,0 +1,414 @@
+# ClickHouse Report Code Readability Improvement TODO Plan
+
+## Overview
+After reviewing the actual source code sections in the ClickHouse technical report, I've identified 47 specific code blocks that need enhanced explanations, examples, and better documentation for improved readability.
+
+## Priority Categories
+
+### 🔴 CRITICAL - Complex classes without sufficient explanation
+### 🟡 MEDIUM - Code blocks with minimal comments  
+### 🟢 LOW - Code that could benefit from examples
+
+---
+
+## PHASE 1: Core Architecture Classes (15 items)
+
+### ✅ TODO-1: PredicatePushdownVisitor class (Line 989) **COMPLETED**
+**Issue**: Complex AST transformation logic without step-by-step explanation
+**Action**: ✅ Added detailed comments explaining predicate extraction and table analysis
+- ✅ Added step-by-step process explanation
+- ✅ Added practical SQL examples showing before/after optimization
+- ✅ Added performance impact analysis
+- ✅ Added helper method explanations
+
+### ✅ TODO-2: TypeInferenceVisitor class (Line 1078) **COMPLETED**
+**Issue**: Type system integration lacks examples
+**Action**: ✅ Added practical examples of type inference for different SQL constructs
+- ✅ Added detailed method parameter explanations
+- ✅ Added step-by-step type resolution examples
+- ✅ Added error handling examples
+- ✅ Added function overload resolution explanations
+- ✅ Added performance benefits analysis
+
+### ✅ TODO-3: TypeCompatibilityChecker class (Line 1181) **COMPLETED**
+**Issue**: Complex type compatibility logic without clear examples
+**Action**: ✅ Added examples showing compatible/incompatible type combinations
+- ✅ Added comprehensive compatibility rules with examples
+- ✅ Added numeric type promotion logic
+- ✅ Added practical usage examples for UNION, conditionals, functions
+- ✅ Added helper method implementations
+- ✅ Added performance benefits explanation
+
+### 🔴 TODO-4: QueryAnalyzer class (Line 1322)
+**Issue**: New analyzer architecture needs better explanation vs legacy
+**Action**: Add migration examples and feature comparison
+```cpp
+QueryTreeNodePtr analyze(QueryTreeNodePtr query_tree_node);
+// Missing: Step-by-step analysis process explanation
+```
+
+### 🔴 TODO-5: IQueryTreeNode hierarchy (Line 1372)
+**Issue**: Node type hierarchy without clear usage patterns
+**Action**: Add examples of each node type and relationships
+```cpp
+enum class NodeType { QUERY, UNION, TABLE, ... }
+// Missing: When each node type is used, tree structure examples
+```
+
+### 🟡 TODO-6: QueryNode class (Line 1423)
+**Issue**: Complex query structure representation
+**Action**: Add examples showing how SQL queries map to QueryNode
+```cpp
+QueryTreeNodePtr projection; QueryTreeNodePtr where;
+// Missing: How SQL "SELECT x FROM y WHERE z" becomes QueryNode structure
+```
+
+### 🟡 TODO-7: AnalysisScope class (Line 1535)
+**Issue**: Scope management without clear lifecycle explanation
+**Action**: Add scope nesting examples and variable resolution
+```cpp
+void addColumn(const String & column_name, DataTypePtr type);
+// Missing: How scope resolution works for nested queries
+```
+
+### 🟡 TODO-8: ExpressionOptimizer class (Line 1671)
+**Issue**: Optimization rules without concrete examples
+**Action**: Add before/after optimization examples
+```cpp
+ASTPtr optimizeExpression(ASTPtr expression);
+// Missing: What optimizations are applied, performance impact
+```
+
+### ✅ TODO-9: QueryPlan class (Line 2009) **COMPLETED**
+**Issue**: Plan construction logic needs step-by-step breakdown
+**Action**: ✅ Added examples showing SQL to QueryPlan transformation
+- ✅ Added detailed method parameter explanations
+- ✅ Added practical SQL-to-plan example
+- ✅ Added step interconnection examples
+- ✅ Added IQueryPlanStep interface enhancements
+- ✅ Added step type categorization and purposes
+
+### 🔴 TODO-10: ReadFromMergeTree step (Line 2090)
+**Issue**: Complex storage reading logic without explanation
+**Action**: Add examples of part selection and parallelization
+```cpp
+void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings & settings) override;
+// Missing: How parts are selected, how parallelism is determined
+```
+
+### 🟡 TODO-11: MergeExpressions optimization (Line 2298)
+**Issue**: Expression merging logic without examples
+**Action**: Add before/after examples of expression merging
+```cpp
+void transformPlan(QueryPlan & plan) override;
+// Missing: What expressions can be merged, performance benefits
+```
+
+### 🟡 TODO-12: QueryPlanCostModel class (Line 2461)
+**Issue**: Cost calculation without clear examples
+**Action**: Add cost calculation examples for different operations
+```cpp
+double calculateCost(const IQueryPlanStep & step) const;
+// Missing: How costs are calculated, what factors influence cost
+```
+
+### 🔴 TODO-13: JoinOrderOptimizer class (Line 2500)
+**Issue**: Complex join optimization without clear algorithm explanation
+**Action**: Add examples of join reordering decisions
+```cpp
+QueryPlan optimizeJoinOrder(QueryPlan plan);
+// Missing: How join order affects performance, optimization algorithm
+```
+
+### 🟡 TODO-14: Port class (Line 2594)
+**Issue**: Port communication system needs clearer examples
+**Action**: Add data flow examples between processors
+```cpp
+bool hasData() const; void push(Chunk chunk);
+// Missing: How data flows through ports, backpressure examples
+```
+
+### 🟡 TODO-15: PipelineExecutor class (Line 3201)
+**Action**: Add processor scheduling examples and state transitions
+```cpp
+void execute(); void cancel();
+// Missing: How processors are scheduled, performance characteristics
+```
+
+## PHASE 2: Storage Engine Classes (12 items)
+
+### 🔴 TODO-16: StorageFactory class (Line 3621)
+**Issue**: Factory pattern without registration examples
+**Action**: Add examples of storage engine registration and creation
+```cpp
+void registerStorage(const String & name, Creator creator, Features features = {});
+// Missing: How engines are registered, feature flag usage
+```
+
+### 🔴 TODO-17: StorageMergeTree class (Line 3921)
+**Issue**: Complex merge operations without clear lifecycle
+**Action**: Add merge scheduling and execution examples
+```cpp
+bool scheduleDataProcessingJob(BackgroundJobsAssignee & assignee) override;
+// Missing: How merges are triggered, performance impact
+```
+
+### 🔴 TODO-18: MergeTreeData class (Line 4414)
+**Issue**: Core data management without part lifecycle explanation
+**Action**: Add part creation, merging, and cleanup examples
+```cpp
+DataPartsVector getAllDataPartsVector() const;
+// Missing: Part state transitions, cleanup policies
+```
+
+### 🔴 TODO-19: IMergeTreeDataPart class (Line 4619)
+**Issue**: Part representation without format explanation
+**Action**: Add examples of part structure and metadata
+```cpp
+String getTypeName() const; size_t getBytesOnDisk() const;
+// Missing: How parts store data, metadata structure
+```
+
+### 🟡 TODO-20: MergeTreeDataPartWide (Line 4805)
+**Issue**: Wide format specifics without comparison to compact
+**Action**: Add format comparison examples and use cases
+```cpp
+class MergeTreeDataPartWide : public IMergeTreeDataPart
+// Missing: When wide format is used, performance characteristics
+```
+
+### 🟡 TODO-21: MergeTreeDataPartCompact (Line 4954)
+**Issue**: Compact format without clear benefits explanation
+**Action**: Add examples showing compact vs wide format trade-offs
+```cpp
+class MergeTreeDataPartCompact : public IMergeTreeDataPart
+// Missing: When compact format is beneficial, storage efficiency
+```
+
+### 🟡 TODO-22: MergeTreeMarksLoader (Line 5142)
+**Issue**: Mark loading without clear purpose explanation
+**Action**: Add examples of mark usage in query execution
+```cpp
+MarkRange loadMarks(size_t mark_index) const;
+// Missing: What marks are, how they accelerate queries
+```
+
+### 🟡 TODO-23: CompressedBlockOutputStream (Line 5239)
+**Issue**: Compression streaming without examples
+**Action**: Add compression pipeline examples
+```cpp
+void writeBlock(const Block & block);
+// Missing: How compression works, performance trade-offs
+```
+
+### 🟡 TODO-24: CompressionCodec classes (Lines 5413-5707)
+**Issue**: Various codecs without comparison and use cases
+**Action**: Add codec comparison and selection guidelines
+```cpp
+class CompressionCodecLZ4, CompressionCodecZSTD, etc.
+// Missing: When to use each codec, performance characteristics
+```
+
+### 🟡 TODO-25: MergeTreePrimaryIndex (Line 6033)
+**Issue**: Primary index without query acceleration examples
+**Action**: Add examples of index usage in query execution
+```cpp
+void select(MarkRanges & mark_ranges, const KeyCondition & condition) const;
+// Missing: How index accelerates WHERE conditions
+```
+
+### 🟡 TODO-26: MergeTreeIndexMinMax (Line 6265)
+**Issue**: MinMax index without clear benefits
+**Action**: Add examples of min/max index effectiveness
+```cpp
+bool mayBeTrueInRange(const Range & range) const;
+// Missing: What queries benefit from min/max indexes
+```
+
+### 🟡 TODO-27: MergeTreeIndexBloomFilter (Line 6427)
+**Issue**: Bloom filter without false positive explanation
+**Action**: Add bloom filter examples and tuning guidelines
+```cpp
+bool mayBeTrueInRange(const Range & range) const;
+// Missing: Bloom filter characteristics, tuning parameters
+```
+
+## PHASE 3: Processor Pipeline Classes (10 items)
+
+### 🔴 TODO-28: TransformProcessor (Line 6924)
+**Issue**: Base transform without clear state machine explanation
+**Action**: Add state transition examples for transform processors
+```cpp
+Status prepare() override; void work() override;
+// Missing: How transform state machine works
+```
+
+### 🔴 TODO-29: SynchronizedPortSystem (Line 7113)
+**Issue**: Thread-safe data transfer without examples
+**Action**: Add examples of concurrent data flow
+```cpp
+bool tryTransferData(OutputPort & output, InputPort & input);
+// Missing: How thread safety is achieved, performance impact
+```
+
+### 🔴 TODO-30: Chunk class (Line 7163)
+**Issue**: Core data structure without memory layout explanation
+**Action**: Add examples of chunk construction and manipulation
+```cpp
+Chunk(Columns columns_, UInt64 num_rows_);
+// Missing: How chunks are structured, memory efficiency
+```
+
+### 🟡 TODO-31: JoinProcessor (Line 7262)
+**Issue**: Join implementation without algorithm explanation
+**Action**: Add examples of different join algorithms
+```cpp
+class JoinProcessor : public IProcessor
+// Missing: Hash join vs sort-merge join examples
+```
+
+### 🟡 TODO-32: FilterTransform (Line 7639)
+**Issue**: Filtering without PREWHERE explanation
+**Action**: Add examples of filter pushdown optimization
+```cpp
+void transform(Chunk & chunk) override;
+// Missing: How filtering is optimized, PREWHERE benefits
+```
+
+### 🟡 TODO-33: SortingTransform (Line 7923)
+**Issue**: Sorting without external sort explanation
+**Action**: Add examples of in-memory vs external sorting
+```cpp
+void work() override;
+// Missing: When external sorting kicks in, memory management
+```
+
+### 🟡 TODO-34: QueryPipelineBuilder (Line 8113)
+**Issue**: Pipeline construction without optimization examples
+**Action**: Add examples of pipeline optimization
+```cpp
+void addTransform(ProcessorPtr transform);
+// Missing: How pipelines are optimized, parallelization decisions
+```
+
+### 🟡 TODO-35: MemoryAwareBuilder (Line 8553)
+**Issue**: Memory management without threshold examples
+**Action**: Add memory pressure handling examples
+```cpp
+void checkMemoryUsage();
+// Missing: How memory limits are enforced
+```
+
+### 🟡 TODO-36: NUMAAwareBuilder (Line 8629)
+**Issue**: NUMA optimization without topology examples
+**Action**: Add NUMA topology examples and benefits
+```cpp
+void optimizeForNUMA();
+// Missing: How NUMA affects performance, optimization strategies
+```
+
+### 🟡 TODO-37: AdaptiveParallelization (Line 8717)
+**Issue**: Dynamic parallelization without examples
+**Action**: Add examples of parallelism adaptation
+```cpp
+void adjustParallelism(double cpu_usage);
+// Missing: How parallelism is adjusted, performance monitoring
+```
+
+## PHASE 4: Memory and Data Management (10 items)
+
+### 🔴 TODO-38: IColumn interface (Line 9636)
+**Issue**: Core column interface without type-specific examples
+**Action**: Add examples for different column types
+```cpp
+virtual ColumnPtr clone() const = 0;
+// Missing: How different column types are implemented
+```
+
+### 🔴 TODO-39: Arena class (Line 9710)
+**Issue**: Memory pool without allocation pattern examples
+**Action**: Add examples of arena usage and benefits
+```cpp
+char * alloc(size_t size);
+// Missing: When arenas are beneficial, memory patterns
+```
+
+### 🔴 TODO-40: Block class (Line 10153)
+**Issue**: Core data block without structure examples
+**Action**: Add examples of block construction and manipulation
+```cpp
+void insert(size_t position, ColumnWithTypeAndName column);
+// Missing: How blocks represent tabular data
+```
+
+### 🔴 TODO-41: Field class (Line 10824)
+**Issue**: Variant type without conversion examples
+**Action**: Add examples of field type conversions
+```cpp
+template <typename T> T & get();
+// Missing: How different types are stored and converted
+```
+
+### 🟡 TODO-42: ParallelAggregatingTransform (Line 8968)
+**Issue**: Parallel aggregation without data distribution examples
+**Action**: Add examples of data partitioning for aggregation
+```cpp
+void work() override;
+// Missing: How data is partitioned, memory usage patterns
+```
+
+### 🟡 TODO-43: SharedMemoryPool (Line 9278)
+**Issue**: Shared memory without contention examples
+**Action**: Add examples of memory sharing between threads
+```cpp
+void * allocate(size_t size);
+// Missing: How memory sharing reduces overhead
+```
+
+### 🟡 TODO-44: WorkStealingScheduler (Line 9482)
+**Issue**: Work stealing without load balancing examples
+**Action**: Add examples of work distribution
+```cpp
+Task stealWork();
+// Missing: How work stealing improves CPU utilization
+```
+
+### 🟡 TODO-45: IAggregateFunction (Line 12846)
+**Issue**: Aggregation interface without state management examples
+**Action**: Add examples of aggregation state handling
+```cpp
+void add(AggregateDataPtr place, const IColumn ** columns, size_t row_num, Arena * arena) const = 0;
+// Missing: How aggregation state is managed
+```
+
+### 🟡 TODO-46: Aggregator class (Line 13398)
+**Issue**: Core aggregation logic without hash table examples
+**Action**: Add examples of hash table usage and resizing
+```cpp
+void execute(Block & block);
+// Missing: How hash tables grow, collision handling
+```
+
+### 🟡 TODO-47: RemoteQueryExecutor (Line 15032)
+**Issue**: Distributed execution without shard coordination examples
+**Action**: Add examples of cross-shard query coordination
+```cpp
+void execute();
+// Missing: How queries are distributed, result collection
+```
+
+---
+
+## Implementation Strategy
+
+### Phase 1 (Critical): Focus on core architecture classes that are central to understanding
+### Phase 2 (Storage): Enhance storage engine understanding with practical examples  
+### Phase 3 (Pipeline): Improve processor pipeline comprehension
+### Phase 4 (Memory): Complete memory management and data structure explanations
+
+## Success Metrics
+- ✅ Every class has clear purpose explanation
+- ✅ Complex methods have step-by-step breakdowns
+- ✅ Practical examples for each major concept
+- ✅ Error handling and edge cases documented
+- ✅ Performance implications clearly explained
