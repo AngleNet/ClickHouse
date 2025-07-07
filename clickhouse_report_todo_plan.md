@@ -66,31 +66,32 @@ Create a comprehensive 100,000+ word technical report on ClickHouse's query pipe
   - Index selection and optimization strategies
   - Performance analysis and selectivity estimation
 
-### Phase 3: Processor Architecture (15,000 words)
-- [ ] 3.1 IProcessor Interface (3,000 words)
-  - Processor lifecycle
-  - Port management
-  - Status handling
-  - Memory allocation
-- [ ] 3.2 Source Processors (3,000 words)
-  - SourceFromSingleChunk
-  - MergeTreeSelectProcessor
-  - RemoteSource
-  - Data generation
-- [ ] 3.3 Transform Processors (4,000 words)
-  - FilterTransform
-  - ExpressionTransform
-  - AggregatingTransform
-  - SortingTransform
-- [ ] 3.4 Sink Processors (2,000 words)
-  - NullSink
-  - RemoteSink
-  - Output formatting
-- [ ] 3.5 Pipeline Execution (3,000 words)
-  - Executor implementation
-  - Thread scheduling
-  - Resource management
-  - Error propagation
+### Phase 3: Processor Architecture (15,000 words) **IN PROGRESS**
+- [x] 3.1 IProcessor Interface and Execution Model (3,000 words) ✅ **COMPLETED**
+  - State machine implementation (NeedData, Ready, Finished, etc.)
+  - Port-based communication system
+  - Vectorized execution model
+  - Dynamic pipeline modification capabilities
+- [ ] 3.2 Processor State Machine and Port System (3,000 words) **TODO**
+  - Detailed state transitions and protocols
+  - InputPort and OutputPort implementations
+  - Data flow synchronization mechanisms
+  - Chunk-based processing model
+- [ ] 3.3 Core Processor Types and Implementations (3,000 words) **TODO**
+  - Source processors (StorageSource, RemoteSource)
+  - Transform processors (FilterTransform, ExpressionTransform, SortingTransform)
+  - Aggregation processors (AggregatingTransform, GroupStateMerge)
+  - Sink processors (StorageSink, NetworkSink)
+- [ ] 3.4 Pipeline Graph Construction (3,000 words) **TODO**
+  - QueryPipelineBuilder architecture
+  - Logical to physical translation
+  - Parallelization strategies
+  - Resource management and optimization
+- [ ] 3.5 Parallelism and Resource Allocation (3,000 words) **TODO**
+  - Thread allocation strategies
+  - NUMA awareness and CPU affinity
+  - Memory management in parallel execution
+  - Load balancing and work stealing
 
 ### Phase 4: Data Structures and Memory Management (12,000 words)
 - [ ] 4.1 Column Architecture (4,000 words)

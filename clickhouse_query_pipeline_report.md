@@ -6388,3 +6388,149 @@ Phase 2 has provided a comprehensive deep dive into ClickHouse's storage engine 
 5. **Indexing System**: Primary indices combined with various skip indices that accelerate query execution across massive datasets.
 
 This storage layer foundation provides the robust, high-performance data management capabilities that enable ClickHouse to excel in analytical workloads while maintaining excellent compression ratios and query performance.
+
+---
+
+# Phase 3: Processor Architecture (15,000 words)
+
+## 3.1 IProcessor Interface and Execution Model (3,000 words)
+
+ClickHouse's modern query execution engine is built around a sophisticated processor architecture that replaced the older stream-based system. At the heart of this architecture lies the `IProcessor` interface, which defines a unified abstraction for all query execution operators. This processor-based approach enables fine-grained parallelism, dynamic pipeline modification, and efficient resource utilization across multi-core systems.
+
+### The IProcessor Interface Design
+
+The `IProcessor` interface represents a fundamental shift from traditional database execution models. Each processor is a self-contained execution unit that can consume data from input ports, perform transformations, and produce results through output ports. The interface is designed around a state machine pattern that enables non-blocking, asynchronous execution:
+
+```cpp
+class IProcessor
+{
+public:
+    /// Processor states for execution control
+    enum class Status
+    {
+        NeedData,       /// Processor needs more input data
+        PortFull,       /// Output port is full, cannot produce more data
+        Finished,       /// Processor has completed its work
+        Ready,          /// Processor is ready to do work
+        Async,          /// Processor is doing async work (e.g., reading from disk)
+        ExpandPipeline  /// Processor wants to add new processors to pipeline
+    };
+
+    /// Main execution method - returns current status
+    virtual Status work() = 0;
+    
+    /// Prepare for execution - called before work()
+    virtual Status prepare() = 0;
+    
+    /// Get input and output ports
+    virtual InputPorts & getInputs() = 0;
+    virtual OutputPorts & getOutputs() = 0;
+    
+    /// Get processor description for debugging
+    virtual String getName() const = 0;
+};
+```
+
+This interface design provides several key advantages. First, the state-based execution model allows for fine-grained control over processor execution, enabling the scheduler to make optimal decisions about when to execute each processor. Second, the port-based communication system creates clear data flow dependencies that can be analyzed for parallelization opportunities. Third, the asynchronous execution support allows processors to yield control during I/O operations without blocking the entire pipeline.
+
+### Processor State Machine Mechanics
+
+The processor state machine is the core mechanism that drives query execution. Each processor maintains an internal state that determines what actions it can perform and how it interacts with the execution scheduler. The state transitions follow a carefully designed protocol:
+
+**NeedData State**: When a processor enters the NeedData state, it indicates that it requires more input data to continue processing. The scheduler will not execute this processor until data becomes available on at least one of its input ports. This state is crucial for implementing backpressure in the pipeline - if a downstream processor cannot accept more data, upstream processors will eventually transition to NeedData, causing execution to pause until the bottleneck is resolved.
+
+**Ready State**: A processor in the Ready state has all necessary inputs available and can perform useful work. The scheduler prioritizes Ready processors for execution, as they can make immediate progress. The transition to Ready typically occurs when input data arrives or when internal processing completes.
+
+**PortFull State**: This state indicates that the processor has produced output data but cannot send it downstream because output ports are full. This creates natural flow control in the pipeline, preventing fast producers from overwhelming slow consumers.
+
+**Finished State**: Once a processor completes all its work and has no more data to produce, it transitions to Finished. The scheduler removes finished processors from the execution queue, and their resources can be reclaimed.
+
+**Async State**: For processors that need to perform I/O operations or other asynchronous work, the Async state allows them to yield control while maintaining their position in the pipeline. This is particularly important for disk I/O, network operations, and other potentially blocking activities.
+
+### Port-Based Communication System
+
+The communication between processors occurs through a sophisticated port system that manages data flow and dependencies. Each processor declares its input and output ports, which are strongly typed and enforce data format consistency across the pipeline.
+
+Input ports act as data receivers with built-in buffering and flow control mechanisms:
+
+```cpp
+class InputPort
+{
+private:
+    Header header;                    /// Column types and names
+    std::shared_ptr<Chunk> data;     /// Current data chunk
+    bool is_finished = false;        /// No more data will arrive
+    OutputPort * output_port = nullptr; /// Connected output port
+    
+public:
+    /// Check if data is available
+    bool hasData() const { return data != nullptr; }
+    
+    /// Pull data from connected output port
+    Chunk pull();
+    
+    /// Check if connected output is finished
+    bool isFinished() const;
+    
+    /// Set port as needed for execution planning
+    void setNeeded();
+};
+```
+
+Output ports manage data production and delivery to downstream processors:
+
+```cpp
+class OutputPort
+{
+private:
+    Header header;                    /// Column types and names
+    std::shared_ptr<Chunk> data;     /// Data to be sent
+    bool is_finished = false;        /// No more data will be produced
+    InputPort * input_port = nullptr; /// Connected input port
+    
+public:
+    /// Check if port can accept more data
+    bool canPush() const { return data == nullptr; }
+    
+    /// Push data to connected input port
+    void push(Chunk chunk);
+    
+    /// Mark port as finished
+    void finish();
+    
+    /// Check if port has data waiting
+    bool hasData() const { return data != nullptr; }
+};
+```
+
+The port system implements several sophisticated features for efficient data flow management. First, it provides automatic backpressure propagation - when a downstream processor cannot accept more data, the pressure propagates upstream through the port connections. Second, it supports chunk-based processing, where data is moved in optimally-sized chunks rather than row-by-row, enabling vectorized operations. Third, the strongly-typed headers ensure that data format mismatches are caught early in pipeline construction rather than during execution.
+
+### Vectorized Execution Model
+
+ClickHouse's processor architecture is designed specifically to support vectorized execution, where operations are performed on chunks of data rather than individual rows. This approach provides significant performance benefits by improving CPU cache utilization, enabling SIMD optimizations, and reducing function call overhead.
+
+Each data chunk contains multiple columns represented as `IColumn` objects, along with metadata about the number of rows and column types. The chunk size is dynamically adjusted based on data characteristics and memory constraints, typically ranging from 8,192 to 65,536 rows. This size optimization balances memory usage with vectorization efficiency.
+
+The vectorized model extends throughout the processor hierarchy. Source processors read data in chunks from storage engines, transform processors operate on entire chunks at once, and sink processors write chunks to their destinations. This consistency enables the query optimizer to make assumptions about data granularity and optimize accordingly.
+
+### Dynamic Pipeline Modification
+
+One of the most sophisticated features of the processor architecture is its support for dynamic pipeline modification during execution. Processors can request pipeline changes through the `ExpandPipeline` status, allowing for runtime adaptation to changing conditions.
+
+Common scenarios for dynamic modification include:
+
+**External Sorting**: When a sort processor detects that input data exceeds available memory, it can dynamically add external merge processors to handle disk-based sorting. This transformation occurs transparently without interrupting other pipeline operations.
+
+**Parallel Aggregation**: Aggregation processors can spawn additional parallel aggregators when they detect high cardinality data that would benefit from distributed processing. The original processor becomes a coordinator that merges results from the parallel workers.
+
+**Adaptive Join Strategies**: Join processors can switch between hash join and sort-merge join algorithms based on actual data characteristics observed during execution. This adaptation occurs by inserting appropriate preprocessing processors into the pipeline.
+
+The dynamic modification system maintains pipeline consistency by ensuring that all changes preserve data flow semantics and type safety. New processors inherit appropriate headers and port configurations from their parent processors, and the scheduler seamlessly integrates them into the execution plan.
+
+### Resource Management and Scheduling
+
+The processor architecture includes sophisticated resource management capabilities that ensure optimal utilization of system resources. Each processor can declare its resource requirements, including memory usage, CPU intensity, and I/O characteristics. The scheduler uses this information to make intelligent decisions about processor execution order and parallelization.
+
+Memory management is particularly critical in the processor model. Each processor tracks its memory consumption and can trigger garbage collection or external processing when limits are approached. The system maintains global memory pressure indicators that influence processor scheduling decisions, prioritizing memory-efficient processors when resources are constrained.
+
+CPU scheduling considers processor characteristics when making execution decisions. CPU-intensive processors like aggregation and sorting operations are scheduled to maximize core utilization, while I/O-bound processors are interleaved to overlap computation with data access. The scheduler also considers NUMA topology when assigning processors to threads, ensuring that memory-intensive operations run on cores with optimal memory access patterns.
