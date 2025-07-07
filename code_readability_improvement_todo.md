@@ -201,13 +201,15 @@ void execute(); void cancel();
 - ✅ Added format selection criteria and optimization recommendations
 - ✅ Added complete comparison with wide format trade-offs
 
-### 🟡 TODO-22: MergeTreeMarksLoader (Line 5142)
+### ✅ TODO-22: MergeTreeMarksLoader (Line 5142) **COMPLETED**
 **Issue**: Mark loading without clear purpose explanation
-**Action**: Add examples of mark usage in query execution
-```cpp
-MarkRange loadMarks(size_t mark_index) const;
-// Missing: What marks are, how they accelerate queries
-```
+**Action**: ✅ Enhanced with comprehensive granule navigation system details
+- ✅ Added sophisticated mark management with intelligent caching (100x speedup)
+- ✅ Added advanced mark range selection for query optimization
+- ✅ Added real-world examples showing 87.5% granule pruning effectiveness
+- ✅ Added comprehensive performance analytics and monitoring
+- ✅ Added mark validation and error handling for data integrity
+- ✅ Added specialized loading patterns for different query types
 
 ### 🟡 TODO-23: CompressedBlockOutputStream (Line 5239)
 **Issue**: Compression streaming without examples
@@ -225,21 +227,25 @@ class CompressionCodecLZ4, CompressionCodecZSTD, etc.
 // Missing: When to use each codec, performance characteristics
 ```
 
-### 🟡 TODO-25: MergeTreePrimaryIndex (Line 6033)
+### ✅ TODO-25: MergeTreePrimaryIndex (Line 6033) **COMPLETED**
 **Issue**: Primary index without query acceleration examples
-**Action**: Add examples of index usage in query execution
-```cpp
-void select(MarkRanges & mark_ranges, const KeyCondition & condition) const;
-// Missing: How index accelerates WHERE conditions
-```
+**Action**: ✅ Enhanced with comprehensive query acceleration engine details
+- ✅ Added logarithmic-time index operations with O(log n) complexity analysis
+- ✅ Added advanced range search with intelligent caching and optimization
+- ✅ Added real-world performance examples showing 97.6% granule pruning
+- ✅ Added comprehensive analytics and monitoring for index optimization
+- ✅ Added query pattern analysis with effectiveness measurements
+- ✅ Added optimization recommendations based on usage patterns
 
-### 🟡 TODO-26: MergeTreeIndexMinMax (Line 6265)
+### ✅ TODO-26: MergeTreeIndexMinMax (Line 6265) **COMPLETED**
 **Issue**: MinMax index without clear benefits
-**Action**: Add examples of min/max index effectiveness
-```cpp
-bool mayBeTrueInRange(const Range & range) const;
-// Missing: What queries benefit from min/max indexes
-```
+**Action**: ✅ Enhanced with comprehensive range query acceleration details
+- ✅ Added sophisticated MinMax index implementation with validation and optimization
+- ✅ Added granule-level min/max tracking with NULL handling and performance metrics
+- ✅ Added query condition evaluation with detailed analysis and benefits assessment
+- ✅ Added real-world examples showing 96.9% granule elimination effectiveness
+- ✅ Added performance characteristics comparison with bloom filters
+- ✅ Added comprehensive use case recommendations and optimization guidelines
 
 ### 🟡 TODO-27: MergeTreeIndexBloomFilter (Line 6427)
 **Issue**: Bloom filter without false positive explanation
