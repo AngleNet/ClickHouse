@@ -16,19 +16,53 @@ ClickHouse employs a hand-written recursive descent parser, a design choice that
 
 **Core Parser Classes:**
 
-The `IParser` base class defines the fundamental parsing interface:
+The `IParser` base class defines the fundamental parsing interface that all SQL parsing components must implement:
 
 ```cpp
 class IParser
 {
 public:
     virtual ~IParser() = default;
+    
+    // Core parsing method that each parser must implement
+    // pos: current position in token stream (passed by reference, modified during parsing)
+    // node: output parameter where the constructed AST node will be stored
+    // expected: accumulates information about what tokens were expected (for error messages)
+    // Returns: true if parsing succeeded, false if it failed
     virtual bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) = 0;
+    
+    // Returns human-readable name of this parser (used in error messages)
     virtual const char * getName() const = 0;
     
+    // Public interface methods that provide common parsing logic
     bool parse(Pos & pos, ASTPtr & node, Expected & expected);
     bool wrapParseImpl(Pos & pos, ASTPtr & node, Expected & expected);
 };
+```
+
+**How the Parser Interface Works:**
+
+The parsing process follows this pattern:
+1. **Input**: A `TokenIterator` pointing to the current position in the token stream
+2. **Processing**: The parser attempts to match its expected pattern starting from that position
+3. **Output**: If successful, creates an AST node and advances the position; if failed, leaves position unchanged
+4. **Error Tracking**: The `Expected` parameter collects what was expected at each failure point
+
+**Example Usage:**
+```cpp
+// Parse a SELECT statement
+ParserSelectQuery select_parser;
+TokenIterator pos = token_stream.begin();
+ASTPtr result_node;
+Expected expected;
+
+if (select_parser.parse(pos, result_node, expected)) {
+    // Success: result_node contains the parsed SELECT AST
+    // pos now points to the next unparsed token
+} else {
+    // Failure: generate error message using expected tokens
+    throw ParsingException("Expected " + expected.describe());
+}
 ```
 
 The `IParserBase` class extends this interface with common functionality:
@@ -47,29 +81,61 @@ protected:
 
 **TokenIterator Implementation:**
 
-The parser operates on tokens rather than raw characters, using the `TokenIterator` class:
+The parser operates on tokens rather than raw characters, using the `TokenIterator` class. This abstraction allows the parser to work with meaningful linguistic units instead of individual characters:
 
 ```cpp
 class TokenIterator
 {
 private:
-    const Token * tokens;
-    size_t index = 0;
-    size_t end = 0;
+    const Token * tokens;     // Array of pre-lexed tokens
+    size_t index = 0;        // Current position in token array
+    size_t end = 0;          // One past the last valid token
     
 public:
+    // Constructor takes a pre-lexed token array
     TokenIterator(const Token * tokens_, size_t end_) 
         : tokens(tokens_), end(end_) {}
     
+    // Dereference operators to access current token
     const Token & operator*() const { return tokens[index]; }
     const Token * operator->() const { return &tokens[index]; }
     
+    // Advancement operators (move to next token)
     TokenIterator & operator++() { ++index; return *this; }
     TokenIterator operator++(int) { auto copy = *this; ++index; return copy; }
     
+    // State checking methods
     bool isValid() const { return index < end; }
     size_t getIndex() const { return index; }
 };
+```
+
+**Why TokenIterator is Essential:**
+
+1. **Abstraction**: Hides the complexity of character-level processing from the parser
+2. **Performance**: Pre-lexed tokens are faster to process than character-by-character parsing
+3. **Error Reporting**: Token positions provide precise error locations in the original SQL
+4. **Backtracking**: Easy to save and restore positions for alternative parsing paths
+
+**Example Token Processing:**
+```cpp
+// Example: parsing "SELECT column1, column2 FROM table1"
+TokenIterator pos(tokens, token_count);
+
+// pos points to: Token{type=SELECT, text="SELECT"}
+assert(pos->type == TokenType::SELECT);
+++pos;
+
+// pos points to: Token{type=BareWord, text="column1"}
+assert(pos->type == TokenType::BareWord);
+String first_column = pos->toString(); // "column1"
+++pos;
+
+// pos points to: Token{type=Comma, text=","}
+assert(pos->type == TokenType::Comma);
+++pos;
+
+// Continue parsing...
 ```
 
 #### 1.1.2 Lexical Analysis and Token Processing
@@ -109,24 +175,52 @@ enum class TokenType
 };
 ```
 
-Each token contains position information, type, and the actual text:
+Each token contains position information, type, and the actual text. This structure provides efficient access to token data without copying strings:
 
 ```cpp
 struct Token
 {
-    TokenType type;
-    const char * begin;
-    const char * end;
-    size_t max_length;
+    TokenType type;           // What kind of token this is (keyword, identifier, etc.)
+    const char * begin;       // Pointer to start of token in original SQL string
+    const char * end;         // Pointer to end of token in original SQL string
+    size_t max_length;        // Maximum possible length (for validation)
     
     Token() = default;
     Token(TokenType type_, const char * begin_, const char * end_)
         : type(type_), begin(begin_), end(end_), max_length(end_ - begin_) {}
     
+    // Convert token to string (creates a copy)
     std::string toString() const { return std::string(begin, end); }
+    
+    // Get token length without creating string
     size_t size() const { return end - begin; }
+    
+    // Check if token should be considered in parsing (excludes whitespace/comments)
     bool isSignificant() const;
 };
+```
+
+**Token Memory Efficiency:**
+
+The token structure uses pointers into the original SQL string rather than copying text, which:
+- **Saves Memory**: No duplicate strings stored
+- **Improves Performance**: No string allocation during lexing
+- **Preserves Context**: Original positions maintained for error reporting
+
+**Example Token Creation:**
+```cpp
+// Original SQL: "SELECT id FROM users WHERE age > 25"
+const char* sql = "SELECT id FROM users WHERE age > 25";
+
+// Lexer creates tokens pointing into this string:
+Token select_token{TokenType::SELECT, sql, sql + 6};     // points to "SELECT"
+Token id_token{TokenType::BareWord, sql + 7, sql + 9};   // points to "id"
+Token from_token{TokenType::FROM, sql + 10, sql + 14};   // points to "FROM"
+// ... and so on
+
+// No string copying occurs - tokens just reference the original
+assert(select_token.toString() == "SELECT");
+assert(id_token.size() == 2);  // "id" has length 2
 ```
 
 **Lexical State Machine:**
@@ -187,43 +281,73 @@ Each parser follows a consistent pattern:
 4. **Backtracking**: Restore position on failure and try alternative patterns
 5. **Error Reporting**: Generate meaningful error messages for failed parses
 
-Example implementation for SELECT statement parsing:
+**Detailed Example: SELECT Statement Parsing Implementation**
+
+This shows how ClickHouse parses a complete SELECT statement using the recursive descent approach:
 
 ```cpp
 bool ParserSelectQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
+    // Create the AST node that will represent this SELECT query
     auto select_query = std::make_shared<ASTSelectQuery>();
     
-    // Parse SELECT keyword
+    // Step 1: Parse mandatory SELECT keyword
+    // s_select is a ParserKeyword that expects the exact token "SELECT"
     if (!s_select.ignore(pos, expected))
-        return false;
+        return false;  // Not a SELECT statement, return failure
     
-    // Parse DISTINCT if present
+    // Step 2: Parse optional DISTINCT keyword
+    // ignore() returns true if found, false if not (but doesn't fail parsing)
     if (s_distinct.ignore(pos, expected))
-        select_query->distinct = true;
+        select_query->distinct = true;  // Set flag if DISTINCT was found
     
-    // Parse expression list
+    // Step 3: Parse the column list (mandatory)
+    // This handles: "col1", "col2, col3", "func(col1) AS alias", etc.
     if (!expression_list_parser.parse(pos, select_query->select_expression_list, expected))
-        return false;
+        return false;  // Invalid expression list, parsing fails
     
-    // Parse FROM clause if present
+    // Step 4: Parse optional FROM clause
     if (s_from.ignore(pos, expected))
     {
+        // FROM keyword found, now parse table references
+        // This handles: "table1", "table1 t1 JOIN table2 t2 ON ...", subqueries, etc.
         if (!tables_parser.parse(pos, select_query->tables(), expected))
-            return false;
+            return false;  // Invalid table reference, parsing fails
     }
     
-    // Parse WHERE clause if present
+    // Step 5: Parse optional WHERE clause
     if (s_where.ignore(pos, expected))
     {
+        // WHERE keyword found, parse the condition expression
         if (!expression_parser.parse(pos, select_query->where(), expected))
-            return false;
+            return false;  // Invalid WHERE condition, parsing fails
     }
     
+    // Step 6: Return the completed AST node
     node = select_query;
-    return true;
+    return true;  // Success!
 }
 ```
+
+**How This Parsing Works Step-by-Step:**
+
+For the SQL: `SELECT DISTINCT name, age FROM users WHERE age > 18`
+
+1. **Token Stream**: `[SELECT] [DISTINCT] [name] [,] [age] [FROM] [users] [WHERE] [age] [>] [18]`
+
+2. **Parsing Flow**:
+   ```cpp
+   // pos initially points to [SELECT]
+   s_select.ignore(pos, expected)     // Consumes [SELECT], pos moves to [DISTINCT]
+   s_distinct.ignore(pos, expected)   // Consumes [DISTINCT], pos moves to [name]
+   expression_list_parser.parse(...)  // Consumes [name] [,] [age], pos moves to [FROM]
+   s_from.ignore(pos, expected)       // Consumes [FROM], pos moves to [users]
+   tables_parser.parse(...)           // Consumes [users], pos moves to [WHERE]
+   s_where.ignore(pos, expected)      // Consumes [WHERE], pos moves to [age]
+   expression_parser.parse(...)       // Consumes [age] [>] [18], pos moves to end
+   ```
+
+3. **Result**: Complete `ASTSelectQuery` with all components properly parsed and linked
 
 #### 1.1.4 Error Handling and Recovery Mechanisms
 
@@ -358,7 +482,7 @@ The Abstract Syntax Tree (AST) is the intermediate representation that bridges t
 
 #### 1.2.1 AST Node Architecture
 
-The foundation of ClickHouse's AST is the `IAST` interface, which defines the contract for all AST nodes:
+The foundation of ClickHouse's AST is the `IAST` interface, which defines the contract for all AST nodes. This base class provides a comprehensive framework for representing, manipulating, and analyzing SQL syntax trees:
 
 ```cpp
 class IAST
@@ -366,22 +490,49 @@ class IAST
 public:
     virtual ~IAST() = default;
     
-    // Core virtual methods
+    // Core virtual methods that every AST node must implement
+    
+    // getID(): Returns unique identifier for this node type (used for hashing/comparison)
+    // delimiter: character used to separate components in the ID string
     virtual String getID(char delimiter = '_') const = 0;
+    
+    // clone(): Creates a deep copy of this node and all its children
+    // Essential for query transformation and optimization
     virtual ASTPtr clone() const = 0;
+    
+    // formatImpl(): Converts the AST back to SQL text representation
+    // settings: formatting preferences (indentation, keywords case, etc.)
+    // state: current formatting context (depth, previous elements)
+    // frame: stack frame for nested formatting
     virtual void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const = 0;
     
-    // Tree traversal methods
+    // Tree traversal methods for visitor pattern implementation
+    
+    // forEachChild(): Applies function to each direct child of this node
+    // func: function to call on each child node
     virtual void forEachChild(std::function<void(const ASTPtr &)> func) const {}
+    
+    // updateTreeHashImpl(): Updates hash with this node's content
+    // Used for query plan caching and comparison
     virtual void updateTreeHashImpl(SipHash & hash_state) const;
     
-    // Utility methods
+    // Utility methods for AST analysis and debugging
+    
+    // getTreeHash(): Computes hash of entire subtree rooted at this node
     String getTreeHash() const;
+    
+    // dumpTree(): Outputs human-readable tree structure for debugging
     void dumpTree(WriteBuffer & ostr, size_t indent = 0) const;
+    
+    // size(): Returns total number of nodes in subtree (for memory analysis)
     size_t size() const;
+    
+    // checkSize(): Validates tree size doesn't exceed limit (prevents stack overflow)
     size_t checkSize(size_t max_size) const;
     
-    // Type checking
+    // Type checking with safe casting (avoids dynamic_cast overhead)
+    
+    // as<T>(): Safely cast this node to specific type T, returns nullptr if wrong type
     template <typename T>
     T * as() { return typeid(*this) == typeid(T) ? static_cast<T *>(this) : nullptr; }
     
@@ -389,10 +540,45 @@ public:
     const T * as() const { return typeid(*this) == typeid(T) ? static_cast<const T *>(this) : nullptr; }
     
 protected:
-    // Memory management
-    size_t children_size = 0;
-    static constexpr auto max_depth = 1000;
+    // Memory management and safety limits
+    size_t children_size = 0;                    // Number of direct children
+    static constexpr auto max_depth = 1000;      // Maximum tree depth to prevent stack overflow
 };
+```
+
+**Key Design Principles of the AST Interface:**
+
+1. **Type Safety**: The `as<T>()` method provides safe downcasting without the overhead of `dynamic_cast`
+2. **Memory Efficiency**: Nodes track their size to prevent excessive memory usage
+3. **Immutability Support**: Clone operations enable safe transformations without side effects
+4. **Visitor Pattern**: `forEachChild()` enables clean tree traversal algorithms
+5. **Debugging Support**: `dumpTree()` and size tracking help with development and troubleshooting
+
+**Example Usage of AST Interface:**
+```cpp
+// Parse a simple SELECT statement
+ASTPtr root = parseSQL("SELECT name FROM users");
+
+// Safe type checking and casting
+if (auto select = root->as<ASTSelectQuery>()) {
+    std::cout << "Found SELECT query\n";
+    
+    // Get the column list
+    if (select->select_expression_list) {
+        select->select_expression_list->forEachChild([](const ASTPtr& child) {
+            if (auto identifier = child->as<ASTIdentifier>()) {
+                std::cout << "Column: " << identifier->name() << "\n";
+            }
+        });
+    }
+}
+
+// Create a deep copy for transformation
+ASTPtr modified_query = root->clone();
+
+// Check tree complexity
+size_t node_count = root->size();
+std::cout << "AST has " << node_count << " nodes\n";
 ```
 
 **Memory Management Strategy:**
@@ -3226,7 +3412,7 @@ ClickHouse's storage layer is built around a sophisticated abstraction that enab
 
 ### 2.1.1 IStorage Interface Design
 
-The `IStorage` interface represents one of ClickHouse's most critical abstractions, providing a unified API for all storage engines:
+The `IStorage` interface represents one of ClickHouse's most critical abstractions, providing a unified API for all storage engines. This interface enables ClickHouse to support diverse storage backends (MergeTree, Memory, Distributed, etc.) with a consistent query processing layer:
 
 ```cpp
 class IStorage : public std::enable_shared_from_this<IStorage>
@@ -3234,18 +3420,40 @@ class IStorage : public std::enable_shared_from_this<IStorage>
 public:
     using StoragePtr = std::shared_ptr<IStorage>;
     
-    // Core metadata interface
+    // Core metadata interface - provides basic table identification
+    // getName(): Returns the storage engine name (e.g., "MergeTree", "Memory", "Distributed")  
     virtual String getName() const = 0;
+    
+    // getTableName(): Returns the logical table name as seen by users
     virtual String getTableName() const = 0;
+    
+    // getDatabaseName(): Returns the database containing this table
     virtual String getDatabaseName() const = 0;
     
-    // Schema management
+    // Schema management - handles table structure and metadata
+    // getInMemoryMetadata(): Returns complete table schema including columns, indices, constraints
     virtual StorageInMemoryMetadata getInMemoryMetadata() const = 0;
+    
+    // getHeader(): Returns column structure for query planning (names + types)
     virtual Block getHeader() const = 0;
+    
+    // getColumns(): Returns list of regular columns (excludes virtual columns)
     virtual NamesAndTypesList getColumns() const = 0;
+    
+    // getVirtuals(): Returns virtual columns that don't physically exist but can be queried
+    // Examples: _path for file-based storage, _shard_num for distributed tables
     virtual NamesAndTypesList getVirtuals() const { return {}; }
     
-    // Query execution interface
+    // Query execution interface - core methods for data access
+    
+    // read(): Main method for SELECT queries - builds processor pipeline for reading data
+    // query_plan: execution plan to add reading steps to
+    // column_names: specific columns requested (optimization hint)
+    // storage_snapshot: consistent view of table schema during query
+    // query_info: parsed query with WHERE conditions, ORDER BY, etc.
+    // processed_stage: how much processing to do in storage vs query layer
+    // max_block_size: preferred chunk size for vectorized processing  
+    // num_streams: parallelism hint for reading
     virtual void read(
         QueryPlan & query_plan,
         const Names & column_names,
@@ -3256,6 +3464,11 @@ public:
         size_t max_block_size,
         size_t num_streams) = 0;
     
+    // write(): Main method for INSERT queries - creates sink processor for writing data
+    // query: original INSERT AST (may contain settings, format info)
+    // metadata_snapshot: table schema at time of insert
+    // context: query execution context with settings and permissions
+    // async_insert: whether to use asynchronous insertion optimization
     virtual SinkToStoragePtr write(
         const ASTPtr & query,
         const StorageMetadataPtr & metadata_snapshot,
@@ -3267,14 +3480,38 @@ public:
     virtual void shutdown() {}
     virtual void flush() {}
     
-    // Storage capabilities
+    // Storage capabilities - feature flags that inform query optimization
+    
+    // supportsParallelInsert(): Can this storage handle concurrent INSERT operations safely?
+    // Used to enable multi-threaded inserts for better performance
     virtual bool supportsParallelInsert() const { return false; }
+    
+    // supportsSubcolumns(): Can this storage read parts of complex types (Array elements, Tuple fields)?  
+    // Enables optimization where only needed subcolumns are read
     virtual bool supportsSubcolumns() const { return false; }
+    
+    // supportsDynamicSubcolumns(): Can subcolumns be accessed without schema predefinition?
+    // Important for flexible data formats like JSON
     virtual bool supportsDynamicSubcolumns() const { return false; }
+    
+    // supportsPrewhere(): Can this storage push filter conditions to storage layer?
+    // PREWHERE allows early filtering before full column materialization
     virtual bool supportsPrewhere() const { return false; }
+    
+    // supportsFinal(): Does this storage need FINAL clause for deduplicated reads?
+    // ReplacingMergeTree and CollapsingMergeTree require FINAL for consistent results
     virtual bool supportsFinal() const { return false; }
+    
+    // supportsIndexForIn(): Can this storage use indices for IN (...) conditions?
+    // Enables set index optimization for large IN lists
     virtual bool supportsIndexForIn() const { return false; }
+    
+    // supportsReplication(): Is this storage replicated across multiple nodes?
+    // Affects query routing and consistency guarantees
     virtual bool supportsReplication() const { return false; }
+    
+    // supportsDeduplication(): Does this storage automatically deduplicate identical inserts?
+    // Important for exactly-once delivery semantics
     virtual bool supportsDeduplication() const { return false; }
     
     // Optimization hints
@@ -3307,6 +3544,75 @@ protected:
     ContextPtr global_context;
     LoggerPtr log;
 };
+```
+
+**How IStorage Interface Works in Practice:**
+
+The IStorage interface enables ClickHouse to treat all storage engines uniformly while allowing each to optimize for its specific use case. Here's how it works:
+
+**Example 1: Reading from MergeTree**
+```cpp
+// Query: SELECT name, age FROM users WHERE age > 18
+StoragePtr storage = getTable("users");
+
+// Check storage capabilities for optimization
+if (storage->supportsPrewhere()) {
+    // Push WHERE condition to storage layer for early filtering
+    query_info.prewhere_info = extractPrewhereConditions("age > 18");
+}
+
+// Call storage's read method
+QueryPlan plan;
+storage->read(
+    plan,
+    {"name", "age"},              // Only read needed columns
+    storage_snapshot,
+    query_info,                   // Contains WHERE conditions
+    context,
+    QueryProcessingStage::FetchColumns,  // Let storage do filtering
+    8192,                         // Block size
+    4                            // Use 4 parallel streams
+);
+```
+
+**Example 2: Writing to Different Storage Engines**
+```cpp
+// Both operations use the same interface, but implementation differs dramatically:
+
+// Writing to MergeTree (disk-based, supports merges)
+auto merge_tree_sink = merge_tree_storage->write(insert_query, metadata, context);
+// Creates buffered sink that writes data parts to disk
+
+// Writing to Memory table (RAM-based, no persistence)
+auto memory_sink = memory_storage->write(insert_query, metadata, context);  
+// Creates sink that directly appends to in-memory blocks
+
+// The query processor doesn't need to know the difference!
+```
+
+**Example 3: Storage Engine Selection**
+```cpp
+// Different engines optimize for different use cases:
+
+if (query_requires_deduplication) {
+    // Use ReplacingMergeTree for automatic deduplication
+    assert(storage->supportsDeduplication());
+}
+
+if (query_has_large_in_clause) {
+    // Use storage with set index support
+    if (storage->supportsIndexForIn()) {
+        // Can optimize "column IN (1,2,3,...1000)" efficiently
+    }
+}
+
+if (requires_high_consistency) {
+    // Use replicated storage
+    if (storage->supportsReplication()) {
+        // Data is automatically replicated across nodes
+    }
+}
+```
 ```
 
 ### 2.1.2 Storage Engine Registration and Factory Pattern
@@ -6405,31 +6711,77 @@ The `IProcessor` interface represents a fundamental shift from traditional datab
 class IProcessor
 {
 public:
-    /// Processor states for execution control
+    /// Processor states for execution control - each state indicates what the processor needs
     enum class Status
     {
-        NeedData,       /// Processor needs more input data
-        PortFull,       /// Output port is full, cannot produce more data
-        Finished,       /// Processor has completed its work
-        Ready,          /// Processor is ready to do work
+        NeedData,       /// Processor needs more input data to continue
+        PortFull,       /// Output port is full, cannot produce more data  
+        Finished,       /// Processor has completed its work permanently
+        Ready,          /// Processor is ready to perform work() immediately
         Async,          /// Processor is doing async work (e.g., reading from disk)
-        ExpandPipeline  /// Processor wants to add new processors to pipeline
+        ExpandPipeline  /// Processor wants to add new processors to pipeline dynamically
     };
 
-    /// Main execution method - returns current status
+    /// Main execution method - performs actual data processing
+    /// Only called when prepare() returns Status::Ready
+    /// Should process a reasonable chunk of data and return quickly
     virtual Status work() = 0;
     
-    /// Prepare for execution - called before work()
+    /// Preparation method - checks processor state without doing heavy work
+    /// Called by scheduler to determine if work() should be called
+    /// Must be lightweight and return quickly
     virtual Status prepare() = 0;
     
-    /// Get input and output ports
+    /// Access to input/output ports for data flow
     virtual InputPorts & getInputs() = 0;
     virtual OutputPorts & getOutputs() = 0;
     
-    /// Get processor description for debugging
+    /// Human-readable name for debugging and monitoring
     virtual String getName() const = 0;
 };
 ```
+
+**Understanding the Two-Phase Execution Model:**
+
+ClickHouse uses a sophisticated two-phase execution model that separates state checking from actual work:
+
+1. **Prepare Phase** (`prepare()`): 
+   - Lightweight operation that checks processor state
+   - Examines input/output port conditions
+   - Returns status indicating what processor needs
+   - Never performs heavy computation or I/O
+
+2. **Work Phase** (`work()`):
+   - Heavy computation and data processing
+   - Only called when `prepare()` returns `Status::Ready`
+   - Processes data chunks and updates processor state
+   - Can be CPU-intensive or perform I/O
+
+**Example: Simple Filter Processor**
+```cpp
+class FilterProcessor : public IProcessor {
+    Status prepare() override {
+        // Phase 1: Quick state check
+        if (!input.hasData()) {
+            return input.isFinished() ? Status::Finished : Status::NeedData;
+        }
+        if (output.isFull()) {
+            return Status::PortFull;  // Downstream is blocked
+        }
+        return Status::Ready;  // Can do work
+    }
+    
+    Status work() override {
+        // Phase 2: Actual processing
+        Chunk chunk = input.pull();           // Get input data
+        Chunk filtered = applyFilter(chunk);  // Apply WHERE condition  
+        output.push(std::move(filtered));     // Send to next processor
+        return Status::Ready;  // Check again next time
+    }
+};
+```
+
+This design enables the scheduler to make intelligent decisions about processor execution without wasting CPU cycles on unnecessary work attempts.
 
 This interface design provides several key advantages. First, the state-based execution model allows for fine-grained control over processor execution, enabling the scheduler to make optimal decisions about when to execute each processor. Second, the port-based communication system creates clear data flow dependencies that can be analyzed for parallelization opportunities. Third, the asynchronous execution support allows processors to yield control during I/O operations without blocking the entire pipeline.
 
