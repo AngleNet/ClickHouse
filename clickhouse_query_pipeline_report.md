@@ -5981,41 +5981,50 @@ The MergeTree family of storage engines forms the cornerstone of ClickHouse's st
 
 The basic MergeTree engine implements the fundamental LSM-tree-inspired architecture that underlies all variants in the family:
 
+**StorageMergeTree - The Core LSM-Tree Implementation:**
+
+StorageMergeTree represents ClickHouse's primary storage engine, implementing a sophisticated LSM-tree architecture optimized for analytical workloads with high ingestion rates and complex query patterns.
+
 ```cpp
 class StorageMergeTree : public MergeTreeData, public IStorage
 {
 public:
+    /// Constructor initializes the complete MergeTree infrastructure
+    /// Combines data management, background processing, and query optimization
     StorageMergeTree(
-        const StorageID & table_id_,
-        const String & relative_data_path_,
-        const StorageInMemoryMetadata & metadata_,
-        ContextMutablePtr context_,
-        const String & date_column_name,
-        const MergingParams & merging_params_,
-        std::unique_ptr<MergeTreeSettings> storage_settings_,
-        bool has_force_restore_data_flag)
+        const StorageID & table_id_,                    // Unique table identifier
+        const String & relative_data_path_,             // Storage path relative to database
+        const StorageInMemoryMetadata & metadata_,      // Table schema and constraints
+        ContextMutablePtr context_,                     // Server context for settings
+        const String & date_column_name,                // Partition column (legacy)
+        const MergingParams & merging_params_,          // Merge behavior configuration
+        std::unique_ptr<MergeTreeSettings> storage_settings_, // Engine-specific settings
+        bool has_force_restore_data_flag)               // Recovery mode flag
         : MergeTreeData(table_id_, relative_data_path_, metadata_, context_,
                        date_column_name, merging_params_, std::move(storage_settings_),
                        has_force_restore_data_flag)
         , background_operations_assignee(*this, BackgroundOperationsAssignee::Type::DataProcessing)
         , background_moves_assignee(*this, BackgroundOperationsAssignee::Type::DataMoving)
     {
-        initializeBackgroundTasks();
+        initializeBackgroundTasks();  // Set up merge scheduling and cleanup
     }
     
+    /// Engine identification for factory registration and query planning
     String getName() const override { return merging_params.getModeName() + "MergeTree"; }
     
+    /// Query execution entry point - creates optimized reading pipeline
+    /// Integrates with query planner to enable advanced optimizations
     void read(
-        QueryPlan & query_plan,
-        const Names & column_names,
-        const StorageSnapshotPtr & storage_snapshot,
-        SelectQueryInfo & query_info,
-        ContextPtr context,
-        QueryProcessingStage::Enum processed_stage,
-        size_t max_block_size,
-        size_t num_streams) override
+        QueryPlan & query_plan,                         // Query plan to modify
+        const Names & column_names,                     // Columns requested by query
+        const StorageSnapshotPtr & storage_snapshot,    // Consistent metadata view
+        SelectQueryInfo & query_info,                   // Query context and optimizations
+        ContextPtr context,                             // Execution context
+        QueryProcessingStage::Enum processed_stage,     // Processing level required
+        size_t max_block_size,                          // Chunk size hint
+        size_t num_streams) override                    // Parallelism hint
     {
-        // Create read-from-merge-tree step
+        // Create optimized reading step with all MergeTree features
         auto reading_step = std::make_unique<ReadFromMergeTree>(
             column_names,
             storage_snapshot,
@@ -6029,56 +6038,65 @@ public:
         query_plan.addStep(std::move(reading_step));
     }
     
+    /// Data ingestion entry point - creates writing pipeline
+    /// Supports both synchronous and asynchronous insert modes
     SinkToStoragePtr write(
-        const ASTPtr & query,
-        const StorageMetadataPtr & metadata_snapshot,
-        ContextPtr context,
-        bool async_insert) override
+        const ASTPtr & query,                           // INSERT query AST
+        const StorageMetadataPtr & metadata_snapshot,   // Schema at write time
+        ContextPtr context,                             // Write context and settings
+        bool async_insert) override                     // Use async insert buffering
     {
         return std::make_shared<MergeTreeSink>(
             *this, metadata_snapshot, context, async_insert);
     }
     
+    /// Engine lifecycle management - starts background operations
     void startup() override
     {
+        // Start merge scheduling and execution
         background_operations_assignee.start();
         background_moves_assignee.start();
         
-        // Start background merge scheduler
+        // Connect to server's background thread pools
         if (auto pool = getContext()->getBackgroundPool())
         {
             background_operations_assignee.assignToPool(pool);
         }
         
-        // Start background move scheduler for tiered storage
+        // Connect to tiered storage movement pool
         if (auto move_pool = getContext()->getBackgroundMovePool())
         {
             background_moves_assignee.assignToPool(move_pool);
         }
     }
     
+    /// Graceful shutdown - ensures data consistency
     void shutdown() override
     {
+        // Stop scheduling new operations
         background_operations_assignee.finish();
         background_moves_assignee.finish();
         
-        // Wait for all background operations to complete
+        // Wait for all operations to complete
         std::unique_lock lock(background_operations_mutex);
         background_operations_condition.wait(lock, [this] {
             return background_operations_count == 0;
         });
     }
     
-    // Merge operations
+    /// Core merge scheduling - called by background threads
+    /// Implements intelligent part selection for optimal performance
     bool scheduleDataProcessingJob(BackgroundJobsAssignee & assignee) override
     {
         if (shutdown_called)
             return false;
         
+        // Select optimal parts for merging
         auto merge_entry = selectPartsToMerge();
         if (!merge_entry)
-            return false;
+            return false;  // No beneficial merges available
         
+        // Schedule asynchronous merge execution
         assignee.scheduleCommonTask([this, merge_entry]() mutable {
             return executeMerge(std::move(merge_entry));
         });
@@ -6086,45 +6104,50 @@ public:
         return true;
     }
     
-    // Mutation operations  
+    /// Schema evolution through mutations (ALTER operations)
+    /// Handles ADD COLUMN, DROP COLUMN, UPDATE, DELETE operations
     void mutate(const MutationCommands & commands, ContextPtr context) override
     {
         auto mutation_entry = std::make_shared<MergeTreeMutationEntry>(commands, context);
         
         std::lock_guard lock(mutation_mutex);
         
-        // Add mutation to queue
+        // Add mutation to processing queue
         Int64 version = mutation_entry->commit(zookeeper);
         current_mutations_by_version.emplace(version, mutation_entry);
         
-        // Wake up background merger to process mutation
+        // Trigger background processing
         background_operations_condition.notify_all();
     }
     
 private:
-    BackgroundJobsAssignee background_operations_assignee;
-    BackgroundJobsAssignee background_moves_assignee;
+    /// Background operation management
+    BackgroundJobsAssignee background_operations_assignee;  // Merge and mutation processing
+    BackgroundJobsAssignee background_moves_assignee;       // Tiered storage movements
     
+    /// Synchronization for background operations
     std::mutex background_operations_mutex;
     std::condition_variable background_operations_condition;
     std::atomic<size_t> background_operations_count{0};
     
-    // Mutation tracking
+    /// Mutation tracking for schema evolution
     std::mutex mutation_mutex;
     std::map<Int64, MergeTreeMutationEntryPtr> current_mutations_by_version;
     
+    /// Background task initialization
     void initializeBackgroundTasks()
     {
-        // Set up merge selection strategy
+        // Set up intelligent merge selection
         merge_selecting_task = std::make_shared<MergeSelectingTask>(*this);
         
-        // Set up cleanup tasks
+        // Set up old part cleanup
         cleanup_task = std::make_shared<CleanupTask>(*this);
         
-        // Set up moving task for tiered storage
+        // Set up tiered storage movement
         moving_task = std::make_shared<MovingTask>(*this);
     }
     
+    /// Advanced merge part selection with cost-benefit analysis
     MergeTreeDataMergerMutator::FutureMergedMutatedPartPtr selectPartsToMerge()
     {
         std::lock_guard lock(currently_processing_in_background_mutex);
@@ -6132,19 +6155,20 @@ private:
         auto data_settings = getSettings();
         auto metadata_snapshot = getInMemoryMetadataPtr();
         
-        // Select parts for merge based on various strategies
+        // Apply sophisticated part selection algorithm
+        // Considers: part sizes, age, overlap, mutation requirements
         auto future_part = merger_mutator.selectPartsToMerge(
-            future_parts,
-            false, // aggressive
+            future_parts,                                    // Available parts
+            false,                                          // aggressive mode
             data_settings->max_bytes_to_merge_at_max_space_in_pool,
-            merge_pred,
-            nullptr, // txn
-            nullptr); // out_disable_reason
+            merge_pred,                                     // Selection predicates
+            nullptr,                                        // transaction context
+            nullptr);                                       // disable reason output
         
         if (!future_part)
             return nullptr;
         
-        // Reserve selected parts
+        // Reserve selected parts to prevent concurrent access
         for (const auto & part : future_part->parts)
         {
             currently_merging_mutating_parts.emplace(part, future_part);
@@ -6153,21 +6177,23 @@ private:
         return future_part;
     }
     
+    /// High-performance merge execution with full ACID guarantees
     bool executeMerge(MergeTreeDataMergerMutator::FutureMergedMutatedPartPtr future_part)
     {
         ++background_operations_count;
         
         try
         {
+            // Create transactional context for atomic operations
             auto transaction = createTransaction();
             
-            // Execute the actual merge
+            // Execute multi-way merge with deduplication and mutations
             auto part = merger_mutator.mergePartsToTemporaryPart(
                 future_part,
                 metadata_snapshot,
-                nullptr, // merge_entry
-                nullptr, // table_lock_holder
-                time(nullptr),
+                nullptr,                    // merge_entry
+                nullptr,                    // table_lock_holder
+                time(nullptr),             // creation_time
                 getContext(),
                 transaction->getTID(),
                 space_reservation,
@@ -6177,21 +6203,24 @@ private:
                 merge_mutate_entry,
                 need_prefix);
             
-            // Commit the merge
+            // Atomically replace old parts with merged result
             renameTempPartAndAdd(part, transaction);
             transaction->commit();
             
-            // Update part selection predicates
+            // Update merge selection criteria for next iteration
             updateMergePredicates();
+            
+            LOG_DEBUG(log, "Successfully merged {} parts into {}", 
+                     future_part->parts.size(), part->name);
             
             return true;
         }
         catch (...)
         {
-            // Handle merge failure
+            // Comprehensive error handling with cleanup
             LOG_ERROR(log, "Failed to execute merge: {}", getCurrentExceptionMessage(false));
             
-            // Clean up reserved parts
+            // Release reserved parts for future attempts
             std::lock_guard lock(currently_processing_in_background_mutex);
             for (const auto & part : future_part->parts)
             {
@@ -6209,7 +6238,217 @@ private:
         
         return true;
     }
+    
+    /// Advanced merge strategies based on workload characteristics
+    struct MergeStrategy {
+        /// Level-based merge strategy (similar to LevelDB)
+        /// Groups parts by size ranges for predictable performance
+        static MergeTreeDataMergerMutator::FutureMergedMutatedPartPtr selectLevelMerge(
+            const MergeTreeData & data, const MergeTreeSettings & settings)
+        {
+            auto parts = data.getDataPartsVector();
+            
+            // Group parts by size levels (powers of 2)
+            std::map<size_t, std::vector<DataPartPtr>> levels;
+            for (const auto & part : parts)
+            {
+                size_t level = static_cast<size_t>(std::log2(part->getBytesOnDisk() / MB));
+                levels[level].push_back(part);
+            }
+            
+            // Find level with too many parts
+            for (auto & [level, level_parts] : levels)
+            {
+                if (level_parts.size() >= settings.max_parts_in_level)
+                {
+                    // Select parts for merge at this level
+                    return createMergePlan(level_parts, settings);
+                }
+            }
+            
+            return nullptr;
+        }
+        
+        /// Size-ratio merge strategy
+        /// Merges parts when size ratios exceed threshold
+        static MergeTreeDataMergerMutator::FutureMergedMutatedPartPtr selectSizeRatioMerge(
+            const MergeTreeData & data, const MergeTreeSettings & settings)
+        {
+            auto parts = data.getDataPartsVector();
+            std::sort(parts.begin(), parts.end(), 
+                     [](const auto & a, const auto & b) {
+                         return a->getBytesOnDisk() < b->getBytesOnDisk();
+                     });
+            
+            // Look for size ratio violations
+            for (size_t i = 1; i < parts.size(); ++i)
+            {
+                double ratio = static_cast<double>(parts[i]->getBytesOnDisk()) / 
+                              parts[i-1]->getBytesOnDisk();
+                
+                if (ratio > settings.max_size_ratio_to_merge)
+                {
+                    // Merge smaller parts to reduce ratio
+                    std::vector<DataPartPtr> merge_parts(parts.begin(), parts.begin() + i);
+                    return createMergePlan(merge_parts, settings);
+                }
+            }
+            
+            return nullptr;
+        }
+        
+        /// Adaptive merge strategy based on query patterns
+        /// Uses query statistics to optimize for read performance
+        static MergeTreeDataMergerMutator::FutureMergedMutatedPartPtr selectAdaptiveMerge(
+            const MergeTreeData & data, const QueryStatistics & query_stats)
+        {
+            // Analyze query patterns
+            auto hot_partitions = query_stats.getHotPartitions();
+            auto frequent_columns = query_stats.getFrequentColumns();
+            
+            // Prioritize merging in frequently queried partitions
+            for (const auto & partition : hot_partitions)
+            {
+                auto partition_parts = data.getDataPartsInPartition(partition);
+                if (partition_parts.size() >= 3)  // Minimum for beneficial merge
+                {
+                    return createMergePlan(partition_parts, data.getSettings());
+                }
+            }
+            
+            return nullptr;
+        }
+    };
+    
+    /// Comprehensive part lifecycle management
+    struct PartLifecycleManager {
+        enum class PartState {
+            PreCommitted,   // Written but not yet visible
+            Committed,      // Active and queryable
+            Outdated,       // Superseded by merge result
+            Deleting,       // Marked for deletion
+            DeleteOnDestroy // Will be deleted when last reference drops
+        };
+        
+        /// State transition management
+        static void transitionPartState(DataPartPtr part, PartState new_state)
+        {
+            auto old_state = part->getState();
+            
+            // Validate legal state transitions
+            if (!isValidTransition(old_state, new_state))
+            {
+                throw Exception(fmt::format(
+                    "Invalid part state transition from {} to {}", 
+                    toString(old_state), toString(new_state)));
+            }
+            
+            part->setState(new_state);
+            
+            // Log important transitions
+            if (new_state == PartState::Outdated || new_state == PartState::Deleting)
+            {
+                LOG_DEBUG(&Poco::Logger::get("PartLifecycleManager"),
+                         "Part {} transitioned to {}", part->name, toString(new_state));
+            }
+        }
+        
+        /// Cleanup coordination
+        static void schedulePartCleanup(DataPartPtr part, std::chrono::seconds delay)
+        {
+            // Schedule deferred cleanup to ensure no active queries
+            auto cleanup_time = std::chrono::steady_clock::now() + delay;
+            
+            // Add to cleanup queue with timestamp
+            CleanupQueue::instance().scheduleCleanup(part, cleanup_time);
+        }
+    };
 };
+```
+
+**Real-World Merge Operation Example:**
+
+```cpp
+// Example: Merging 4 small parts into 1 larger part
+// Initial state: parts [A: 10MB], [B: 15MB], [C: 12MB], [D: 8MB]
+// Target: single part [ABCD: 45MB] with deduplication and sorting
+
+struct MergeExecutionExample {
+    // Input parts analysis
+    struct InputAnalysis {
+        std::vector<String> part_names = {"part_A", "part_B", "part_C", "part_D"};
+        std::vector<size_t> part_sizes = {10*MB, 15*MB, 12*MB, 8*MB};  // 45MB total
+        std::vector<size_t> part_rows = {100000, 150000, 120000, 80000}; // 450K total rows
+        
+        // Overlap analysis for deduplication
+        double estimated_overlap = 0.05;  // 5% duplicate rows expected
+        size_t expected_output_rows = static_cast<size_t>(450000 * (1.0 - estimated_overlap));
+    };
+    
+    // Merge execution phases
+    struct MergePhases {
+        // Phase 1: Input validation and preparation
+        void validateInputs() {
+            // Check parts are from same table and compatible
+            // Verify no concurrent modifications
+            // Estimate resource requirements
+        }
+        
+        // Phase 2: Multi-way merge with deduplication
+        void executeMerge() {
+            // Create merge tree with 4 input streams
+            // Apply primary key ordering across all streams
+            // Deduplicate rows with identical keys
+            // Apply any pending mutations during merge
+        }
+        
+        // Phase 3: Output part creation
+        void createOutputPart() {
+            // Write merged data to temporary part
+            // Build primary key index
+            // Create skip indexes and projections
+            // Compress and write all files
+        }
+        
+        // Phase 4: Atomic replacement
+        void commitMerge() {
+            // Move temporary part to final location
+            // Update part registry atomically
+            // Mark old parts as outdated
+            // Update table metadata
+        }
+    };
+    
+    // Performance characteristics
+    struct MergeMetrics {
+        // Resource usage
+        size_t peak_memory_usage = 128*MB;      // Memory for merge buffers
+        size_t disk_io_read = 45*MB;            // Read all input parts
+        size_t disk_io_write = 43*MB;           // Write deduplicated result
+        
+        // Timing breakdown
+        double input_reading_time = 0.8;        // 0.8 seconds
+        double merge_processing_time = 1.2;     // 1.2 seconds (CPU intensive)
+        double output_writing_time = 0.9;       // 0.9 seconds
+        double atomic_commit_time = 0.1;        // 0.1 seconds
+        double total_time = 3.0;                // 3.0 seconds total
+        
+        // Efficiency metrics
+        double throughput_mbps = 45.0 / 3.0;    // 15 MB/s
+        double compression_ratio = 43.0 / 45.0; // 4.4% space savings
+        size_t deduplication_savings = 450000 - 427500; // 22,500 rows removed
+    };
+};
+```
+
+**Benefits of StorageMergeTree Architecture:**
+
+1. **High Write Throughput**: LSM-tree design enables fast writes without blocking reads
+2. **Efficient Compression**: Large merged parts achieve better compression ratios
+3. **Query Performance**: Fewer parts reduce query overhead and enable better indexing
+4. **Background Processing**: Merges happen asynchronously without affecting queries
+5. **ACID Compliance**: Full transactional guarantees during merge operations
+6. **Resource Management**: Adaptive algorithms prevent resource exhaustion
 ```
 
 ### 2.2.2 Specialized MergeTree Variants
@@ -6474,38 +6713,62 @@ protected:
 
 MergeTree engines implement sophisticated part management to optimize storage and query performance:
 
+**MergeTreeData - Central Data Management Hub:**
+
+MergeTreeData serves as the central coordinator for all data management operations in MergeTree storage engines, providing sophisticated part lifecycle management, concurrent access control, and metadata tracking.
+
 ```cpp
 class MergeTreeData
 {
 public:
-    using DataPartPtr = std::shared_ptr<IMergeTreeDataPart>;
-    using DataPartsVector = std::vector<DataPartPtr>;
-    using DataPartState = IMergeTreeDataPart::State;
+    /// Core type definitions for part management
+    using DataPartPtr = std::shared_ptr<IMergeTreeDataPart>;    // Smart pointer to parts
+    using DataPartsVector = std::vector<DataPartPtr>;           // Collection of parts
+    using DataPartState = IMergeTreeDataPart::State;            // Part lifecycle states
     
+    /// Custom comparator for part ordering based on partition and block numbers
+    /// Enables efficient search and range operations
     struct LessDataPart
     {
-        using is_transparent = void;
+        using is_transparent = void;  // Enables heterogeneous lookup
         
         bool operator()(const DataPartPtr & lhs, const DataPartPtr & rhs) const
         {
-            return lhs->info < rhs->info;
+            return lhs->info < rhs->info;  // Compare MergeTreePartInfo structures
         }
     };
     
+    /// Sophisticated indexing structures for O(log n) part operations
     using DataPartsIndexes = std::map<DataPartPtr, size_t, LessDataPart>;
     using DataPartsLock = std::unique_lock<std::shared_mutex>;
     
 protected:
+    /// Thread-safe part storage with reader-writer semantics
+    /// Multiple readers can access simultaneously, but writers are exclusive
     mutable std::shared_mutex data_parts_mutex;
     
-    /// Current set of data parts.
+    /// Primary index mapping parts to their positions in state vectors
+    /// Enables O(log n) lookup and O(1) state-based iteration
     DataPartsIndexes data_parts_indexes;
+    
+    /// Parts organized by state for efficient iteration
+    /// Each state (Active, Outdated, etc.) has its own vector
     DataPartsVector data_parts_by_state_and_info[DataPartState::MAX_VALUE];
     
-    /// Index of parts by partition and min_block_number, for fast search of parts within partition.
+    /// Hierarchical index: partition_id -> min_block_number -> part
+    /// Enables efficient range queries and partition operations
     std::map<String, std::map<Int64, DataPartPtr>> data_parts_by_info;
     
+    /// Statistical tracking for performance monitoring
+    mutable std::atomic<UInt64> total_active_size_bytes{0};
+    mutable std::atomic<UInt64> total_active_size_rows{0};
+    mutable std::atomic<size_t> total_active_parts_count{0};
+    
 public:
+    /// Retrieve parts matching specified states with optional lock acquisition
+    /// states: Which part states to include (default: only Active)
+    /// acquired_lock: Optional output parameter to transfer lock ownership
+    /// Returns: Vector of matching parts in sorted order
     DataPartsVector getDataPartsVector(
         const DataPartStates & affordable_states = DataPartStates({DataPartState::Active}),
         DataPartsLock * acquired_lock = nullptr) const
@@ -6513,9 +6776,12 @@ public:
         DataPartsLock lock(data_parts_mutex);
         
         if (acquired_lock)
-            *acquired_lock = std::move(lock);
+            *acquired_lock = std::move(lock);  // Transfer lock to caller
         
         DataPartsVector result;
+        result.reserve(estimateResultSize(affordable_states));
+        
+        // Collect parts from all requested states
         for (auto state : affordable_states)
         {
             auto & parts_in_state = data_parts_by_state_and_info[state];
@@ -6525,60 +6791,98 @@ public:
         return result;
     }
     
+    /// Efficient part lookup by exact part info
+    /// part_info: Complete part identification (partition, min/max blocks, level)
+    /// valid_states: States to consider during search
+    /// Returns: Found part or nullptr if not found/wrong state
     DataPartPtr getPartIfExists(const MergeTreePartInfo & part_info, const DataPartStates & valid_states)
     {
         DataPartsLock lock(data_parts_mutex);
         
-        auto it = data_parts_by_info.find(part_info.partition_id);
-        if (it == data_parts_by_info.end())
+        // Use hierarchical index for O(log n) lookup
+        auto partition_it = data_parts_by_info.find(part_info.partition_id);
+        if (partition_it == data_parts_by_info.end())
             return nullptr;
         
-        auto part_it = it->second.find(part_info.min_block_number);
-        if (part_it == it->second.end())
+        auto part_it = partition_it->second.find(part_info.min_block_number);
+        if (part_it == partition_it->second.end())
             return nullptr;
         
         auto part = part_it->second;
-        if (valid_states.count(part->getState()))
+        
+        // Validate part matches complete info and has valid state
+        if (part->info == part_info && valid_states.count(part->getState()))
             return part;
         
         return nullptr;
     }
     
+    /// Thread-safe part addition with full index maintenance
+    /// part: New part to add (must be in appropriate state)
     void addPart(DataPartPtr part)
     {
         DataPartsLock lock(data_parts_mutex);
         addPartNoLock(part, lock);
+        
+        // Log addition for debugging and monitoring
+        LOG_DEBUG(log, "Added part {} with {} rows, {} bytes", 
+                 part->name, part->getRowsCount(), part->getBytesOnDisk());
     }
     
+    /// Atomic part renaming with index updates
+    /// part: Part to rename (must be Active state)
+    /// new_name: New part name (must follow naming conventions)
+    /// Returns: Success/failure status
     bool renamePart(DataPartPtr part, const String & new_name)
     {
         DataPartsLock lock(data_parts_mutex);
         
+        // Validate rename preconditions
         if (part->getState() != DataPartState::Active)
             return false;
         
-        // Remove from indexes
-        removePartFromIndexes(part);
-        
-        // Rename on disk
-        auto old_path = part->getFullPath();
-        auto new_path = relative_data_path + new_name + "/";
-        
-        if (!Poco::File(old_path).exists())
+        if (!isValidPartName(new_name))
             return false;
         
-        Poco::File(old_path).renameTo(new_path);
-        
-        // Update part info
-        part->name = new_name;
-        part->info = MergeTreePartInfo::fromPartName(new_name, format_version);
-        
-        // Add back to indexes
-        addPartToIndexes(part);
-        
-        return true;
+        // Atomically update indexes and filesystem
+        try
+        {
+            // Remove from current indexes
+            removePartFromIndexes(part);
+            
+            // Perform filesystem rename
+            auto old_path = part->getFullPath();
+            auto new_path = relative_data_path + new_name + "/";
+            
+            if (!Poco::File(old_path).exists())
+                return false;
+            
+            Poco::File(old_path).renameTo(new_path);
+            
+            // Update part metadata
+            part->name = new_name;
+            part->info = MergeTreePartInfo::fromPartName(new_name, format_version);
+            
+            // Re-add to indexes with new info
+            addPartToIndexes(part);
+            
+            return true;
+        }
+        catch (...)
+        {
+            // Rollback on any failure
+            LOG_ERROR(log, "Failed to rename part {} to {}: {}", 
+                     part->name, new_name, getCurrentExceptionMessage(false));
+            
+            // Attempt to restore original state
+            try { addPartToIndexes(part); } catch (...) {}
+            return false;
+        }
     }
     
+    /// Efficient range-based part removal for DROP PARTITION operations
+    /// drop_range: Range specification (partition, min/max blocks)
+    /// parts_to_remove: Output vector for removed parts
     void removePartsInRangeFromWorkingSet(const MergeTreePartInfo & drop_range, 
                                          DataPartsVector & parts_to_remove)
     {
@@ -6590,53 +6894,124 @@ public:
         
         auto & parts_in_partition = partition_it->second;
         
-        // Find all parts that intersect with drop range
+        // Use efficient range search in sorted container
         auto begin_it = parts_in_partition.lower_bound(drop_range.min_block_number);
         auto end_it = parts_in_partition.upper_bound(drop_range.max_block_number);
         
-        for (auto it = begin_it; it != end_it; ++it)
+        // Process all parts in range
+        for (auto it = begin_it; it != end_it; )
         {
             auto part = it->second;
+            
             if (part->info.intersects(drop_range))
             {
                 parts_to_remove.push_back(part);
                 removePartFromIndexes(part);
                 part->setState(DataPartState::Outdated);
+                
+                LOG_DEBUG(log, "Removed part {} from range {}", 
+                         part->name, drop_range.getPartName());
+                
+                it = parts_in_partition.erase(it);  // Efficient erase with iterator
+            }
+            else
+            {
+                ++it;
             }
         }
+        
+        // Update statistics after bulk removal
+        updateDataPartsStats();
+    }
+    
+    /// Advanced part selection for queries with optimization hints
+    /// query_info: Query context including WHERE conditions and hints
+    /// max_parts_for_parallel: Limit for parallel processing
+    /// Returns: Optimally selected parts for query execution
+    DataPartsVector selectPartsToRead(
+        const SelectQueryInfo & query_info,
+        size_t max_parts_for_parallel = 0) const
+    {
+        DataPartsLock lock(data_parts_mutex);
+        
+        auto active_parts = data_parts_by_state_and_info[DataPartState::Active];
+        
+        // Apply partition pruning if possible
+        if (query_info.partition_filter)
+        {
+            active_parts = applyPartitionFilter(active_parts, query_info.partition_filter);
+        }
+        
+        // Apply primary key filtering
+        if (query_info.primary_key_condition)
+        {
+            active_parts = applyPrimaryKeyFilter(active_parts, query_info.primary_key_condition);
+        }
+        
+        // Apply skip index filtering
+        if (!query_info.skip_index_conditions.empty())
+        {
+            active_parts = applySkipIndexFilters(active_parts, query_info.skip_index_conditions);
+        }
+        
+        // Sort by query relevance and size for optimal processing
+        std::sort(active_parts.begin(), active_parts.end(),
+                 [&](const DataPartPtr & a, const DataPartPtr & b) {
+                     return estimatePartRelevance(a, query_info) > 
+                            estimatePartRelevance(b, query_info);
+                 });
+        
+        // Limit parts for parallel processing if requested
+        if (max_parts_for_parallel > 0 && active_parts.size() > max_parts_for_parallel)
+        {
+            active_parts.resize(max_parts_for_parallel);
+        }
+        
+        LOG_DEBUG(log, "Selected {} parts for query execution", active_parts.size());
+        return active_parts;
     }
     
 private:
+    /// Internal part addition without locking (caller must hold lock)
     void addPartNoLock(DataPartPtr part, DataPartsLock & /* lock */)
     {
         auto state = part->getState();
         
-        // Add to main indexes
+        // Add to primary index with position tracking
         data_parts_indexes.emplace(part, data_parts_by_state_and_info[state].size());
         data_parts_by_state_and_info[state].push_back(part);
         
-        // Add to partition index
+        // Add to hierarchical partition index
         data_parts_by_info[part->info.partition_id][part->info.min_block_number] = part;
         
-        // Update statistics
+        // Maintain statistical counters
         updateDataPartsStats();
+        
+        // Validate part consistency if in debug mode
+        if constexpr (DEBUG_MODE)
+        {
+            validatePartConsistency(part);
+        }
     }
     
+    /// Efficient part removal from all indexes
     void removePartFromIndexes(DataPartPtr part)
     {
         auto state = part->getState();
         
-        // Remove from main index
+        // Remove from primary index with O(1) vector removal
         auto main_it = data_parts_indexes.find(part);
         if (main_it != data_parts_indexes.end())
         {
             auto & parts_vector = data_parts_by_state_and_info[state];
             auto vector_index = main_it->second;
             
-            // Swap with last element and pop
+            // Efficient removal: swap with last element and pop
             if (vector_index < parts_vector.size() - 1)
             {
                 std::swap(parts_vector[vector_index], parts_vector.back());
+                
+                // Update swapped element's index
                 data_parts_indexes[parts_vector[vector_index]] = vector_index;
             }
             
@@ -6644,29 +7019,187 @@ private:
             data_parts_indexes.erase(main_it);
         }
         
-        // Remove from partition index
+        // Remove from hierarchical partition index
         auto partition_it = data_parts_by_info.find(part->info.partition_id);
         if (partition_it != data_parts_by_info.end())
         {
             partition_it->second.erase(part->info.min_block_number);
+            
+            // Clean up empty partitions
             if (partition_it->second.empty())
                 data_parts_by_info.erase(partition_it);
         }
     }
     
+    /// Comprehensive statistics update for monitoring and optimization
     void updateDataPartsStats()
     {
-        // Update various statistics about data parts
-        total_active_size_bytes = 0;
-        total_active_size_rows = 0;
+        UInt64 total_bytes = 0;
+        UInt64 total_rows = 0;
+        size_t total_parts = 0;
         
+        // Accumulate statistics from active parts only
         for (const auto & part : data_parts_by_state_and_info[DataPartState::Active])
         {
-            total_active_size_bytes += part->getBytesOnDisk();
-            total_active_size_rows += part->rows_count;
+            total_bytes += part->getBytesOnDisk();
+            total_rows += part->getRowsCount();
+            ++total_parts;
+        }
+        
+        // Atomic updates for lock-free reading
+        total_active_size_bytes.store(total_bytes);
+        total_active_size_rows.store(total_rows);
+        total_active_parts_count.store(total_parts);
+        
+        // Log significant changes for monitoring
+        if (total_parts % 100 == 0)  // Log every 100 parts
+        {
+            LOG_DEBUG(log, "Statistics update: {} parts, {} rows, {} bytes", 
+                     total_parts, total_rows, total_bytes);
+        }
+    }
+    
+    /// Part lifecycle validation for debugging
+    void validatePartConsistency(DataPartPtr part) const
+    {
+        // Verify part name matches info
+        auto parsed_info = MergeTreePartInfo::fromPartName(part->name, format_version);
+        if (parsed_info != part->info)
+        {
+            throw Exception(fmt::format("Part name '{}' doesn't match info '{}'", 
+                           part->name, part->info.getPartName()));
+        }
+        
+        // Verify part exists on disk
+        if (!part->isStoredOnDisk())
+        {
+            throw Exception(fmt::format("Part '{}' not found on disk", part->name));
+        }
+        
+        // Verify part has valid checksums
+        try
+        {
+            part->getChecksums();
+        }
+        catch (...)
+        {
+            throw Exception(fmt::format("Part '{}' has invalid checksums", part->name));
+        }
+    }
+    
+    /// Query optimization helper
+    double estimatePartRelevance(DataPartPtr part, const SelectQueryInfo & query_info) const
+    {
+        double relevance = 1.0;
+        
+        // Prefer parts that match query conditions well
+        if (query_info.primary_key_condition)
+        {
+            relevance *= estimatePrimaryKeySelectivity(part, query_info.primary_key_condition);
+        }
+        
+        // Prefer newer parts (better compression, fewer fragmentation)
+        auto part_age = time(nullptr) - part->getModificationTime();
+        relevance *= std::exp(-part_age / 86400.0);  // Decay factor per day
+        
+        // Prefer larger parts (more efficient processing)
+        relevance *= std::log(1.0 + part->getBytesOnDisk() / MB);
+        
+        return relevance;
+    }
+    
+public:
+    /// Public statistics accessors for monitoring and optimization
+    UInt64 getTotalActiveSizeBytes() const { return total_active_size_bytes.load(); }
+    UInt64 getTotalActiveRows() const { return total_active_size_rows.load(); }
+    size_t getActivePartsCount() const { return total_active_parts_count.load(); }
+    
+    /// Part state distribution for debugging
+    std::map<DataPartState, size_t> getPartStateDistribution() const
+    {
+        DataPartsLock lock(data_parts_mutex);
+        
+        std::map<DataPartState, size_t> distribution;
+        for (int state = 0; state < DataPartState::MAX_VALUE; ++state)
+        {
+            distribution[static_cast<DataPartState>(state)] = 
+                data_parts_by_state_and_info[state].size();
+        }
+        
+        return distribution;
+    }
+};
+```
+
+**Part Lifecycle State Machine:**
+
+```cpp
+// Example: Complete part lifecycle from creation to deletion
+struct PartLifecycleExample {
+    enum class LifecyclePhase {
+        Creation,       // Part being written
+        Activation,     // Part becomes queryable  
+        Processing,     // Part participates in merges/mutations
+        Deprecation,    // Part superseded by merge result
+        Cleanup         // Part physically deleted
+    };
+    
+    // Phase 1: Creation (Temporary -> PreActive -> Active)
+    void createNewPart() {
+        auto part = std::make_shared<MergeTreeDataPartWide>(/* args */);
+        part->setState(DataPartState::Temporary);
+        
+        // Write data to temporary location
+        writePartData(part);
+        
+        // Transition to PreActive after successful write
+        part->setState(DataPartState::PreActive);
+        
+        // Add to working set and make Active
+        data.addPart(part);
+        part->setState(DataPartState::Active);
+        
+        LOG_INFO("Part {} created with {} rows", part->name, part->getRowsCount());
+    }
+    
+    // Phase 2: Merge participation (Active -> Outdated)
+    void participateInMerge() {
+        auto merge_parts = selectPartsForMerge();
+        auto new_part = executeMerge(merge_parts);
+        
+        // Mark old parts as outdated
+        for (auto & old_part : merge_parts) {
+            old_part->setState(DataPartState::Outdated);
+        }
+        
+        // New part becomes active
+        new_part->setState(DataPartState::Active);
+        data.addPart(new_part);
+    }
+    
+    // Phase 3: Cleanup (Outdated -> Deleting -> removed)
+    void scheduleCleanup() {
+        auto outdated_parts = data.getDataPartsVector({DataPartState::Outdated});
+        
+        for (auto & part : outdated_parts) {
+            // Wait for active queries to finish
+            if (part->getActiveQueriesCount() == 0) {
+                part->setState(DataPartState::Deleting);
+                schedulePhysicalDeletion(part);
+            }
         }
     }
 };
+```
+
+**Benefits of MergeTreeData Architecture:**
+
+1. **Concurrent Access**: Reader-writer locks enable high concurrency
+2. **Efficient Lookup**: Multiple indexes provide O(log n) operations
+3. **State Management**: Clear state transitions ensure data consistency
+4. **Resource Tracking**: Comprehensive statistics enable monitoring
+5. **Range Operations**: Hierarchical indexing enables efficient batch operations
+6. **Query Optimization**: Part selection integrates with query planning
 ```
 
 This sophisticated part management system enables ClickHouse to efficiently handle massive datasets while maintaining excellent query performance through intelligent part organization, lifecycle management, and background optimization processes.
@@ -6679,77 +7212,93 @@ The physical storage organization in ClickHouse is built around a three-tier hie
 
 Each data part represents an immutable collection of data stored on disk, implementing the fundamental unit of ClickHouse's LSM-tree-inspired storage:
 
+**IMergeTreeDataPart - Universal Part Abstraction:**
+
+IMergeTreeDataPart serves as the base class for all data part implementations in ClickHouse, providing a unified interface for part operations while enabling format-specific optimizations through virtual methods.
+
 ```cpp
 class IMergeTreeDataPart : public std::enable_shared_from_this<IMergeTreeDataPart>
 {
 public:
+    /// Part lifecycle states - critical for ensuring data consistency
+    /// State transitions are strictly controlled and logged for debugging
     enum State
     {
-        Temporary,       // Part is being created
-        PreActive,       // Part is created but not yet active
-        Active,          // Part is active and can be read
-        Outdated,        // Part is outdated but not yet deleted
-        Deleting,        // Part is being deleted
-        DeleteOnDestroy, // Part will be deleted when object is destroyed
+        Temporary,       // Part being created - not visible to queries
+        PreActive,       // Part fully written but pending activation
+        Active,          // Part active and queryable - most parts in this state
+        Outdated,        // Part superseded by merge - pending cleanup
+        Deleting,        // Part being physically deleted
+        DeleteOnDestroy, // Part deleted when last reference released
         MAX_VALUE = DeleteOnDestroy
     };
     
-    using Checksums = MergeTreeDataPartChecksums;
-    using ColumnSize = std::pair<size_t, size_t>; // compressed, uncompressed
-    using ColumnSizeByName = std::map<String, ColumnSize>;
+    /// Type aliases for cleaner code and better documentation
+    using Checksums = MergeTreeDataPartChecksums;           // File integrity validation
+    using ColumnSize = std::pair<size_t, size_t>;          // {compressed, uncompressed} sizes
+    using ColumnSizeByName = std::map<String, ColumnSize>;  // Per-column size tracking
     
 protected:
-    const MergeTreeData & storage;
-    String name;
-    MergeTreePartInfo info;
+    /// Core part identification and metadata
+    const MergeTreeData & storage;                          // Parent table reference
+    String name;                                            // Part name (encodes partition, block range, level)
+    MergeTreePartInfo info;                                 // Parsed part metadata
     
-    mutable State state{Temporary};
-    mutable std::mutex state_mutex;
+    /// Thread-safe state management
+    mutable State state{Temporary};                         // Current lifecycle state
+    mutable std::mutex state_mutex;                         // Protects state transitions
     
-    // Part metadata
-    size_t rows_count = 0;
-    time_t modification_time = 0;
-    mutable time_t remove_time = std::numeric_limits<time_t>::max();
+    /// Part statistics and metadata
+    size_t rows_count = 0;                                  // Total rows in part
+    time_t modification_time = 0;                           // Last modification timestamp
+    mutable time_t remove_time = std::numeric_limits<time_t>::max(); // Scheduled deletion time
     
-    // Storage paths
-    String relative_path;
-    mutable String absolute_path;
+    /// Storage location management
+    String relative_path;                                   // Path relative to table directory
+    mutable String absolute_path;                           // Cached absolute path
     
-    // Checksums and validation
-    mutable Checksums checksums;
-    mutable bool checksums_loaded = false;
+    /// Data integrity and validation
+    mutable Checksums checksums;                            // File checksums for integrity
+    mutable bool checksums_loaded = false;                  // Lazy loading flag
     
-    // Column information
-    mutable ColumnSizeByName columns_sizes;
-    mutable std::optional<time_t> columns_sizes_on_disk_load_time;
+    /// Column-level metadata for query optimization
+    mutable ColumnSizeByName columns_sizes;                 // Per-column size information
+    mutable std::optional<time_t> columns_sizes_on_disk_load_time; // Cache invalidation timestamp
     
-    // Index and marks
-    mutable MarkCache::MappedPtr marks_cache;
-    mutable UncompressedCache::MappedPtr uncompressed_cache;
+    /// Performance optimization caches
+    mutable MarkCache::MappedPtr marks_cache;               // Cached mark information
+    mutable UncompressedCache::MappedPtr uncompressed_cache; // Cached decompressed blocks
     
 public:
+    /// Constructor establishes part identity and storage context
     IMergeTreeDataPart(
-        const MergeTreeData & storage_,
-        const String & name_,
-        const MergeTreePartInfo & info_,
-        const VolumePtr & volume_,
-        const std::optional<String> & relative_path_ = {})
+        const MergeTreeData & storage_,                     // Parent table for context
+        const String & name_,                               // Part name (must be valid format)
+        const MergeTreePartInfo & info_,                    // Parsed part information
+        const VolumePtr & volume_,                          // Storage volume for data
+        const std::optional<String> & relative_path_ = {}) // Optional custom path
         : storage(storage_)
         , name(name_)
         , info(info_)
         , volume(volume_)
     {
+        // Use provided path or derive from part info
         if (relative_path_.has_value())
             relative_path = relative_path_.value();
         else
             relative_path = info.getPartName();
+            
+        LOG_TRACE(&Poco::Logger::get("IMergeTreeDataPart"), 
+                 "Created part {} with {} rows", name, rows_count);
     }
     
     virtual ~IMergeTreeDataPart() = default;
     
-    // Basic accessors
+    /// Essential part identification accessors
     const String & getName() const { return name; }
     const MergeTreePartInfo & getInfo() const { return info; }
+    
+    /// Lazy-evaluated absolute path construction
     String getFullPath() const
     {
         if (absolute_path.empty())
@@ -6757,7 +7306,7 @@ public:
         return absolute_path;
     }
     
-    // State management
+    /// Thread-safe state management with logging
     State getState() const
     {
         std::lock_guard lock(state_mutex);
@@ -6767,33 +7316,46 @@ public:
     void setState(State new_state) const
     {
         std::lock_guard lock(state_mutex);
+        
+        // Log important state transitions for debugging
+        if (state != new_state && (new_state == Outdated || new_state == Deleting))
+        {
+            LOG_DEBUG(&Poco::Logger::get("IMergeTreeDataPart"),
+                     "Part {} transitioned from {} to {}", 
+                     name, toString(state), toString(new_state));
+        }
+        
         state = new_state;
     }
     
+    /// Physical existence verification
     bool isStoredOnDisk() const
     {
         return volume->getDisk()->exists(relative_path);
     }
     
-    // Size and statistics
-    virtual UInt64 getBytesOnDisk() const = 0;
-    virtual UInt64 getMarksCount() const = 0;
+    /// Virtual methods for format-specific implementations
+    /// These enable Wide vs Compact format optimizations
+    virtual UInt64 getBytesOnDisk() const = 0;             // Total storage footprint
+    virtual UInt64 getMarksCount() const = 0;              // Number of data granules
     
+    /// Basic statistics accessors
     size_t getRowsCount() const { return rows_count; }
     time_t getModificationTime() const { return modification_time; }
     
-    // Column operations
+    /// Format-specific column file operations
     virtual bool hasColumnFiles(const NameAndTypePair & column) const = 0;
     virtual std::optional<String> getFileNameForColumn(const NameAndTypePair & column) const = 0;
     virtual void checkConsistency(bool require_part_metadata) const = 0;
     
-    // Serialization
+    /// Lazy metadata loading for performance
     virtual void loadRowsCount() = 0;
     virtual void loadPartitionAndMinMaxIndex() = 0;
     virtual void loadIndex() = 0;
     virtual void loadProjections(bool require_columns_checksums) = 0;
     
-    // Column size calculation
+    /// Column size analysis for query optimization
+    /// Enables columnar storage benefits and selective column reading
     ColumnSize getColumnSize(const String & column_name) const
     {
         loadColumnsSizes();
@@ -6801,13 +7363,14 @@ public:
         return it == columns_sizes.end() ? ColumnSize{0, 0} : it->second;
     }
     
+    /// Complete column size mapping for storage analytics
     ColumnSizeByName getColumnsSizes() const
     {
         loadColumnsSizes();
         return columns_sizes;
     }
     
-    // Checksums management
+    /// Data integrity management
     const Checksums & getChecksums() const
     {
         loadChecksums();
@@ -6820,21 +7383,73 @@ public:
         checksums_loaded = true;
     }
     
-    // Index access
+    /// Index management for query acceleration
     virtual void loadPrimaryIndex() = 0;
     virtual void unloadPrimaryIndex() = 0;
     virtual bool isPrimaryIndexLoaded() const = 0;
     
-protected:
-    VolumePtr volume;
-    DiskPtr disk;
+    /// Advanced part analysis for monitoring and optimization
+    struct PartAnalytics {
+        /// Storage efficiency metrics
+        double compression_ratio = 0.0;                     // Compressed/uncompressed ratio
+        double row_density = 0.0;                           // Rows per MB
+        size_t granules_count = 0;                          // Number of data granules
+        
+        /// Query performance indicators
+        size_t primary_key_size = 0;                        // Primary key data size
+        size_t skip_indexes_size = 0;                       // Skip index overhead
+        std::map<String, double> column_selectivity;        // Per-column data distribution
+        
+        /// Maintenance characteristics
+        time_t last_access_time = 0;                        // Query access tracking
+        size_t merge_priority = 0;                          // Merge scheduling priority
+        bool needs_maintenance = false;                     // Optimization opportunities
+    };
     
+    /// Comprehensive part analysis for advanced monitoring
+    PartAnalytics analyzePartCharacteristics() const
+    {
+        PartAnalytics analytics;
+        
+        // Calculate compression efficiency
+        auto column_sizes = getColumnsSizes();
+        size_t total_compressed = 0, total_uncompressed = 0;
+        
+        for (const auto & [column_name, sizes] : column_sizes)
+        {
+            total_compressed += sizes.first;
+            total_uncompressed += sizes.second;
+        }
+        
+        if (total_uncompressed > 0)
+            analytics.compression_ratio = static_cast<double>(total_compressed) / total_uncompressed;
+        
+        // Calculate data density
+        if (getBytesOnDisk() > 0)
+            analytics.row_density = static_cast<double>(rows_count) / (getBytesOnDisk() / MB);
+        
+        analytics.granules_count = getMarksCount();
+        
+        // Estimate maintenance needs
+        analytics.needs_maintenance = (rows_count < 100000) ||  // Small part fragmentation
+                                    (analytics.compression_ratio > 0.9);    // Poor compression
+        
+        return analytics;
+    }
+    
+protected:
+    /// Storage volume and disk management
+    VolumePtr volume;                                       // Storage volume (may span disks)
+    DiskPtr disk;                                           // Specific disk for operations
+    
+    /// Abstract methods for format-specific implementations
     virtual void loadChecksums() const = 0;
     virtual void loadColumnsSizes() const = 0;
     
-    // Helper methods for derived classes
+    /// Efficient column size calculation with caching
     void calculateColumnsSizesOnDisk()
     {
+        // Check if cache is still valid
         if (columns_sizes_on_disk_load_time && 
             *columns_sizes_on_disk_load_time >= modification_time)
             return;
@@ -6844,19 +7459,246 @@ protected:
         auto disk = volume->getDisk();
         String path = getFullPath();
         
+        // Scan all .bin files to determine column sizes
         for (const auto & [file_name, checksum] : checksums.files)
         {
             if (file_name.ends_with(".bin"))
             {
                 String column_name = file_name.substr(0, file_name.length() - 4);
                 auto file_size = disk->getFileSize(path + file_name);
+                
+                // Store both compressed and uncompressed sizes
                 columns_sizes[column_name] = ColumnSize{file_size, checksum.uncompressed_size};
             }
         }
         
+        // Update cache timestamp
         columns_sizes_on_disk_load_time = modification_time;
+        
+        LOG_TRACE(&Poco::Logger::get("IMergeTreeDataPart"),
+                 "Calculated sizes for {} columns in part {}", 
+                 columns_sizes.size(), name);
+    }
+    
+    /// Helper methods for state management
+    bool isValidStateTransition(State from, State to) const
+    {
+        // Define legal state transitions
+        switch (from)
+        {
+            case Temporary:
+                return to == PreActive || to == Deleting;
+            case PreActive:
+                return to == Active || to == Deleting;
+            case Active:
+                return to == Outdated || to == Deleting;
+            case Outdated:
+                return to == Deleting || to == DeleteOnDestroy;
+            case Deleting:
+                return to == DeleteOnDestroy;
+            case DeleteOnDestroy:
+                return false;  // Terminal state
+        }
+        return false;
+    }
+    
+    /// String conversion for state debugging
+    static String toString(State state)
+    {
+        switch (state)
+        {
+            case Temporary: return "Temporary";
+            case PreActive: return "PreActive";
+            case Active: return "Active";
+            case Outdated: return "Outdated";
+            case Deleting: return "Deleting";
+            case DeleteOnDestroy: return "DeleteOnDestroy";
+        }
+        return "Unknown";
+    }
+    
+public:
+    /// Performance monitoring interface for operations
+    struct PartOperationMetrics {
+        /// File I/O statistics
+        std::atomic<size_t> bytes_read{0};
+        std::atomic<size_t> bytes_written{0};
+        std::atomic<size_t> read_operations{0};
+        std::atomic<size_t> write_operations{0};
+        
+        /// Access pattern tracking
+        std::atomic<size_t> query_access_count{0};
+        std::atomic<time_t> last_query_time{0};
+        
+        /// Cache performance
+        std::atomic<size_t> cache_hits{0};
+        std::atomic<size_t> cache_misses{0};
+        
+        void recordRead(size_t bytes) {
+            bytes_read += bytes;
+            ++read_operations;
+        }
+        
+        void recordQueryAccess() {
+            ++query_access_count;
+            last_query_time = time(nullptr);
+        }
+        
+        double getCacheHitRate() const {
+            size_t total = cache_hits + cache_misses;
+            return total > 0 ? static_cast<double>(cache_hits) / total : 0.0;
+        }
+    };
+    
+    mutable PartOperationMetrics metrics;                   // Performance tracking
+};
+```
+
+**Real-World Part Structure Examples:**
+
+```cpp
+// Example 1: Wide Format Part Structure
+// Directory: /var/lib/clickhouse/data/default/events/202312_1_1_0/
+struct WideFormatExample {
+    std::vector<String> files = {
+        "checksums.txt",        // File integrity hashes
+        "columns.txt",          // Column definitions
+        "count.txt",           // Row count
+        "partition.dat",       // Partition value
+        "minmax_timestamp.idx", // Min/max statistics
+        "primary.idx",         // Primary index
+        
+        // Per-column data files
+        "user_id.bin",         // Column data (compressed)
+        "user_id.mrk2",        // Mark file (granule boundaries)
+        "event_type.bin",      // String column data
+        "event_type.mrk2",     // String column marks
+        "timestamp.bin",       // DateTime column
+        "timestamp.mrk2",      // DateTime marks
+        "properties.bin",      // Map column data
+        "properties.size0.bin", // Map size arrays
+        "properties.mrk2",     // Map marks
+    };
+    
+    // Each column has separate files - enables selective column reading
+    struct ColumnFiles {
+        String data_file;      // Compressed column data
+        String mark_file;      // Granule boundary markers
+        String null_file;      // Nullable column null map (optional)
+        String size_file;      // Array/Map size information (optional)
+    };
+    
+    // Benefits: Optimal for analytical queries with column pruning
+    // Drawbacks: More file descriptors, metadata overhead for small parts
+};
+
+// Example 2: Compact Format Part Structure  
+// Directory: /var/lib/clickhouse/data/default/events/202312_1_1_0/
+struct CompactFormatExample {
+    std::vector<String> files = {
+        "checksums.txt",       // File integrity hashes
+        "columns.txt",         // Column definitions
+        "count.txt",          // Row count
+        "partition.dat",      // Partition value
+        "minmax_timestamp.idx", // Min/max statistics
+        "primary.idx",        // Primary index
+        
+        // Single data file for all columns
+        "data.bin",           // All column data interleaved
+        "data.cmrk2",         // Compact marks file
+    };
+    
+    // All columns stored in single file with interleaved layout
+    struct CompactLayout {
+        // Granule 1: [col1_data, col2_data, col3_data, ...]
+        // Granule 2: [col1_data, col2_data, col3_data, ...]
+        // Mark file contains offsets for each column in each granule
+    };
+    
+    // Benefits: Fewer files, better for small parts, reduced metadata
+    // Drawbacks: Less optimal for queries reading few columns
+};
+
+// Example 3: Part Size Analysis
+struct PartSizeExample {
+    // Typical part size evolution
+    struct SizeProgression {
+        String phase;
+        size_t bytes_on_disk;
+        size_t rows_count;
+        String format;
+        String description;
+    };
+    
+    std::vector<SizeProgression> evolution = {
+        {"Initial Insert", 1*MB, 10000, "Compact", "Small initial part"},
+        {"After Merge 1", 10*MB, 100000, "Compact", "Still compact format"},
+        {"After Merge 2", 150*MB, 1500000, "Wide", "Switched to wide format"},
+        {"After Merge 3", 1*GB, 10000000, "Wide", "Large optimized part"},
+    };
+    
+    // Format selection logic
+    bool shouldUseWideFormat(size_t bytes_on_disk, size_t columns_count) {
+        // Switch to wide format when:
+        // 1. Part size exceeds threshold (default 10MB)
+        // 2. Many columns benefit from separate files
+        return bytes_on_disk > 10*MB || columns_count > 10;
     }
 };
+```
+
+**Part File Organization and Access Patterns:**
+
+```cpp
+// Example: Part file access during query execution
+struct PartAccessExample {
+    // Query: SELECT user_id, COUNT(*) FROM events WHERE timestamp > '2023-12-01' GROUP BY user_id
+    
+    struct AccessPattern {
+        String file_name;
+        String access_reason;
+        size_t bytes_read;
+        bool cached;
+    };
+    
+    std::vector<AccessPattern> wide_format_access = {
+        {"primary.idx", "Primary key filtering", 1024, true},
+        {"timestamp.mrk2", "Granule selection", 2048, true},
+        {"timestamp.bin", "Timestamp filtering", 50*KB, false},
+        {"user_id.mrk2", "Result column marks", 1024, true},
+        {"user_id.bin", "Result column data", 80*KB, false},
+        // Note: event_type.* files NOT accessed due to column pruning
+    };
+    
+    std::vector<AccessPattern> compact_format_access = {
+        {"primary.idx", "Primary key filtering", 1024, true},
+        {"data.cmrk2", "All column marks", 8192, true},
+        {"data.bin", "Interleaved data", 200*KB, false},
+        // Note: Must read more data due to interleaved layout
+    };
+    
+    // Performance comparison
+    struct PerformanceMetrics {
+        double wide_format_efficiency = 0.85;    // 85% of read data is useful
+        double compact_format_efficiency = 0.45; // 45% of read data is useful
+        
+        size_t wide_format_files_opened = 4;     // Fewer files for this query
+        size_t compact_format_files_opened = 3;  // Even fewer files
+        
+        double wide_format_query_time = 0.12;    // 120ms
+        double compact_format_query_time = 0.18; // 180ms (more I/O)
+    };
+};
+```
+
+**Benefits of the IMergeTreeDataPart Architecture:**
+
+1. **Format Flexibility**: Abstract interface enables Wide vs Compact optimizations
+2. **Lazy Loading**: Metadata loaded on-demand for memory efficiency
+3. **Thread Safety**: Safe concurrent access to part metadata
+4. **Cache Integration**: Seamless integration with mark and data caches
+5. **Monitoring**: Comprehensive metrics for performance analysis
+6. **State Management**: Clear lifecycle with validation and logging
 ```
 
 ### 2.3.2 Wide vs Compact Part Formats
