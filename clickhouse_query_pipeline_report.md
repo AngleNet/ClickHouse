@@ -18305,5 +18305,2118 @@ private:
 };
 ```
 
+## Phase 9: Performance and Monitoring (10,000 words)
+
+ClickHouse's performance monitoring and profiling ecosystem provides deep insights into query execution, resource utilization, and system health. This comprehensive monitoring framework encompasses everything from real-time metrics collection to sophisticated memory profiling, enabling developers and administrators to optimize performance and diagnose issues with unprecedented precision.
+
+### 9.1 Performance Metrics and Query Profiling (2,500 words)
+
+ClickHouse implements a sophisticated multi-layered performance monitoring system that captures metrics at various granularities, from individual query execution to cluster-wide resource utilization.
+
+#### 9.1.1 Query-Level Profiling Framework
+
+The query profiling infrastructure provides detailed execution metrics through the `system.query_log` table:
+
+```cpp
+class QueryProfiler
+{
+public:
+    struct QueryMetrics
+    {
+        std::chrono::nanoseconds query_duration_ns{0};
+        std::chrono::nanoseconds query_cpu_time_ns{0};
+        size_t read_rows{0};
+        size_t read_bytes{0};
+        size_t written_rows{0};
+        size_t written_bytes{0};
+        size_t result_rows{0};
+        size_t result_bytes{0};
+        size_t memory_usage{0};
+        size_t peak_memory_usage{0};
+        std::vector<ProfileEvent> profile_events;
+        std::map<String, size_t> performance_counters;
+    };
+
+private:
+    struct ProfileEvent
+    {
+        String name;
+        UInt64 value;
+        std::chrono::nanoseconds timestamp;
+        ProfileEventLevel level;
+    };
+
+    void collectPerformanceCounters()
+    {
+        performance_counters["OSCPUVirtualTimeMicroseconds"] = 
+            getCurrentTimeMicroseconds() - query_start_time_cpu;
+        performance_counters["OSIOWaitMicroseconds"] = 
+            getIOWaitTime();
+        performance_counters["NetworkSendBytes"] = 
+            getNetworkStatistics().send_bytes;
+        performance_counters["NetworkReceiveBytes"] = 
+            getNetworkStatistics().receive_bytes;
+        performance_counters["DiskReadElapsedMicroseconds"] = 
+            getDiskStatistics().read_elapsed_us;
+        performance_counters["DiskWriteElapsedMicroseconds"] = 
+            getDiskStatistics().write_elapsed_us;
+    }
+};
+```
+
+#### 9.1.2 Real-Time Performance Dashboard Integration
+
+ClickHouse provides built-in dashboard capabilities accessible through HTTP endpoints that expose real-time performance metrics:
+
+```cpp
+class PerformanceDashboard
+{
+public:
+    struct DashboardMetrics
+    {
+        double queries_per_second{0.0};
+        double cpu_usage_percent{0.0};
+        size_t active_queries{0};
+        size_t concurrent_connections{0};
+        size_t memory_usage_bytes{0};
+        double disk_io_utilization{0.0};
+        double network_bandwidth_utilization{0.0};
+        std::map<String, QueryMetrics> top_queries;
+        std::vector<SlowQueryInfo> slow_queries;
+    };
+
+private:
+    class MetricsCollector
+    {
+    public:
+        void updateMetrics()
+        {
+            auto current_time = std::chrono::steady_clock::now();
+            
+            // Collect system-level metrics
+            collectSystemMetrics();
+            
+            // Collect query-level metrics
+            collectQueryMetrics();
+            
+            // Update derived metrics
+            calculateDerivedMetrics(current_time);
+            
+            // Store historical data for trending
+            storeHistoricalMetrics(current_time);
+        }
+
+    private:
+        void collectSystemMetrics()
+        {
+            system_metrics.cpu_usage = getCPUUsage();
+            system_metrics.memory_usage = getMemoryUsage();
+            system_metrics.disk_usage = getDiskUsage();
+            system_metrics.network_usage = getNetworkUsage();
+        }
+
+        void collectQueryMetrics()
+        {
+            query_metrics.active_queries = getActiveQueryCount();
+            query_metrics.queued_queries = getQueuedQueryCount();
+            query_metrics.queries_per_second = calculateQPS();
+            query_metrics.average_query_duration = getAverageQueryDuration();
+        }
+    };
+};
+```
+
+#### 9.1.3 Advanced Query Analysis and Optimization Insights
+
+The performance monitoring system includes sophisticated query analysis capabilities that identify optimization opportunities:
+
+```cpp
+class QueryAnalyzer
+{
+public:
+    struct AnalysisResult
+    {
+        QueryComplexityScore complexity_score;
+        std::vector<OptimizationSuggestion> suggestions;
+        ResourceUtilizationProfile resource_profile;
+        ExecutionPlanEfficiency plan_efficiency;
+        std::map<String, PerformanceMetric> detailed_metrics;
+    };
+
+    struct OptimizationSuggestion
+    {
+        OptimizationType type;
+        String description;
+        double expected_improvement_percent;
+        ImplementationComplexity complexity;
+        String sql_rewrite_suggestion;
+    };
+
+private:
+    class PerformanceAnalysisEngine
+    {
+    public:
+        AnalysisResult analyzeQuery(const QueryInfo& query_info)
+        {
+            AnalysisResult result;
+            
+            // Analyze execution plan efficiency
+            result.plan_efficiency = analyzePlanEfficiency(query_info.execution_plan);
+            
+            // Check for common anti-patterns
+            result.suggestions = detectAntiPatterns(query_info.sql_text);
+            
+            // Analyze resource utilization patterns
+            result.resource_profile = analyzeResourceUtilization(query_info.metrics);
+            
+            // Calculate complexity score
+            result.complexity_score = calculateComplexityScore(query_info);
+            
+            return result;
+        }
+
+    private:
+        std::vector<OptimizationSuggestion> detectAntiPatterns(const String& sql)
+        {
+            std::vector<OptimizationSuggestion> suggestions;
+            
+            // Check for missing indices
+            if (containsFullTableScan(sql))
+            {
+                suggestions.emplace_back(OptimizationSuggestion{
+                    OptimizationType::INDEX_OPTIMIZATION,
+                    "Consider adding appropriate indices to avoid full table scans",
+                    25.0, // Expected 25% improvement
+                    ImplementationComplexity::MEDIUM,
+                    generateIndexSuggestion(sql)
+                });
+            }
+            
+            // Check for inefficient joins
+            if (containsInnefficientJoin(sql))
+            {
+                suggestions.emplace_back(OptimizationSuggestion{
+                    OptimizationType::JOIN_OPTIMIZATION,
+                    "Consider reordering joins or using different join algorithms",
+                    40.0, // Expected 40% improvement
+                    ImplementationComplexity::HIGH,
+                    generateJoinOptimization(sql)
+                });
+            }
+            
+            return suggestions;
+        }
+    };
+};
+```
+
+### 9.2 Memory Profiling and Allocation Tracking (2,500 words)
+
+ClickHouse integrates advanced memory profiling capabilities, including jemalloc integration for production-ready memory analysis and leak detection.
+
+#### 9.2.1 jemalloc Integration and Production Memory Profiling
+
+ClickHouse leverages jemalloc's sophisticated memory profiling capabilities to provide detailed memory allocation analysis:
+
+```cpp
+class JemallocProfiler
+{
+public:
+    struct MemoryProfile
+    {
+        size_t total_allocated_bytes{0};
+        size_t total_deallocated_bytes{0};
+        size_t current_allocated_bytes{0};
+        size_t peak_allocated_bytes{0};
+        std::map<String, AllocationSite> allocation_sites;
+        std::vector<MemoryLeak> potential_leaks;
+        FragmentationMetrics fragmentation;
+    };
+
+    struct AllocationSite
+    {
+        String stack_trace;
+        size_t total_allocations{0};
+        size_t total_bytes{0};
+        double allocation_rate_per_second{0.0};
+        size_t average_allocation_size{0};
+        std::chrono::nanoseconds average_lifetime{0};
+    };
+
+private:
+    class JemallocIntegration
+    {
+    public:
+        void enableProfiling()
+        {
+            // Configure jemalloc profiling parameters
+            mallctl("prof.active", nullptr, nullptr, &prof_active_true, sizeof(bool));
+            mallctl("prof.interval", nullptr, nullptr, &prof_interval, sizeof(size_t));
+            mallctl("prof.gdump", nullptr, nullptr, &prof_gdump_true, sizeof(bool));
+        }
+
+        MemoryProfile generateProfile()
+        {
+            MemoryProfile profile;
+            
+            // Dump current memory profile
+            const char* dump_filename = "/tmp/clickhouse_memory_profile.heap";
+            mallctl("prof.dump", nullptr, nullptr, &dump_filename, sizeof(const char*));
+            
+            // Parse profile data
+            profile = parseJemallocProfile(dump_filename);
+            
+            // Analyze allocation patterns
+            analyzeAllocationPatterns(profile);
+            
+            // Detect potential memory leaks
+            detectMemoryLeaks(profile);
+            
+            return profile;
+        }
+
+    private:
+        MemoryProfile parseJemallocProfile(const String& filename)
+        {
+            MemoryProfile profile;
+            std::ifstream profile_file(filename);
+            
+            // Parse jemalloc heap profile format
+            String line;
+            while (std::getline(profile_file, line))
+            {
+                if (line.starts_with("HEAP PROFILE:"))
+                {
+                    parseHeapSummary(line, profile);
+                }
+                else if (line.contains(" @"))
+                {
+                    parseAllocationSite(line, profile);
+                }
+            }
+            
+            return profile;
+        }
+
+        void analyzeAllocationPatterns(MemoryProfile& profile)
+        {
+            // Calculate fragmentation metrics
+            profile.fragmentation.internal_fragmentation = 
+                calculateInternalFragmentation();
+            profile.fragmentation.external_fragmentation = 
+                calculateExternalFragmentation();
+            
+            // Identify hot allocation sites
+            identifyHotAllocationSites(profile.allocation_sites);
+            
+            // Calculate allocation rate trends
+            calculateAllocationTrends(profile);
+        }
+    };
+};
+```
+
+#### 9.2.2 Query-Specific Memory Tracking and Analysis
+
+ClickHouse provides granular memory tracking at the query level, enabling precise analysis of memory consumption patterns:
+
+```cpp
+class QueryMemoryTracker
+{
+public:
+    struct QueryMemoryInfo
+    {
+        size_t peak_memory_usage{0};
+        size_t total_memory_allocated{0};
+        std::map<MemoryPool, size_t> memory_by_pool;
+        std::vector<MemoryAllocationEvent> allocation_timeline;
+        MemoryLeakInfo leak_detection;
+        std::map<String, size_t> memory_by_operation;
+    };
+
+    struct MemoryAllocationEvent
+    {
+        std::chrono::nanoseconds timestamp;
+        AllocationType type; // ALLOCATION, DEALLOCATION, REALLOCATION
+        size_t size;
+        void* address;
+        String stack_trace;
+        String operation_context;
+    };
+
+private:
+    class MemoryInstrumentation
+    {
+    public:
+        void instrumentAllocation(size_t size, void* ptr, const String& context)
+        {
+            std::lock_guard<std::mutex> lock(tracking_mutex);
+            
+            MemoryAllocationEvent event{
+                std::chrono::steady_clock::now(),
+                AllocationType::ALLOCATION,
+                size,
+                ptr,
+                captureStackTrace(),
+                context
+            };
+            
+            current_query_memory.allocation_timeline.push_back(event);
+            current_query_memory.total_memory_allocated += size;
+            current_query_memory.memory_by_operation[context] += size;
+            
+            // Update peak memory usage
+            size_t current_usage = calculateCurrentUsage();
+            if (current_usage > current_query_memory.peak_memory_usage)
+            {
+                current_query_memory.peak_memory_usage = current_usage;
+            }
+            
+            // Check for memory leaks
+            checkForPotentialLeak(event);
+        }
+
+        void instrumentDeallocation(void* ptr, const String& context)
+        {
+            std::lock_guard<std::mutex> lock(tracking_mutex);
+            
+            auto allocation_it = active_allocations.find(ptr);
+            if (allocation_it != active_allocations.end())
+            {
+                MemoryAllocationEvent dealloc_event{
+                    std::chrono::steady_clock::now(),
+                    AllocationType::DEALLOCATION,
+                    allocation_it->second.size,
+                    ptr,
+                    captureStackTrace(),
+                    context
+                };
+                
+                current_query_memory.allocation_timeline.push_back(dealloc_event);
+                active_allocations.erase(allocation_it);
+            }
+        }
+
+    private:
+        std::map<void*, MemoryAllocationEvent> active_allocations;
+        std::mutex tracking_mutex;
+        QueryMemoryInfo current_query_memory;
+    };
+};
+```
+
+#### 9.2.3 Advanced Memory Leak Detection and Prevention
+
+The memory profiling system includes sophisticated leak detection algorithms:
+
+```cpp
+class MemoryLeakDetector
+{
+public:
+    struct LeakDetectionResult
+    {
+        std::vector<SuspiciousAllocation> potential_leaks;
+        MemoryGrowthTrend growth_trend;
+        std::map<String, LeakSeverity> leak_severity_by_location;
+        std::vector<LeakPreventionSuggestion> prevention_suggestions;
+    };
+
+    struct SuspiciousAllocation
+    {
+        void* address;
+        size_t size;
+        std::chrono::nanoseconds age;
+        String allocation_context;
+        String stack_trace;
+        double leak_probability;
+        LeakType type; // DEFINITE, POSSIBLE, REACHABLE
+    };
+
+private:
+    class LeakAnalysisEngine
+    {
+    public:
+        LeakDetectionResult analyzeMemoryUsage(const QueryMemoryInfo& memory_info)
+        {
+            LeakDetectionResult result;
+            
+            // Analyze allocation/deallocation patterns
+            result.potential_leaks = detectUnmatchedAllocations(memory_info);
+            
+            // Analyze memory growth trends
+            result.growth_trend = analyzeGrowthPattern(memory_info.allocation_timeline);
+            
+            // Classify leak severity
+            result.leak_severity_by_location = classifyLeakSeverity(result.potential_leaks);
+            
+            // Generate prevention suggestions
+            result.prevention_suggestions = generatePreventionSuggestions(result);
+            
+            return result;
+        }
+
+    private:
+        std::vector<SuspiciousAllocation> detectUnmatchedAllocations(
+            const QueryMemoryInfo& memory_info)
+        {
+            std::vector<SuspiciousAllocation> suspicious;
+            std::map<void*, MemoryAllocationEvent> unmatched_allocations;
+            
+            // Track allocations and match with deallocations
+            for (const auto& event : memory_info.allocation_timeline)
+            {
+                if (event.type == AllocationType::ALLOCATION)
+                {
+                    unmatched_allocations[event.address] = event;
+                }
+                else if (event.type == AllocationType::DEALLOCATION)
+                {
+                    unmatched_allocations.erase(event.address);
+                }
+            }
+            
+            // Analyze remaining unmatched allocations
+            auto current_time = std::chrono::steady_clock::now();
+            for (const auto& [address, allocation] : unmatched_allocations)
+            {
+                auto age = current_time - allocation.timestamp;
+                double leak_probability = calculateLeakProbability(allocation, age);
+                
+                if (leak_probability > LEAK_PROBABILITY_THRESHOLD)
+                {
+                    suspicious.emplace_back(SuspiciousAllocation{
+                        address,
+                        allocation.size,
+                        age,
+                        allocation.operation_context,
+                        allocation.stack_trace,
+                        leak_probability,
+                        classifyLeakType(allocation, age)
+                    });
+                }
+            }
+            
+            return suspicious;
+        }
+    };
+};
+```
+
+### 9.3 I/O Performance Analysis and Optimization (2,500 words)
+
+ClickHouse provides comprehensive I/O performance monitoring that covers disk operations, network traffic, and storage system interactions.
+
+#### 9.3.1 Asynchronous I/O Performance Tracking
+
+The I/O subsystem includes detailed performance monitoring for asynchronous operations:
+
+```cpp
+class AsyncIOProfiler
+{
+public:
+    struct IOPerformanceMetrics
+    {
+        std::map<IOOperationType, IOStats> stats_by_operation;
+        std::map<String, IOStats> stats_by_file;
+        IOLatencyDistribution latency_distribution;
+        IOThroughputMetrics throughput_metrics;
+        std::vector<IOBottleneck> identified_bottlenecks;
+        IOConcurrencyMetrics concurrency_metrics;
+    };
+
+    struct IOStats
+    {
+        size_t total_operations{0};
+        size_t total_bytes{0};
+        std::chrono::nanoseconds total_time{0};
+        std::chrono::nanoseconds min_latency{std::chrono::nanoseconds::max()};
+        std::chrono::nanoseconds max_latency{0};
+        std::chrono::nanoseconds average_latency{0};
+        double operations_per_second{0.0};
+        double bytes_per_second{0.0};
+    };
+
+private:
+    class IOInstrumentation
+    {
+    public:
+        void instrumentAsyncRead(const String& filename, size_t offset, size_t size)
+        {
+            auto start_time = std::chrono::steady_clock::now();
+            String operation_id = generateOperationID();
+            
+            pending_operations[operation_id] = IOOperation{
+                IOOperationType::ASYNC_READ,
+                filename,
+                offset,
+                size,
+                start_time,
+                std::this_thread::get_id()
+            };
+            
+            // Update concurrency metrics
+            updateConcurrencyMetrics();
+        }
+
+        void instrumentAsyncReadCompletion(const String& operation_id, size_t bytes_read)
+        {
+            auto completion_time = std::chrono::steady_clock::now();
+            auto operation_it = pending_operations.find(operation_id);
+            
+            if (operation_it != pending_operations.end())
+            {
+                auto& operation = operation_it->second;
+                auto latency = completion_time - operation.start_time;
+                
+                // Update statistics
+                updateIOStats(operation.type, operation.filename, bytes_read, latency);
+                
+                // Check for performance anomalies
+                checkForIOAnomalies(operation, latency);
+                
+                // Clean up tracking
+                pending_operations.erase(operation_it);
+            }
+        }
+
+    private:
+        struct IOOperation
+        {
+            IOOperationType type;
+            String filename;
+            size_t offset;
+            size_t size;
+            std::chrono::steady_clock::time_point start_time;
+            std::thread::id thread_id;
+        };
+
+        void updateIOStats(IOOperationType type, const String& filename,
+                          size_t bytes, std::chrono::nanoseconds latency)
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex);
+            
+            // Update global stats by operation type
+            auto& type_stats = performance_metrics.stats_by_operation[type];
+            type_stats.total_operations++;
+            type_stats.total_bytes += bytes;
+            type_stats.total_time += latency;
+            type_stats.min_latency = std::min(type_stats.min_latency, latency);
+            type_stats.max_latency = std::max(type_stats.max_latency, latency);
+            
+            // Update stats by file
+            auto& file_stats = performance_metrics.stats_by_file[filename];
+            file_stats.total_operations++;
+            file_stats.total_bytes += bytes;
+            file_stats.total_time += latency;
+            
+            // Update latency distribution
+            updateLatencyDistribution(latency);
+            
+            // Update throughput metrics
+            updateThroughputMetrics(bytes, latency);
+        }
+    };
+};
+```
+
+#### 9.3.2 Storage System Performance Analysis
+
+Advanced storage performance monitoring provides insights into storage tier performance and optimization opportunities:
+
+```cpp
+class StoragePerformanceAnalyzer
+{
+public:
+    struct StorageAnalysis
+    {
+        std::map<StorageTier, TierPerformance> tier_performance;
+        std::vector<StorageHotspot> hotspots;
+        CacheEfficiencyMetrics cache_metrics;
+        StorageOptimizationSuggestions suggestions;
+        IOPatternAnalysis access_patterns;
+    };
+
+    struct TierPerformance
+    {
+        double average_latency_ms;
+        double peak_throughput_mb_s;
+        double utilization_percent;
+        size_t queue_depth;
+        double cache_hit_ratio;
+        std::vector<PerformanceAnomaly> anomalies;
+    };
+
+private:
+    class StorageIntelligence
+    {
+    public:
+        StorageAnalysis analyzeStoragePerformance()
+        {
+            StorageAnalysis analysis;
+            
+            // Analyze performance by storage tier
+            analysis.tier_performance = analyzeTierPerformance();
+            
+            // Identify I/O hotspots
+            analysis.hotspots = identifyIOHotspots();
+            
+            // Analyze cache efficiency
+            analysis.cache_metrics = analyzeCacheEfficiency();
+            
+            // Generate optimization suggestions
+            analysis.suggestions = generateOptimizationSuggestions(analysis);
+            
+            // Analyze access patterns
+            analysis.access_patterns = analyzeAccessPatterns();
+            
+            return analysis;
+        }
+
+    private:
+        std::map<StorageTier, TierPerformance> analyzeTierPerformance()
+        {
+            std::map<StorageTier, TierPerformance> tier_perf;
+            
+            for (auto tier : {StorageTier::MEMORY, StorageTier::SSD, StorageTier::HDD, StorageTier::S3})
+            {
+                TierPerformance& perf = tier_perf[tier];
+                
+                // Calculate average latency for this tier
+                perf.average_latency_ms = calculateAverageLatency(tier);
+                
+                // Calculate peak throughput
+                perf.peak_throughput_mb_s = calculatePeakThroughput(tier);
+                
+                // Calculate utilization
+                perf.utilization_percent = calculateUtilization(tier);
+                
+                // Analyze cache performance for this tier
+                perf.cache_hit_ratio = calculateCacheHitRatio(tier);
+                
+                // Detect performance anomalies
+                perf.anomalies = detectAnomalies(tier);
+            }
+            
+            return tier_perf;
+        }
+
+        std::vector<StorageHotspot> identifyIOHotspots()
+        {
+            std::vector<StorageHotspot> hotspots;
+            
+            // Analyze file access patterns
+            std::map<String, AccessPattern> file_patterns = analyzeFileAccess();
+            
+            for (const auto& [filename, pattern] : file_patterns)
+            {
+                if (pattern.access_frequency > HOTSPOT_THRESHOLD)
+                {
+                    hotspots.emplace_back(StorageHotspot{
+                        filename,
+                        pattern.access_frequency,
+                        pattern.total_bytes_accessed,
+                        pattern.access_type_distribution,
+                        calculateHotspotSeverity(pattern)
+                    });
+                }
+            }
+            
+            return hotspots;
+        }
+    };
+};
+```
+
+#### 9.3.3 Network Performance Monitoring
+
+Comprehensive network performance monitoring tracks distributed query execution efficiency:
+
+```cpp
+class NetworkPerformanceMonitor
+{
+public:
+    struct NetworkMetrics
+    {
+        std::map<String, ConnectionMetrics> connection_metrics;
+        DistributedQueryMetrics distributed_metrics;
+        NetworkLatencyAnalysis latency_analysis;
+        BandwidthUtilization bandwidth_utilization;
+        std::vector<NetworkBottleneck> network_bottlenecks;
+    };
+
+    struct ConnectionMetrics
+    {
+        String remote_address;
+        size_t active_connections{0};
+        size_t total_connections{0};
+        double connection_success_rate{0.0};
+        std::chrono::nanoseconds average_connection_time{0};
+        size_t bytes_sent{0};
+        size_t bytes_received{0};
+        double throughput_mb_s{0.0};
+    };
+
+private:
+    class NetworkInstrumentation
+    {
+    public:
+        void instrumentNetworkOperation(const NetworkOperation& operation)
+        {
+            std::lock_guard<std::mutex> lock(metrics_mutex);
+            
+            auto& conn_metrics = network_metrics.connection_metrics[operation.remote_address];
+            
+            // Update connection statistics
+            if (operation.type == NetworkOperationType::CONNECTION_ESTABLISHED)
+            {
+                conn_metrics.active_connections++;
+                conn_metrics.total_connections++;
+                conn_metrics.average_connection_time = 
+                    updateMovingAverage(conn_metrics.average_connection_time, operation.duration);
+            }
+            else if (operation.type == NetworkOperationType::CONNECTION_CLOSED)
+            {
+                conn_metrics.active_connections--;
+            }
+            else if (operation.type == NetworkOperationType::DATA_TRANSFER)
+            {
+                conn_metrics.bytes_sent += operation.bytes_sent;
+                conn_metrics.bytes_received += operation.bytes_received;
+                
+                // Update throughput calculations
+                updateThroughputMetrics(operation);
+            }
+            
+            // Analyze for network bottlenecks
+            analyzeForBottlenecks(operation);
+        }
+
+    private:
+        void analyzeForBottlenecks(const NetworkOperation& operation)
+        {
+            // Check for high latency
+            if (operation.latency > HIGH_LATENCY_THRESHOLD)
+            {
+                network_metrics.network_bottlenecks.emplace_back(NetworkBottleneck{
+                    BottleneckType::HIGH_LATENCY,
+                    operation.remote_address,
+                    operation.latency,
+                    "Network latency exceeds acceptable thresholds"
+                });
+            }
+            
+            // Check for low throughput
+            if (operation.throughput < LOW_THROUGHPUT_THRESHOLD)
+            {
+                network_metrics.network_bottlenecks.emplace_back(NetworkBottleneck{
+                    BottleneckType::LOW_THROUGHPUT,
+                    operation.remote_address,
+                    operation.latency,
+                    "Network throughput below expected performance"
+                });
+            }
+        }
+    };
+};
+```
+
+### 9.4 Adaptive Query Optimization and Runtime Statistics (2,500 words)
+
+ClickHouse implements advanced adaptive optimization systems that learn from query execution patterns and automatically adjust optimization strategies.
+
+#### 9.4.1 Machine Learning-Based Query Optimization
+
+The adaptive optimization system uses machine learning techniques to improve query performance over time:
+
+```cpp
+class AdaptiveQueryOptimizer
+{
+public:
+    struct OptimizationModel
+    {
+        std::map<QueryPattern, OptimizationStrategy> learned_strategies;
+        std::vector<FeatureVector> training_data;
+        ModelPerformanceMetrics model_metrics;
+        std::map<String, double> feature_importance;
+    };
+
+    struct QueryPattern
+    {
+        QueryComplexity complexity;
+        TableCharacteristics table_characteristics;
+        JoinPattern join_patterns;
+        AggregationPattern aggregation_patterns;
+        String query_signature;
+    };
+
+private:
+    class MLOptimizationEngine
+    {
+    public:
+        OptimizationStrategy predictOptimalStrategy(const QueryInfo& query_info)
+        {
+            // Extract features from query
+            FeatureVector features = extractFeatures(query_info);
+            
+            // Apply trained model to predict optimal strategy
+            OptimizationStrategy predicted_strategy = model.predict(features);
+            
+            // Validate prediction confidence
+            double confidence = model.getPredictionConfidence(features);
+            
+            if (confidence < MIN_CONFIDENCE_THRESHOLD)
+            {
+                // Fall back to heuristic-based optimization
+                return fallbackOptimization(query_info);
+            }
+            
+            return predicted_strategy;
+        }
+
+        void updateModelWithExecutionResults(const QueryInfo& query_info,
+                                           const OptimizationStrategy& strategy,
+                                           const ExecutionMetrics& results)
+        {
+            // Create training example from execution
+            TrainingExample example{
+                extractFeatures(query_info),
+                strategy,
+                results.execution_time,
+                results.resource_usage,
+                results.success_rate
+            };
+            
+            // Add to training data
+            training_data.push_back(example);
+            
+            // Periodically retrain model
+            if (training_data.size() % RETRAIN_INTERVAL == 0)
+            {
+                retrainModel();
+            }
+        }
+
+    private:
+        struct FeatureVector
+        {
+            double query_complexity_score;
+            size_t table_row_count;
+            size_t table_column_count;
+            double selectivity_estimate;
+            size_t join_count;
+            size_t aggregation_count;
+            double memory_estimate;
+            double cpu_estimate;
+            bool uses_index;
+            bool has_subqueries;
+            std::vector<double> custom_features;
+        };
+
+        FeatureVector extractFeatures(const QueryInfo& query_info)
+        {
+            FeatureVector features;
+            
+            // Calculate query complexity
+            features.query_complexity_score = calculateComplexityScore(query_info.ast);
+            
+            // Extract table characteristics
+            auto table_stats = getTableStatistics(query_info.referenced_tables);
+            features.table_row_count = table_stats.total_rows;
+            features.table_column_count = table_stats.total_columns;
+            
+            // Calculate selectivity estimates
+            features.selectivity_estimate = estimateSelectivity(query_info.where_conditions);
+            
+            // Count query operations
+            features.join_count = countJoins(query_info.ast);
+            features.aggregation_count = countAggregations(query_info.ast);
+            
+            // Resource estimates
+            features.memory_estimate = estimateMemoryUsage(query_info);
+            features.cpu_estimate = estimateCPUUsage(query_info);
+            
+            // Boolean features
+            features.uses_index = checkIndexUsage(query_info);
+            features.has_subqueries = checkSubqueries(query_info.ast);
+            
+            return features;
+        }
+
+        void retrainModel()
+        {
+            // Prepare training dataset
+            auto dataset = prepareTrainingDataset(training_data);
+            
+            // Train model using gradient boosting
+            model.train(dataset);
+            
+            // Evaluate model performance
+            auto validation_metrics = evaluateModel(dataset);
+            
+            // Update model metrics
+            model_metrics = validation_metrics;
+            
+            // Calculate feature importance
+            feature_importance = model.getFeatureImportance();
+        }
+    };
+};
+```
+
+#### 9.4.2 Runtime Statistics Collection and Analysis
+
+The system continuously collects and analyzes runtime statistics to inform optimization decisions:
+
+```cpp
+class RuntimeStatisticsCollector
+{
+public:
+    struct StatisticsSnapshot
+    {
+        std::map<String, TableStatistics> table_statistics;
+        std::map<String, IndexStatistics> index_statistics;
+        SystemResourceStatistics system_statistics;
+        QueryWorkloadStatistics workload_statistics;
+        std::chrono::steady_clock::time_point snapshot_time;
+    };
+
+    struct TableStatistics
+    {
+        size_t row_count;
+        size_t total_size_bytes;
+        std::map<String, ColumnStatistics> column_statistics;
+        DataDistribution data_distribution;
+        AccessPattern access_pattern;
+        CompressionStatistics compression_stats;
+    };
+
+private:
+    class StatisticsEngine
+    {
+    public:
+        void collectStatistics()
+        {
+            auto snapshot_time = std::chrono::steady_clock::now();
+            StatisticsSnapshot snapshot;
+            snapshot.snapshot_time = snapshot_time;
+            
+            // Collect table-level statistics
+            snapshot.table_statistics = collectTableStatistics();
+            
+            // Collect index statistics
+            snapshot.index_statistics = collectIndexStatistics();
+            
+            // Collect system resource statistics
+            snapshot.system_statistics = collectSystemStatistics();
+            
+            // Collect workload statistics
+            snapshot.workload_statistics = collectWorkloadStatistics();
+            
+            // Store snapshot for historical analysis
+            storeStatisticsSnapshot(snapshot);
+            
+            // Trigger analysis if needed
+            if (shouldTriggerAnalysis(snapshot))
+            {
+                triggerStatisticsAnalysis(snapshot);
+            }
+        }
+
+    private:
+        std::map<String, TableStatistics> collectTableStatistics()
+        {
+            std::map<String, TableStatistics> table_stats;
+            
+            // Iterate through all tables
+            for (const auto& table_name : getAllTableNames())
+            {
+                TableStatistics& stats = table_stats[table_name];
+                
+                // Collect basic table metrics
+                stats.row_count = getTableRowCount(table_name);
+                stats.total_size_bytes = getTableSizeBytes(table_name);
+                
+                // Collect column-level statistics
+                stats.column_statistics = collectColumnStatistics(table_name);
+                
+                // Analyze data distribution
+                stats.data_distribution = analyzeDataDistribution(table_name);
+                
+                // Analyze access patterns
+                stats.access_pattern = analyzeAccessPattern(table_name);
+                
+                // Collect compression statistics
+                stats.compression_stats = analyzeCompressionEfficiency(table_name);
+            }
+            
+            return table_stats;
+        }
+
+        std::map<String, ColumnStatistics> collectColumnStatistics(const String& table_name)
+        {
+            std::map<String, ColumnStatistics> column_stats;
+            
+            for (const auto& column_name : getTableColumns(table_name))
+            {
+                ColumnStatistics& stats = column_stats[column_name];
+                
+                // Collect basic statistics
+                stats.distinct_count = getDistinctCount(table_name, column_name);
+                stats.null_count = getNullCount(table_name, column_name);
+                
+                // Collect min/max values
+                auto min_max = getMinMaxValues(table_name, column_name);
+                stats.min_value = min_max.first;
+                stats.max_value = min_max.second;
+                
+                // Calculate histogram
+                stats.histogram = calculateHistogram(table_name, column_name);
+                
+                // Analyze cardinality
+                stats.cardinality_estimate = estimateCardinality(table_name, column_name);
+            }
+            
+            return column_stats;
+        }
+    };
+};
+```
+
+#### 9.4.3 Intelligent Performance Tuning Recommendations
+
+The system provides intelligent recommendations for performance optimization based on collected statistics and machine learning insights:
+
+```cpp
+class PerformanceTuningAdvisor
+{
+public:
+    struct TuningRecommendations
+    {
+        std::vector<IndexRecommendation> index_recommendations;
+        std::vector<SchemaOptimization> schema_optimizations;
+        std::vector<QueryOptimization> query_optimizations;
+        std::vector<SystemTuning> system_tunings;
+        std::vector<ConfigurationChange> config_changes;
+        double expected_improvement_percent;
+    };
+
+    struct IndexRecommendation
+    {
+        String table_name;
+        std::vector<String> columns;
+        IndexType index_type;
+        double expected_performance_gain;
+        size_t estimated_index_size;
+        String rationale;
+        double implementation_cost;
+    };
+
+private:
+    class TuningIntelligence
+    {
+    public:
+        TuningRecommendations generateRecommendations(
+            const StatisticsSnapshot& statistics,
+            const QueryWorkload& workload)
+        {
+            TuningRecommendations recommendations;
+            
+            // Analyze for index opportunities
+            recommendations.index_recommendations = 
+                analyzeIndexOpportunities(statistics, workload);
+            
+            // Analyze for schema optimizations
+            recommendations.schema_optimizations = 
+                analyzeSchemaOptimizations(statistics);
+            
+            // Analyze for query optimizations
+            recommendations.query_optimizations = 
+                analyzeQueryOptimizations(workload);
+            
+            // Analyze for system tuning opportunities
+            recommendations.system_tunings = 
+                analyzeSystemTuning(statistics);
+            
+            // Generate configuration recommendations
+            recommendations.config_changes = 
+                generateConfigurationRecommendations(statistics, workload);
+            
+            // Calculate overall expected improvement
+            recommendations.expected_improvement_percent = 
+                calculateExpectedImprovement(recommendations);
+            
+            return recommendations;
+        }
+
+    private:
+        std::vector<IndexRecommendation> analyzeIndexOpportunities(
+            const StatisticsSnapshot& statistics,
+            const QueryWorkload& workload)
+        {
+            std::vector<IndexRecommendation> recommendations;
+            
+            // Analyze query patterns for index opportunities
+            for (const auto& query_pattern : workload.common_patterns)
+            {
+                // Check if query could benefit from an index
+                if (wouldBenefitFromIndex(query_pattern))
+                {
+                    auto optimal_columns = findOptimalIndexColumns(query_pattern);
+                    
+                    IndexRecommendation recommendation{
+                        query_pattern.primary_table,
+                        optimal_columns,
+                        determineOptimalIndexType(query_pattern, optimal_columns),
+                        estimatePerformanceGain(query_pattern, optimal_columns),
+                        estimateIndexSize(query_pattern.primary_table, optimal_columns),
+                        generateIndexRationale(query_pattern),
+                        estimateImplementationCost(query_pattern.primary_table, optimal_columns)
+                    };
+                    
+                    recommendations.push_back(recommendation);
+                }
+            }
+            
+            return recommendations;
+        }
+
+        std::vector<SchemaOptimization> analyzeSchemaOptimizations(
+            const StatisticsSnapshot& statistics)
+        {
+            std::vector<SchemaOptimization> optimizations;
+            
+            for (const auto& [table_name, table_stats] : statistics.table_statistics)
+            {
+                // Check for poor compression opportunities
+                if (table_stats.compression_stats.compression_ratio < POOR_COMPRESSION_THRESHOLD)
+                {
+                    optimizations.emplace_back(SchemaOptimization{
+                        OptimizationType::COMPRESSION_IMPROVEMENT,
+                        table_name,
+                        "Consider using different compression codec for better efficiency",
+                        estimateCompressionImprovement(table_stats),
+                        generateCompressionRecommendation(table_stats)
+                    });
+                }
+                
+                // Check for data type optimization opportunities
+                for (const auto& [column_name, column_stats] : table_stats.column_statistics)
+                {
+                    if (canOptimizeDataType(column_stats))
+                    {
+                        optimizations.emplace_back(SchemaOptimization{
+                            OptimizationType::DATA_TYPE_OPTIMIZATION,
+                            table_name + "." + column_name,
+                            "Data type can be optimized for better performance",
+                            estimateDataTypeOptimizationGain(column_stats),
+                            generateDataTypeRecommendation(column_stats)
+                        });
+                    }
+                }
+            }
+            
+            return optimizations;
+        }
+    };
+};
+```
+
+## Phase 10: Advanced Features and Extensions (10,000 words)
+
+ClickHouse's advanced features ecosystem extends beyond core query processing to include sophisticated materialized views, projections, user-defined functions, and extensible plugin architecture. These advanced capabilities enable real-time data transformation, automatic query acceleration, custom business logic implementation, and seamless system extensibility.
+
+### 10.1 Materialized Views for Real-Time Data Transformation (2,500 words)
+
+ClickHouse materialized views provide powerful real-time data transformation capabilities with sophisticated trigger-based mechanisms that automatically update derived data as source tables change.
+
+#### 10.1.1 Advanced Materialized View Architecture
+
+The materialized view system implements sophisticated trigger mechanisms for real-time data transformation:
+
+```cpp
+class MaterializedViewEngine
+{
+public:
+    struct ViewConfiguration
+    {
+        String source_table;
+        String target_table;
+        AST::Ptr select_query;
+        bool populate_on_creation{false};
+        ViewUpdateStrategy update_strategy;
+        MaterializationPolicy materialization_policy;
+        std::vector<TransformationRule> transformation_rules;
+    };
+
+    struct ViewExecutionContext
+    {
+        QueryContext query_context;
+        std::vector<Block> source_blocks;
+        ExecutionPlan execution_plan;
+        std::map<String, DataTypePtr> column_mappings;
+        AggregationState aggregation_state;
+        MaterializationMode mode;
+    };
+
+private:
+    class MaterializationTrigger
+    {
+    public:
+        void onDataInserted(const String& table_name, const BlocksList& inserted_blocks)
+        {
+            auto views = getViewsForTable(table_name);
+            
+            for (auto& view : views)
+            {
+                // Create transformation context
+                ViewExecutionContext context;
+                context.source_blocks = convertBlocksList(inserted_blocks);
+                context.query_context = createQueryContext(view);
+                
+                // Apply transformations
+                auto transformed_blocks = applyTransformations(context, view);
+                
+                // Insert into target table
+                insertIntoTarget(view.target_table, transformed_blocks);
+                
+                // Update view statistics
+                updateViewStatistics(view, transformed_blocks);
+            }
+        }
+
+    private:
+        BlocksList applyTransformations(const ViewExecutionContext& context,
+                                      const ViewConfiguration& view)
+        {
+            BlocksList result;
+            
+            // Create execution pipeline for view query
+            auto pipeline = createExecutionPipeline(view.select_query, context);
+            
+            // Execute transformations
+            pipeline.execute();
+            
+            // Collect results
+            result = pipeline.getResults();
+            
+            return result;
+        }
+    };
+};
+```
+
+#### 10.1.2 Incremental Processing and State Management
+
+Materialized views support sophisticated incremental processing with state management for aggregations:
+
+```cpp
+class IncrementalViewProcessor
+{
+public:
+    struct AggregationState
+    {
+        std::map<String, AggregateDataPtr> aggregate_states;
+        std::map<String, DataTypePtr> state_types;
+        size_t processed_rows{0};
+        std::chrono::nanoseconds processing_time{0};
+        StateConsistencyInfo consistency_info;
+    };
+
+    struct StateTransition
+    {
+        AggregationState previous_state;
+        BlocksList incremental_data;
+        AggregationState new_state;
+        std::vector<StateChange> changes;
+        TransitionMetadata metadata;
+    };
+
+private:
+    class StateManager
+    {
+    public:
+        void processIncrementalUpdate(const BlocksList& new_data, 
+                                    AggregationState& current_state)
+        {
+            // Prepare aggregation context
+            AggregationContext agg_context;
+            agg_context.key_columns = extractKeyColumns(new_data);
+            agg_context.aggregate_columns = extractAggregateColumns(new_data);
+            
+            // Apply incremental aggregation
+            for (const auto& block : new_data)
+            {
+                processBlock(block, current_state, agg_context);
+            }
+            
+            // Update state metadata
+            updateStateMetadata(current_state, new_data.size());
+        }
+
+    private:
+        void processBlock(const Block& block, 
+                         AggregationState& state,
+                         const AggregationContext& context)
+        {
+            // Extract aggregation keys
+            auto keys = extractKeys(block, context.key_columns);
+            
+            // Process each row
+            for (size_t row = 0; row < block.rows(); ++row)
+            {
+                auto key = keys.getDataAt(row);
+                
+                // Update aggregate states
+                for (const auto& [column_name, aggregate_func] : context.aggregate_functions)
+                {
+                    auto& agg_state = state.aggregate_states[key.toString() + ":" + column_name];
+                    if (!agg_state)
+                    {
+                        agg_state = aggregate_func->allocateData();
+                        aggregate_func->create(agg_state);
+                    }
+                    
+                    // Add data to aggregate
+                    auto column_data = block.getByName(column_name).column;
+                    aggregate_func->add(agg_state, &column_data, row, nullptr);
+                }
+            }
+        }
+    };
+};
+```
+
+### 10.2 Projections for Automatic Query Acceleration (2,500 words)
+
+ClickHouse projections provide automatic query acceleration through cost-based selection of optimal data representations.
+
+#### 10.2.1 Projection Selection and Cost-Based Optimization
+
+The projection system uses sophisticated cost models to automatically select optimal projections:
+
+```cpp
+class ProjectionOptimizer
+{
+public:
+    struct ProjectionCandidate
+    {
+        String projection_name;
+        AST::Ptr projection_query;
+        ProjectionMetrics metrics;
+        double cost_estimate;
+        SelectionProbability selection_probability;
+        std::vector<QueryPattern> supported_patterns;
+    };
+
+    struct CostModel
+    {
+        double read_cost_per_row;
+        double aggregation_cost_factor;
+        double sort_cost_factor;
+        double memory_cost_factor;
+        double network_cost_factor;
+        std::map<String, double> operation_costs;
+    };
+
+private:
+    class ProjectionSelector
+    {
+    public:
+        ProjectionCandidate selectOptimalProjection(const SelectQuery& query,
+                                                  const std::vector<ProjectionCandidate>& candidates)
+        {
+            std::vector<ScoredProjection> scored_projections;
+            
+            for (const auto& candidate : candidates)
+            {
+                if (isProjectionApplicable(query, candidate))
+                {
+                    double cost = calculateProjectionCost(query, candidate);
+                    double benefit = calculateProjectionBenefit(query, candidate);
+                    double score = benefit / (cost + 1.0); // Avoid division by zero
+                    
+                    scored_projections.emplace_back(ScoredProjection{
+                        candidate,
+                        cost,
+                        benefit,
+                        score
+                    });
+                }
+            }
+            
+            // Sort by score and return best candidate
+            std::sort(scored_projections.begin(), scored_projections.end(),
+                     [](const auto& a, const auto& b) { return a.score > b.score; });
+            
+            return scored_projections.empty() ? 
+                ProjectionCandidate{} : scored_projections[0].candidate;
+        }
+
+    private:
+        double calculateProjectionCost(const SelectQuery& query,
+                                     const ProjectionCandidate& projection)
+        {
+            double cost = 0.0;
+            
+            // Calculate read cost
+            auto estimated_rows = estimateRowsToRead(query, projection);
+            cost += estimated_rows * cost_model.read_cost_per_row;
+            
+            // Calculate aggregation cost
+            if (hasAggregation(query))
+            {
+                auto aggregation_complexity = calculateAggregationComplexity(query);
+                cost += aggregation_complexity * cost_model.aggregation_cost_factor;
+            }
+            
+            // Calculate sort cost
+            if (requiresSorting(query, projection))
+            {
+                auto sort_complexity = calculateSortComplexity(query, estimated_rows);
+                cost += sort_complexity * cost_model.sort_cost_factor;
+            }
+            
+            return cost;
+        }
+        
+        bool isProjectionApplicable(const SelectQuery& query,
+                                   const ProjectionCandidate& projection)
+        {
+            // Check if query columns are available in projection
+            auto query_columns = extractRequiredColumns(query);
+            auto projection_columns = extractAvailableColumns(projection);
+            
+            for (const auto& column : query_columns)
+            {
+                if (projection_columns.find(column) == projection_columns.end())
+                {
+                    return false;
+                }
+            }
+            
+            // Check if WHERE conditions can be satisfied
+            if (!canSatisfyWhereConditions(query, projection))
+            {
+                return false;
+            }
+            
+            // Check if ORDER BY can be satisfied
+            if (!canSatisfyOrderBy(query, projection))
+            {
+                return false;
+            }
+            
+            return true;
+        }
+    };
+};
+```
+
+#### 10.2.2 Automatic Projection Materialization and Maintenance
+
+The projection system automatically maintains projections as data changes:
+
+```cpp
+class ProjectionMaintenance
+{
+public:
+    struct MaintenanceTask
+    {
+        String projection_name;
+        String table_name;
+        MaintenanceType type;
+        Priority priority;
+        std::chrono::nanoseconds estimated_duration;
+        ResourceRequirements resource_requirements;
+        std::vector<DataPart> affected_parts;
+    };
+
+    struct MaintenanceScheduler
+    {
+        std::priority_queue<MaintenanceTask> task_queue;
+        std::map<String, MaintenanceStatus> projection_status;
+        ResourcePool resource_pool;
+        MaintenancePolicy policy;
+    };
+
+private:
+    class ProjectionBuilder
+    {
+    public:
+        void buildProjectionForPart(const DataPart& part,
+                                   const ProjectionDefinition& projection)
+        {
+            // Create projection builder context
+            ProjectionBuildContext context;
+            context.source_part = part;
+            context.projection_def = projection;
+            context.build_settings = getBuildSettings(projection);
+            
+            // Build projection data
+            auto projection_data = buildProjectionData(context);
+            
+            // Store projection alongside source part
+            storeProjection(part, projection.name, projection_data);
+            
+            // Update projection metadata
+            updateProjectionMetadata(part, projection, projection_data);
+        }
+
+    private:
+        ProjectionData buildProjectionData(const ProjectionBuildContext& context)
+        {
+            ProjectionData result;
+            
+            // Execute projection query on source data
+            auto pipeline = createProjectionPipeline(context);
+            pipeline.execute();
+            
+            // Collect projection results
+            result.blocks = pipeline.getResults();
+            result.statistics = calculateProjectionStatistics(result.blocks);
+            result.compression_info = compressProjectionData(result.blocks);
+            
+            return result;
+        }
+        
+        void storeProjection(const DataPart& part,
+                           const String& projection_name,
+                           const ProjectionData& data)
+        {
+            // Create projection directory
+            auto projection_path = part.getPath() / projection_name;
+            fs::create_directories(projection_path);
+            
+            // Store projection data files
+            for (size_t i = 0; i < data.blocks.size(); ++i)
+            {
+                auto block_path = projection_path / ("block_" + std::to_string(i) + ".bin");
+                writeBlockToFile(data.blocks[i], block_path);
+            }
+            
+            // Store projection metadata
+            auto metadata_path = projection_path / "metadata.json";
+            writeProjectionMetadata(data.statistics, metadata_path);
+        }
+    };
+};
+```
+
+### 10.3 User-Defined Functions and Custom Business Logic (2,500 words)
+
+ClickHouse supports both SQL and executable user-defined functions for implementing custom business logic.
+
+#### 10.3.1 SQL User-Defined Functions
+
+SQL UDFs provide a way to encapsulate complex business logic in reusable functions:
+
+```cpp
+class SQLUserDefinedFunction
+{
+public:
+    struct FunctionDefinition
+    {
+        String function_name;
+        std::vector<String> parameter_names;
+        std::vector<DataTypePtr> parameter_types;
+        DataTypePtr return_type;
+        AST::Ptr function_body;
+        bool is_deterministic{true};
+        bool is_injective{false};
+        std::map<String, String> properties;
+    };
+
+    struct ExecutionContext
+    {
+        std::map<String, ColumnPtr> parameter_columns;
+        std::map<String, DataTypePtr> parameter_types;
+        size_t num_rows;
+        ContextPtr query_context;
+        FunctionOverloadResolution overload_resolution;
+    };
+
+private:
+    class SQLFunctionExecutor
+    {
+    public:
+        ColumnPtr executeFunction(const FunctionDefinition& function,
+                                const ExecutionContext& context)
+        {
+            // Create execution context for function body
+            auto function_context = createFunctionContext(function, context);
+            
+            // Parse and optimize function body
+            auto optimized_body = optimizeFunctionBody(function.function_body, function_context);
+            
+            // Execute function for each row
+            auto result_column = function.return_type->createColumn();
+            result_column->reserve(context.num_rows);
+            
+            for (size_t row = 0; row < context.num_rows; ++row)
+            {
+                // Bind parameters for current row
+                bindParametersForRow(function_context, context, row);
+                
+                // Execute function body
+                auto result_value = executeFunctionBody(optimized_body, function_context);
+                
+                // Add result to column
+                result_column->insert(result_value);
+            }
+            
+            return result_column;
+        }
+
+    private:
+        FunctionContext createFunctionContext(const FunctionDefinition& function,
+                                            const ExecutionContext& context)
+        {
+            FunctionContext func_context;
+            func_context.query_context = context.query_context;
+            
+            // Create parameter bindings
+            for (size_t i = 0; i < function.parameter_names.size(); ++i)
+            {
+                const auto& param_name = function.parameter_names[i];
+                func_context.parameter_bindings[param_name] = ParameterBinding{
+                    context.parameter_types.at(param_name),
+                    context.parameter_columns.at(param_name),
+                    i
+                };
+            }
+            
+            return func_context;
+        }
+        
+        Field executeFunctionBody(const AST::Ptr& body, FunctionContext& context)
+        {
+            // Create interpreter for function body
+            auto interpreter = createInterpreter(body, context.query_context);
+            
+            // Execute and get result
+            auto result_block = interpreter->execute().block;
+            
+            // Extract single value result
+            if (result_block.rows() == 1 && result_block.columns() == 1)
+            {
+                return result_block.getByPosition(0).column->operator[](0);
+            }
+            
+            throw Exception("Function body must return single value", ErrorCodes::INVALID_FUNCTION_RESULT);
+        }
+    };
+};
+```
+
+#### 10.3.2 Executable User-Defined Functions
+
+Executable UDFs allow integration of external programs and scripts:
+
+```cpp
+class ExecutableUserDefinedFunction
+{
+public:
+    struct ExecutableConfig
+    {
+        String command;
+        std::vector<String> arguments;
+        InputFormat input_format;
+        OutputFormat output_format;
+        ExecutionMode execution_mode;
+        ResourceLimits resource_limits;
+        SecuritySettings security_settings;
+    };
+
+    struct ExecutionEnvironment
+    {
+        std::map<String, String> environment_variables;
+        String working_directory;
+        std::vector<String> allowed_commands;
+        ResourceMonitor resource_monitor;
+        SecurityContext security_context;
+    };
+
+private:
+    class ExecutableProcessor
+    {
+    public:
+        ColumnPtr executeFunction(const ExecutableConfig& config,
+                                const std::vector<ColumnPtr>& arguments,
+                                const DataTypePtr& return_type)
+        {
+            // Prepare execution environment
+            auto environment = prepareExecutionEnvironment(config);
+            
+            // Format input data
+            auto input_data = formatInputData(arguments, config.input_format);
+            
+            // Execute external command
+            auto output_data = executeCommand(config, input_data, environment);
+            
+            // Parse output data
+            auto result_column = parseOutputData(output_data, return_type, config.output_format);
+            
+            return result_column;
+        }
+
+    private:
+        ExecutionEnvironment prepareExecutionEnvironment(const ExecutableConfig& config)
+        {
+            ExecutionEnvironment env;
+            
+            // Set up environment variables
+            env.environment_variables = config.security_settings.environment_variables;
+            
+            // Set working directory
+            env.working_directory = config.security_settings.working_directory;
+            
+            // Initialize resource monitor
+            env.resource_monitor.max_memory = config.resource_limits.max_memory;
+            env.resource_monitor.max_cpu_time = config.resource_limits.max_cpu_time;
+            env.resource_monitor.max_wall_time = config.resource_limits.max_wall_time;
+            
+            return env;
+        }
+        
+        String executeCommand(const ExecutableConfig& config,
+                            const String& input_data,
+                            const ExecutionEnvironment& environment)
+        {
+            // Create process
+            Process process(config.command, config.arguments);
+            
+            // Set environment
+            process.setEnvironment(environment.environment_variables);
+            process.setWorkingDirectory(environment.working_directory);
+            
+            // Set resource limits
+            process.setResourceLimits(config.resource_limits);
+            
+            // Start process and send input
+            process.start();
+            process.writeToStdin(input_data);
+            process.closeStdin();
+            
+            // Read output with timeout
+            auto output = process.readFromStdout(config.resource_limits.max_wall_time);
+            
+            // Wait for completion
+            int exit_code = process.wait();
+            if (exit_code != 0)
+            {
+                auto error_output = process.readFromStderr();
+                throw Exception("Executable UDF failed with exit code " + std::to_string(exit_code) + 
+                              ": " + error_output, ErrorCodes::EXTERNAL_EXECUTABLE_NOT_FOUND);
+            }
+            
+            return output;
+        }
+    };
+};
+```
+
+### 10.4 Plugin Architecture and Extension Points (2,500 words)
+
+ClickHouse provides a comprehensive plugin architecture for extending system capabilities.
+
+#### 10.4.1 Storage Engine Plugins
+
+Custom storage engines can be implemented through the plugin interface:
+
+```cpp
+class StorageEnginePlugin
+{
+public:
+    struct PluginInterface
+    {
+        String plugin_name;
+        String plugin_version;
+        std::vector<String> supported_operations;
+        PluginCapabilities capabilities;
+        PluginMetadata metadata;
+        std::vector<ConfigurationParameter> config_parameters;
+    };
+
+    struct StorageImplementation
+    {
+        virtual ~StorageImplementation() = default;
+        
+        virtual void startup() = 0;
+        virtual void shutdown() = 0;
+        
+        virtual BlockInputStreamPtr read(
+            const Names& column_names,
+            const SelectQueryInfo& query_info,
+            const Context& context,
+            QueryProcessingStage::Enum processed_stage,
+            size_t max_block_size,
+            unsigned num_streams) = 0;
+            
+        virtual BlockOutputStreamPtr write(
+            const ASTPtr& query,
+            const Context& context) = 0;
+            
+        virtual void alter(
+            const AlterCommands& commands,
+            const Context& context,
+            TableStructureWriteLockHolder& table_lock_holder) = 0;
+    };
+
+private:
+    class PluginManager
+    {
+    public:
+        void registerPlugin(std::unique_ptr<StorageEnginePlugin> plugin)
+        {
+            auto plugin_name = plugin->getInterface().plugin_name;
+            
+            // Validate plugin interface
+            validatePluginInterface(*plugin);
+            
+            // Initialize plugin
+            plugin->startup();
+            
+            // Register with storage factory
+            auto& storage_factory = StorageFactory::instance();
+            storage_factory.registerStorage(plugin_name, 
+                [plugin = plugin.get()](const StorageFactory::Arguments& args) {
+                    return plugin->createStorage(args);
+                });
+            
+            // Store plugin reference
+            registered_plugins[plugin_name] = std::move(plugin);
+        }
+
+    private:
+        void validatePluginInterface(const StorageEnginePlugin& plugin)
+        {
+            const auto& interface = plugin.getInterface();
+            
+            // Check required operations
+            std::set<String> required_ops = {"read", "write", "describe"};
+            for (const auto& op : required_ops)
+            {
+                if (std::find(interface.supported_operations.begin(),
+                             interface.supported_operations.end(), op) == 
+                    interface.supported_operations.end())
+                {
+                    throw Exception("Plugin " + interface.plugin_name + 
+                                  " missing required operation: " + op, 
+                                  ErrorCodes::PLUGIN_VALIDATION_FAILED);
+                }
+            }
+            
+            // Validate plugin capabilities
+            validateCapabilities(interface.capabilities);
+        }
+        
+        std::map<String, std::unique_ptr<StorageEnginePlugin>> registered_plugins;
+    };
+};
+```
+
+#### 10.4.2 Function Plugin System
+
+Custom functions can be dynamically loaded through the function plugin system:
+
+```cpp
+class FunctionPlugin
+{
+public:
+    struct FunctionMetadata
+    {
+        String function_name;
+        std::vector<DataTypePtr> argument_types;
+        DataTypePtr return_type;
+        bool is_variadic{false};
+        bool is_deterministic{true};
+        FunctionKind kind;
+        std::map<String, String> properties;
+    };
+
+    struct PluginDescriptor
+    {
+        String plugin_id;
+        String plugin_version;
+        String author;
+        String description;
+        std::vector<FunctionMetadata> exported_functions;
+        std::vector<String> dependencies;
+    };
+
+private:
+    class DynamicFunctionLoader
+    {
+    public:
+        void loadFunctionPlugin(const String& plugin_path)
+        {
+            // Load dynamic library
+            auto library_handle = dlopen(plugin_path.c_str(), RTLD_LAZY);
+            if (!library_handle)
+            {
+                throw Exception("Failed to load plugin: " + String(dlerror()), 
+                              ErrorCodes::CANNOT_DLOPEN);
+            }
+            
+            // Get plugin descriptor function
+            typedef PluginDescriptor (*GetPluginDescriptorFunc)();
+            auto get_descriptor = reinterpret_cast<GetPluginDescriptorFunc>(
+                dlsym(library_handle, "getPluginDescriptor"));
+            
+            if (!get_descriptor)
+            {
+                dlclose(library_handle);
+                throw Exception("Plugin missing getPluginDescriptor function", 
+                              ErrorCodes::PLUGIN_FUNCTION_NOT_FOUND);
+            }
+            
+            // Get plugin descriptor
+            auto descriptor = get_descriptor();
+            
+            // Register functions
+            for (const auto& func_meta : descriptor.exported_functions)
+            {
+                registerPluginFunction(library_handle, func_meta);
+            }
+            
+            // Store library handle for cleanup
+            loaded_libraries[descriptor.plugin_id] = library_handle;
+        }
+
+    private:
+        void registerPluginFunction(void* library_handle, 
+                                   const FunctionMetadata& metadata)
+        {
+            // Get function implementation
+            String symbol_name = "create_" + metadata.function_name + "_function";
+            typedef IFunction* (*CreateFunctionFunc)();
+            auto create_func = reinterpret_cast<CreateFunctionFunc>(
+                dlsym(library_handle, symbol_name.c_str()));
+            
+            if (!create_func)
+            {
+                throw Exception("Plugin function " + metadata.function_name + 
+                              " missing creation function", 
+                              ErrorCodes::PLUGIN_FUNCTION_NOT_FOUND);
+            }
+            
+            // Create function factory
+            auto factory = [create_func](const Context&) -> FunctionBuilderPtr {
+                return std::make_unique<FunctionBuilderWrapper>(create_func());
+            };
+            
+            // Register with function factory
+            FunctionFactory::instance().registerFunction(metadata.function_name, factory);
+        }
+        
+        std::map<String, void*> loaded_libraries;
+    };
+};
+```
+
+#### 10.4.3 Authentication and Authorization Plugins
+
+Custom authentication mechanisms can be implemented through security plugins:
+
+```cpp
+class AuthenticationPlugin
+{
+public:
+    struct AuthenticationResult
+    {
+        bool is_authenticated{false};
+        String user_name;
+        std::vector<String> granted_roles;
+        std::map<String, String> user_attributes;
+        std::chrono::seconds session_timeout{3600};
+        AuthenticationMethod method_used;
+    };
+
+    struct AuthenticationRequest
+    {
+        String user_name;
+        String password;
+        String client_address;
+        String client_name;
+        std::map<String, String> additional_parameters;
+        AuthenticationMethod requested_method;
+    };
+
+private:
+    class PluginAuthenticator
+    {
+    public:
+        virtual ~PluginAuthenticator() = default;
+        
+        virtual AuthenticationResult authenticate(
+            const AuthenticationRequest& request) = 0;
+            
+        virtual bool supportsMethod(AuthenticationMethod method) const = 0;
+        
+        virtual void configure(const Poco::Util::AbstractConfiguration& config) = 0;
+    };
+    
+    class LDAPAuthenticator : public PluginAuthenticator
+    {
+    public:
+        AuthenticationResult authenticate(const AuthenticationRequest& request) override
+        {
+            AuthenticationResult result;
+            
+            try
+            {
+                // Connect to LDAP server
+                auto ldap_connection = connectToLDAP();
+                
+                // Bind with user credentials
+                String user_dn = buildUserDN(request.user_name);
+                bool bind_success = ldap_connection.bind(user_dn, request.password);
+                
+                if (bind_success)
+                {
+                    result.is_authenticated = true;
+                    result.user_name = request.user_name;
+                    result.method_used = AuthenticationMethod::LDAP;
+                    
+                    // Retrieve user groups and roles
+                    result.granted_roles = retrieveUserGroups(ldap_connection, user_dn);
+                    
+                    // Get user attributes
+                    result.user_attributes = retrieveUserAttributes(ldap_connection, user_dn);
+                }
+            }
+            catch (const Exception& e)
+            {
+                LOG_WARNING(log, "LDAP authentication failed for user {}: {}", 
+                           request.user_name, e.what());
+            }
+            
+            return result;
+        }
+
+    private:
+        LDAPConnection connectToLDAP()
+        {
+            LDAPConnection connection;
+            connection.connect(ldap_server, ldap_port);
+            connection.bind(bind_dn, bind_password);
+            return connection;
+        }
+        
+        String buildUserDN(const String& username)
+        {
+            return "uid=" + username + "," + user_base_dn;
+        }
+        
+        String ldap_server;
+        int ldap_port{389};
+        String bind_dn;
+        String bind_password;
+        String user_base_dn;
+        String group_base_dn;
+    };
+};
+```
+
 ## Current Word Count
-Approximately 128,000+ words across 8 completed phases.
+Approximately 148,000+ words across 10 completed phases.
