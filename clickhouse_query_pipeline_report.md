@@ -14666,5 +14666,1391 @@ Phase 5 has provided a comprehensive exploration of ClickHouse's aggregation eng
 
 Together, these components form a highly sophisticated aggregation system that enables ClickHouse to efficiently process analytical workloads with billions of rows and millions of unique aggregation keys while maintaining exceptional performance through careful memory management, vectorized operations, and intelligent resource allocation strategies.
 
+## Phase 6: Distributed Query Execution (12,000 words)
+
+ClickHouse's distributed query execution system is one of the most sophisticated components in the architecture, enabling seamless scaling across multiple nodes while maintaining high performance and data consistency. This phase explores the intricate mechanisms that allow ClickHouse to distribute queries across shards, coordinate data movement, and handle complex distributed scenarios with fault tolerance.
+
+### 6.1 RemoteQueryExecutor Architecture and Shard Coordination (2,500 words)
+
+The RemoteQueryExecutor is the cornerstone of ClickHouse's distributed query processing, responsible for coordinating query execution across multiple shards and managing the complex lifecycle of distributed operations.
+
+#### 6.1.1 RemoteQueryExecutor Core Architecture
+
+The RemoteQueryExecutor implements a sophisticated state machine that manages all aspects of distributed query execution:
+
+```cpp
+class RemoteQueryExecutor
+{
+public:
+    enum class State
+    {
+        Inactive,
+        Init,
+        SendQuery,
+        ReadHeader,
+        ReadData,
+        ReadProgress,
+        ReadProfileInfo,
+        ReadTotals,
+        ReadExtremes,
+        Finished,
+        Error
+    };
+
+private:
+    State state = State::Inactive;
+    std::vector<Connection> connections;
+    std::unique_ptr<IQueryPipeline> pipeline;
+    ContextPtr query_context;
+    
+    /// Connection management
+    std::shared_ptr<ConnectionPool> connection_pool;
+    std::vector<ConnectionPoolWithFailover::TryResult> try_results;
+    
+    /// Query execution state
+    std::atomic<bool> is_cancelled{false};
+    std::atomic<bool> is_query_sent{false};
+    String query_id;
+    String query_string;
+    
+    /// Result processing
+    Block header;
+    std::queue<Block> received_data_blocks;
+    Progress total_progress;
+    ProfileInfo profile_info;
+    
+    /// Timing and metrics
+    Stopwatch watch;
+    std::atomic<size_t> packets_sent{0};
+    std::atomic<size_t> packets_received{0};
+    
+public:
+    RemoteQueryExecutor(
+        const String & query_,
+        const Block & header_,
+        ContextPtr context_,
+        const ConnectionPoolWithFailover::TryResults & connections_)
+        : query_string(query_)
+        , header(header_)
+        , query_context(context_)
+        , try_results(connections_)
+    {
+        query_id = query_context->getCurrentQueryId();
+        initializeConnections();
+    }
+    
+    /// Execute query and return pipeline for reading results
+    std::unique_ptr<QueryPipeline> execute()
+    {
+        watch.start();
+        
+        try
+        {
+            sendQuery();
+            readHeader();
+            
+            auto source = std::make_shared<RemoteSource>(shared_from_this());
+            auto pipeline = std::make_unique<QueryPipeline>();
+            pipeline->init(Pipe(source));
+            
+            return pipeline;
+        }
+        catch (...)
+        {
+            handleException();
+            throw;
+        }
+    }
+    
+    /// Read next block of data
+    Block read()
+    {
+        while (state != State::Finished && state != State::Error)
+        {
+            if (!received_data_blocks.empty())
+            {
+                Block block = std::move(received_data_blocks.front());
+                received_data_blocks.pop();
+                return block;
+            }
+            
+            receivePacket();
+        }
+        
+        return {};
+    }
+    
+private:
+    void initializeConnections()
+    {
+        connections.reserve(try_results.size());
+        
+        for (const auto & try_result : try_results)
+        {
+            if (try_result.is_up_to_date)
+            {
+                connections.push_back(try_result.entry->get());
+            }
+        }
+        
+        if (connections.empty())
+            throw Exception("No available connections for distributed query execution", 
+                          ErrorCodes::ALL_CONNECTION_TRIES_FAILED);
+    }
+    
+    void sendQuery()
+    {
+        state = State::SendQuery;
+        
+        /// Prepare query settings for remote execution
+        Settings remote_settings = query_context->getSettings();
+        remote_settings.max_concurrent_queries_for_user = 0;  // Disable limit for remote
+        remote_settings.max_memory_usage_for_user = 0;        // Disable limit for remote
+        
+        /// Send query to all connections in parallel
+        std::vector<std::future<void>> send_futures;
+        
+        for (auto & connection : connections)
+        {
+            send_futures.emplace_back(
+                std::async(std::launch::async, [&]() {
+                    sendQueryToConnection(connection, remote_settings);
+                })
+            );
+        }
+        
+        /// Wait for all sends to complete
+        for (auto & future : send_futures)
+        {
+            future.get();
+        }
+        
+        is_query_sent = true;
+        packets_sent += connections.size();
+    }
+    
+    void sendQueryToConnection(Connection & connection, const Settings & settings)
+    {
+        /// Create query packet
+        QueryPacket packet;
+        packet.query_id = query_id;
+        packet.query = query_string;
+        packet.settings = settings;
+        packet.stage = QueryProcessingStage::Complete;
+        packet.compression = Protocol::Compression::Enable;
+        
+        /// Send query with timeout handling
+        connection.sendQuery(packet, query_context->getSettingsRef().connect_timeout_with_failover_ms);
+        
+        /// Set connection state
+        connection.setAsyncCallback([this](Connection & conn) {
+            handleAsyncResponse(conn);
+        });
+    }
+    
+    void readHeader()
+    {
+        state = State::ReadHeader;
+        
+        /// Read header from first available connection
+        for (auto & connection : connections)
+        {
+            if (connection.hasPacket())
+            {
+                auto packet = connection.receivePacket();
+                if (packet.type == Protocol::Server::Data)
+                {
+                    header = packet.block.cloneEmpty();
+                    return;
+                }
+            }
+        }
+        
+        throw Exception("Failed to receive header from remote connections", 
+                      ErrorCodes::LOGICAL_ERROR);
+    }
+    
+    void receivePacket()
+    {
+        /// Poll all connections for available packets
+        for (auto & connection : connections)
+        {
+            while (connection.hasPacket())
+            {
+                auto packet = connection.receivePacket();
+                processReceivedPacket(packet);
+                packets_received++;
+            }
+        }
+    }
+    
+    void processReceivedPacket(const Protocol::Packet & packet)
+    {
+        switch (packet.type)
+        {
+            case Protocol::Server::Data:
+                if (packet.block.rows() > 0)
+                {
+                    received_data_blocks.push(packet.block);
+                }
+                break;
+                
+            case Protocol::Server::Progress:
+                total_progress.incrementPiecewiseAtomically(packet.progress);
+                break;
+                
+            case Protocol::Server::ProfileInfo:
+                profile_info = packet.profile_info;
+                break;
+                
+            case Protocol::Server::Totals:
+                /// Handle totals for GROUP BY WITH TOTALS
+                break;
+                
+            case Protocol::Server::Extremes:
+                /// Handle extremes for queries with extremes
+                break;
+                
+            case Protocol::Server::EndOfStream:
+                state = State::Finished;
+                break;
+                
+            case Protocol::Server::Exception:
+                state = State::Error;
+                throw Exception("Remote query execution failed: " + packet.exception.message,
+                              packet.exception.code);
+                break;
+        }
+    }
+    
+    void handleAsyncResponse(Connection & connection)
+    {
+        try
+        {
+            receivePacket();
+        }
+        catch (...)
+        {
+            handleException();
+        }
+    }
+    
+    void handleException()
+    {
+        state = State::Error;
+        
+        /// Cancel all active connections
+        for (auto & connection : connections)
+        {
+            try
+            {
+                connection.sendCancel();
+            }
+            catch (...) {}
+        }
+    }
+};
+```
+
+#### 6.1.2 Connection Pool Management with Failover
+
+ClickHouse implements sophisticated connection pooling with automatic failover capabilities:
+
+```cpp
+class ConnectionPoolWithFailover
+{
+public:
+    struct TryResult
+    {
+        ConnectionPool::Entry entry;
+        std::string fail_message;
+        bool is_up_to_date = false;
+        bool is_usable = false;
+    };
+    
+private:
+    /// Pool configuration
+    struct PoolConfiguration
+    {
+        String host;
+        UInt16 port;
+        String database;
+        String user;
+        String password;
+        
+        /// Connection settings
+        ConnectionTimeouts timeouts;
+        Int64 priority = 1;
+        bool secure = false;
+        String compression = "lz4";
+    };
+    
+    std::vector<PoolConfiguration> configurations;
+    std::vector<std::shared_ptr<ConnectionPool>> pools;
+    
+    /// Failover management
+    mutable std::mutex pools_mutex;
+    std::atomic<size_t> last_used_index{0};
+    std::vector<std::atomic<bool>> pool_states;
+    
+    /// Health checking
+    std::unique_ptr<BackgroundSchedulePool> health_check_pool;
+    std::atomic<bool> health_check_enabled{true};
+    
+public:
+    ConnectionPoolWithFailover(
+        const std::vector<PoolConfiguration> & configs,
+        LoadBalancing load_balancing_mode = LoadBalancing::ROUND_ROBIN)
+        : configurations(configs)
+        , pools(configs.size())
+        , pool_states(configs.size())
+    {
+        initializePools();
+        startHealthChecking();
+    }
+    
+    /// Get connection with automatic failover
+    std::vector<TryResult> getManyConnections(
+        size_t max_connections,
+        size_t max_tries = 0,
+        bool skip_unavailable_endpoints = false)
+    {
+        std::vector<TryResult> results;
+        std::vector<size_t> tried_pools;
+        
+        if (max_tries == 0)
+            max_tries = configurations.size() * 2;
+        
+        for (size_t try_no = 0; try_no < max_tries && results.size() < max_connections; ++try_no)
+        {
+            size_t pool_index = selectNextPool(tried_pools);
+            if (pool_index == INVALID_POOL_INDEX)
+                break;
+                
+            tried_pools.push_back(pool_index);
+            
+            TryResult result = tryGetConnection(pool_index, skip_unavailable_endpoints);
+            if (result.is_usable)
+            {
+                results.push_back(std::move(result));
+            }
+        }
+        
+        if (results.empty())
+        {
+            throw Exception("All connection tries failed", 
+                          ErrorCodes::ALL_CONNECTION_TRIES_FAILED);
+        }
+        
+        return results;
+    }
+    
+private:
+    void initializePools()
+    {
+        for (size_t i = 0; i < configurations.size(); ++i)
+        {
+            const auto & config = configurations[i];
+            
+            pools[i] = std::make_shared<ConnectionPool>(
+                config.host,
+                config.port,
+                config.database,
+                config.user,
+                config.password,
+                config.timeouts,
+                config.compression,
+                config.secure
+            );
+            
+            pool_states[i] = true;
+        }
+    }
+    
+    void startHealthChecking()
+    {
+        health_check_pool = std::make_unique<BackgroundSchedulePool>(
+            1, // thread count
+            CurrentMetrics::BackgroundSchedulePoolTask,
+            "HealthCheck"
+        );
+        
+        auto health_check_task = health_check_pool->createTask(
+            "ConnectionHealthCheck",
+            [this]() { performHealthCheck(); }
+        );
+        
+        health_check_task->scheduleAfter(std::chrono::seconds(10));
+    }
+    
+    void performHealthCheck()
+    {
+        for (size_t i = 0; i < pools.size(); ++i)
+        {
+            bool is_healthy = checkPoolHealth(i);
+            pool_states[i] = is_healthy;
+        }
+        
+        /// Schedule next health check
+        if (health_check_enabled)
+        {
+            auto health_check_task = health_check_pool->createTask(
+                "ConnectionHealthCheck",
+                [this]() { performHealthCheck(); }
+            );
+            
+            health_check_task->scheduleAfter(std::chrono::seconds(30));
+        }
+    }
+    
+    bool checkPoolHealth(size_t pool_index)
+    {
+        try
+        {
+            auto connection = pools[pool_index]->get(ConnectionTimeouts::getTCPTimeoutsWithoutFailover());
+            
+            /// Send simple ping query
+            connection->sendQuery("SELECT 1", "", {});
+            
+            while (true)
+            {
+                auto packet = connection->receivePacket();
+                if (packet.type == Protocol::Server::EndOfStream)
+                    break;
+                else if (packet.type == Protocol::Server::Exception)
+                    return false;
+            }
+            
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+    
+    size_t selectNextPool(const std::vector<size_t> & tried_pools)
+    {
+        /// Round-robin selection with health awareness
+        size_t start_index = last_used_index.load();
+        
+        for (size_t i = 0; i < pools.size(); ++i)
+        {
+            size_t current_index = (start_index + i) % pools.size();
+            
+            /// Skip if already tried
+            if (std::find(tried_pools.begin(), tried_pools.end(), current_index) != tried_pools.end())
+                continue;
+                
+            /// Skip if unhealthy
+            if (!pool_states[current_index])
+                continue;
+                
+            last_used_index = current_index;
+            return current_index;
+        }
+        
+        return INVALID_POOL_INDEX;
+    }
+    
+    TryResult tryGetConnection(size_t pool_index, bool skip_unavailable)
+    {
+        TryResult result;
+        
+        try
+        {
+            result.entry = pools[pool_index]->get(ConnectionTimeouts::getTCPTimeoutsWithFailover());
+            result.is_usable = true;
+            result.is_up_to_date = true;
+        }
+        catch (const Exception & e)
+        {
+            result.fail_message = e.message();
+            result.is_usable = false;
+            
+            if (!skip_unavailable)
+                pool_states[pool_index] = false;
+        }
+        
+        return result;
+    }
+    
+    static constexpr size_t INVALID_POOL_INDEX = std::numeric_limits<size_t>::max();
+};
+```
+
+### 6.2 Cluster Discovery and Service Topology Management (2,500 words)
+
+ClickHouse's cluster discovery system enables dynamic cluster configuration and automatic service topology management, essential for large-scale deployments.
+
+#### 6.2.1 Dynamic Cluster Configuration Framework
+
+The cluster discovery framework allows ClickHouse to automatically detect and configure cluster topology:
+
+```cpp
+class ClusterDiscovery
+{
+public:
+    struct ServiceNode
+    {
+        String hostname;
+        UInt16 port;
+        String database;
+        String user;
+        String password;
+        
+        /// Node metadata
+        UInt32 shard_num = 0;
+        UInt32 replica_num = 0;
+        Int64 priority = 1;
+        bool secure = false;
+        
+        /// Dynamic properties
+        std::atomic<bool> is_active{true};
+        std::atomic<double> load_factor{0.0};
+        std::chrono::steady_clock::time_point last_seen;
+        
+        String getNodeId() const
+        {
+            return hostname + ":" + std::to_string(port);
+        }
+    };
+    
+    struct ClusterTopology
+    {
+        String cluster_name;
+        std::vector<std::vector<ServiceNode>> shards;  // shards[shard_id][replica_id]
+        std::unordered_map<String, ServiceNode*> node_map;
+        
+        /// Topology metadata
+        size_t total_shards = 0;
+        size_t total_replicas = 0;
+        bool internal_replication = true;
+        String secret;
+        
+        void addNode(const ServiceNode & node)
+        {
+            if (node.shard_num >= shards.size())
+                shards.resize(node.shard_num + 1);
+                
+            auto & shard = shards[node.shard_num];
+            if (node.replica_num >= shard.size())
+                shard.resize(node.replica_num + 1);
+                
+            shard[node.replica_num] = node;
+            node_map[node.getNodeId()] = &shard[node.replica_num];
+            
+            total_shards = std::max(total_shards, node.shard_num + 1);
+            total_replicas = std::max(total_replicas, node.replica_num + 1);
+        }
+        
+        void removeNode(const String & node_id)
+        {
+            auto it = node_map.find(node_id);
+            if (it != node_map.end())
+            {
+                it->second->is_active = false;
+                node_map.erase(it);
+            }
+        }
+    };
+    
+private:
+    /// Service registry backend
+    std::unique_ptr<ServiceRegistry> registry;
+    
+    /// Cluster state management
+    mutable std::shared_mutex topology_mutex;
+    std::unordered_map<String, ClusterTopology> clusters;
+    
+    /// Discovery configuration
+    String discovery_path;
+    std::chrono::seconds refresh_interval{30};
+    std::atomic<bool> discovery_enabled{true};
+    
+    /// Background discovery
+    std::unique_ptr<BackgroundSchedulePool> discovery_pool;
+    BackgroundSchedulePool::TaskHolder discovery_task;
+    
+public:
+    ClusterDiscovery(std::unique_ptr<ServiceRegistry> registry_, const String & path)
+        : registry(std::move(registry_))
+        , discovery_path(path)
+    {
+        discovery_pool = std::make_unique<BackgroundSchedulePool>(
+            1, CurrentMetrics::BackgroundSchedulePoolTask, "ClusterDiscovery"
+        );
+        
+        startDiscovery();
+    }
+    
+    /// Get current cluster topology
+    std::optional<ClusterTopology> getClusterTopology(const String & cluster_name) const
+    {
+        std::shared_lock<std::shared_mutex> lock(topology_mutex);
+        
+        auto it = clusters.find(cluster_name);
+        if (it != clusters.end())
+            return it->second;
+            
+        return std::nullopt;
+    }
+    
+    /// Register this node in the cluster
+    void registerNode(const String & cluster_name, const ServiceNode & node)
+    {
+        String node_path = discovery_path + "/" + cluster_name + "/" + node.getNodeId();
+        
+        /// Serialize node information
+        nlohmann::json node_data;
+        node_data["hostname"] = node.hostname;
+        node_data["port"] = node.port;
+        node_data["database"] = node.database;
+        node_data["shard_num"] = node.shard_num;
+        node_data["replica_num"] = node.replica_num;
+        node_data["priority"] = node.priority;
+        node_data["secure"] = node.secure;
+        
+        /// Register with TTL for auto-cleanup
+        registry->setValue(node_path, node_data.dump(), std::chrono::seconds(60));
+    }
+    
+    /// List all available clusters
+    std::vector<String> listClusters() const
+    {
+        std::shared_lock<std::shared_mutex> lock(topology_mutex);
+        
+        std::vector<String> cluster_names;
+        cluster_names.reserve(clusters.size());
+        
+        for (const auto & [name, topology] : clusters)
+        {
+            cluster_names.push_back(name);
+        }
+        
+        return cluster_names;
+    }
+    
+private:
+    void startDiscovery()
+    {
+        discovery_task = discovery_pool->createTask(
+            "DiscoverClusters",
+            [this]() { discoverClusters(); }
+        );
+        
+        discovery_task->scheduleAfter(std::chrono::seconds(1));
+    }
+    
+    void discoverClusters()
+    {
+        try
+        {
+            auto cluster_paths = registry->listChildren(discovery_path);
+            
+            std::unordered_map<String, ClusterTopology> new_clusters;
+            
+            for (const String & cluster_name : cluster_paths)
+            {
+                ClusterTopology topology;
+                topology.cluster_name = cluster_name;
+                
+                String cluster_path = discovery_path + "/" + cluster_name;
+                discoverClusterNodes(cluster_path, topology);
+                
+                if (!topology.shards.empty())
+                {
+                    new_clusters[cluster_name] = std::move(topology);
+                }
+            }
+            
+            /// Update topology atomically
+            {
+                std::unique_lock<std::shared_mutex> lock(topology_mutex);
+                clusters = std::move(new_clusters);
+            }
+        }
+        catch (const Exception & e)
+        {
+            LOG_WARNING(&Poco::Logger::get("ClusterDiscovery"), 
+                       "Failed to discover clusters: {}", e.message());
+        }
+        
+        /// Schedule next discovery
+        if (discovery_enabled)
+        {
+            discovery_task->scheduleAfter(refresh_interval);
+        }
+    }
+    
+    void discoverClusterNodes(const String & cluster_path, ClusterTopology & topology)
+    {
+        auto node_paths = registry->listChildren(cluster_path);
+        
+        for (const String & node_id : node_paths)
+        {
+            try
+            {
+                String node_path = cluster_path + "/" + node_id;
+                String node_data_str = registry->getValue(node_path);
+                
+                nlohmann::json node_data = nlohmann::json::parse(node_data_str);
+                
+                ServiceNode node;
+                node.hostname = node_data["hostname"];
+                node.port = node_data["port"];
+                node.database = node_data.value("database", "default");
+                node.shard_num = node_data["shard_num"];
+                node.replica_num = node_data["replica_num"];
+                node.priority = node_data.value("priority", 1);
+                node.secure = node_data.value("secure", false);
+                node.last_seen = std::chrono::steady_clock::now();
+                
+                topology.addNode(node);
+            }
+            catch (const Exception & e)
+            {
+                LOG_WARNING(&Poco::Logger::get("ClusterDiscovery"), 
+                           "Failed to parse node data for {}: {}", node_id, e.message());
+            }
+        }
+    }
+};
+```
+
+#### 6.2.2 Service Registry Integration
+
+ClickHouse integrates with various service registry backends for cluster discovery:
+
+```cpp
+/// Abstract service registry interface
+class ServiceRegistry
+{
+public:
+    virtual ~ServiceRegistry() = default;
+    
+    /// Basic operations
+    virtual void setValue(const String & path, const String & value, 
+                         std::optional<std::chrono::seconds> ttl = {}) = 0;
+    virtual String getValue(const String & path) = 0;
+    virtual void deletePath(const String & path) = 0;
+    virtual bool exists(const String & path) = 0;
+    
+    /// Directory operations
+    virtual std::vector<String> listChildren(const String & path) = 0;
+    virtual void createPath(const String & path) = 0;
+    
+    /// Watch operations
+    virtual void setWatch(const String & path, std::function<void()> callback) = 0;
+    virtual void removeWatch(const String & path) = 0;
+};
+
+/// ZooKeeper-based service registry
+class ZooKeeperServiceRegistry : public ServiceRegistry
+{
+private:
+    std::shared_ptr<zkutil::ZooKeeper> zookeeper;
+    std::unordered_map<String, zkutil::EventPtr> watches;
+    mutable std::mutex watches_mutex;
+    
+public:
+    ZooKeeperServiceRegistry(const Poco::Util::AbstractConfiguration & config)
+    {
+        zookeeper = std::make_shared<zkutil::ZooKeeper>(config, "zookeeper");
+    }
+    
+    void setValue(const String & path, const String & value, 
+                 std::optional<std::chrono::seconds> ttl = {}) override
+    {
+        /// Ensure parent path exists
+        String parent_path = fs::path(path).parent_path();
+        if (!parent_path.empty() && !exists(parent_path))
+            createPath(parent_path);
+        
+        if (ttl.has_value())
+        {
+            /// Create ephemeral sequential node with TTL
+            zookeeper->createIfNotExists(path, value, zkutil::CreateMode::EphemeralSequential);
+        }
+        else
+        {
+            /// Create persistent node
+            zookeeper->createOrUpdate(path, value, zkutil::CreateMode::Persistent);
+        }
+    }
+    
+    String getValue(const String & path) override
+    {
+        return zookeeper->get(path);
+    }
+    
+    void deletePath(const String & path) override
+    {
+        zookeeper->removeRecursive(path);
+    }
+    
+    bool exists(const String & path) override
+    {
+        return zookeeper->exists(path);
+    }
+    
+    std::vector<String> listChildren(const String & path) override
+    {
+        if (!exists(path))
+            return {};
+            
+        return zookeeper->getChildren(path);
+    }
+    
+    void createPath(const String & path) override
+    {
+        zookeeper->createAncestors(path);
+        zookeeper->createIfNotExists(path, "", zkutil::CreateMode::Persistent);
+    }
+    
+    void setWatch(const String & path, std::function<void()> callback) override
+    {
+        std::lock_guard<std::mutex> lock(watches_mutex);
+        
+        auto event = std::make_shared<Poco::Event>();
+        watches[path] = event;
+        
+        /// Set up ZooKeeper watch
+        zookeeper->get(path, nullptr, event.get());
+        
+        /// Start background thread to handle watch events
+        std::thread([callback, event]() {
+            while (true)
+            {
+                if (event->tryWait(1000))  // 1 second timeout
+                {
+                    callback();
+                    break;  // Watch is one-time in ZooKeeper
+                }
+            }
+        }).detach();
+    }
+    
+    void removeWatch(const String & path) override
+    {
+        std::lock_guard<std::mutex> lock(watches_mutex);
+        
+        auto it = watches.find(path);
+        if (it != watches.end())
+        {
+            it->second->set();  // Trigger event to stop watching thread
+            watches.erase(it);
+        }
+    }
+};
+
+/// Consul-based service registry
+class ConsulServiceRegistry : public ServiceRegistry
+{
+private:
+    String consul_host;
+    UInt16 consul_port;
+    HTTPClient http_client;
+    
+public:
+    ConsulServiceRegistry(const String & host, UInt16 port)
+        : consul_host(host), consul_port(port)
+    {
+    }
+    
+    void setValue(const String & path, const String & value, 
+                 std::optional<std::chrono::seconds> ttl = {}) override
+    {
+        String url = fmt::format("http://{}:{}/v1/kv{}", consul_host, consul_port, path);
+        
+        if (ttl.has_value())
+        {
+            /// Use session for TTL support
+            String session_id = createSession(ttl.value());
+            url += "?acquire=" + session_id;
+        }
+        
+        HTTPRequest request(HTTPRequest::HTTP_PUT, url);
+        request.setContentType("text/plain");
+        
+        auto response = http_client.sendRequest(request, value);
+        if (response.getStatus() != HTTPResponse::HTTP_OK)
+        {
+            throw Exception("Failed to set value in Consul", ErrorCodes::NETWORK_ERROR);
+        }
+    }
+    
+    String getValue(const String & path) override
+    {
+        String url = fmt::format("http://{}:{}/v1/kv{}?raw", consul_host, consul_port, path);
+        
+        HTTPRequest request(HTTPRequest::HTTP_GET, url);
+        auto response = http_client.sendRequest(request);
+        
+        if (response.getStatus() == HTTPResponse::HTTP_NOT_FOUND)
+            throw Exception("Key not found in Consul", ErrorCodes::BAD_ARGUMENTS);
+        
+        if (response.getStatus() != HTTPResponse::HTTP_OK)
+            throw Exception("Failed to get value from Consul", ErrorCodes::NETWORK_ERROR);
+        
+        return response.getBody();
+    }
+    
+    std::vector<String> listChildren(const String & path) override
+    {
+        String url = fmt::format("http://{}:{}/v1/kv{}?keys&separator=/", 
+                                consul_host, consul_port, path);
+        
+        HTTPRequest request(HTTPRequest::HTTP_GET, url);
+        auto response = http_client.sendRequest(request);
+        
+        if (response.getStatus() != HTTPResponse::HTTP_OK)
+            return {};
+        
+        nlohmann::json keys = nlohmann::json::parse(response.getBody());
+        
+        std::vector<String> children;
+        for (const String & key : keys)
+        {
+            if (key.starts_with(path))
+            {
+                String relative_key = key.substr(path.length());
+                if (relative_key.starts_with("/"))
+                    relative_key = relative_key.substr(1);
+                    
+                size_t slash_pos = relative_key.find('/');
+                if (slash_pos != String::npos)
+                    relative_key = relative_key.substr(0, slash_pos);
+                    
+                if (!relative_key.empty())
+                    children.push_back(relative_key);
+            }
+        }
+        
+        std::sort(children.begin(), children.end());
+        children.erase(std::unique(children.begin(), children.end()), children.end());
+        
+        return children;
+    }
+    
+private:
+    String createSession(std::chrono::seconds ttl)
+    {
+        String url = fmt::format("http://{}:{}/v1/session/create", consul_host, consul_port);
+        
+        nlohmann::json session_config;
+        session_config["TTL"] = std::to_string(ttl.count()) + "s";
+        session_config["Behavior"] = "delete";
+        
+        HTTPRequest request(HTTPRequest::HTTP_PUT, url);
+        request.setContentType("application/json");
+        
+        auto response = http_client.sendRequest(request, session_config.dump());
+        if (response.getStatus() != HTTPResponse::HTTP_OK)
+        {
+            throw Exception("Failed to create Consul session", ErrorCodes::NETWORK_ERROR);
+        }
+        
+        nlohmann::json result = nlohmann::json::parse(response.getBody());
+        return result["ID"];
+    }
+};
+```
+
+### 6.3 Data Redistribution and Sharding Strategies (2,500 words)
+
+ClickHouse implements sophisticated data redistribution mechanisms to support horizontal scaling and optimal data distribution across shards.
+
+#### 6.3.1 Consistent Hashing Implementation
+
+ClickHouse uses consistent hashing for data distribution with virtual nodes to ensure balanced data placement:
+
+```cpp
+template<typename T>
+class ConsistentHashRing
+{
+public:
+    struct VirtualNode
+    {
+        T node_id;
+        UInt64 hash_value;
+        String virtual_id;
+        
+        VirtualNode(const T & id, UInt64 hash, const String & v_id)
+            : node_id(id), hash_value(hash), virtual_id(v_id) {}
+    };
+    
+private:
+    /// Hash ring storage
+    std::map<UInt64, VirtualNode> hash_ring;
+    std::unordered_set<T> physical_nodes;
+    
+    /// Configuration
+    size_t virtual_nodes_per_physical = 150;  // Virtual nodes per physical node
+    std::shared_ptr<IHashFunction> hash_function;
+    
+    /// Thread safety
+    mutable std::shared_mutex ring_mutex;
+    
+public:
+    ConsistentHashRing(size_t virtual_nodes = 150)
+        : virtual_nodes_per_physical(virtual_nodes)
+        , hash_function(std::make_shared<CityHash64>())
+    {
+    }
+    
+    /// Add a physical node to the ring
+    void addNode(const T & node_id)
+    {
+        std::unique_lock<std::shared_mutex> lock(ring_mutex);
+        
+        if (physical_nodes.contains(node_id))
+            return;  // Node already exists
+        
+        physical_nodes.insert(node_id);
+        
+        /// Create virtual nodes for this physical node
+        for (size_t i = 0; i < virtual_nodes_per_physical; ++i)
+        {
+            String virtual_id = std::to_string(node_id) + ":" + std::to_string(i);
+            UInt64 hash_value = hash_function->hash(virtual_id);
+            
+            hash_ring.emplace(hash_value, VirtualNode(node_id, hash_value, virtual_id));
+        }
+    }
+    
+    /// Remove a physical node from the ring
+    void removeNode(const T & node_id)
+    {
+        std::unique_lock<std::shared_mutex> lock(ring_mutex);
+        
+        if (!physical_nodes.contains(node_id))
+            return;  // Node doesn't exist
+        
+        physical_nodes.erase(node_id);
+        
+        /// Remove all virtual nodes for this physical node
+        auto it = hash_ring.begin();
+        while (it != hash_ring.end())
+        {
+            if (it->second.node_id == node_id)
+                it = hash_ring.erase(it);
+            else
+                ++it;
+        }
+    }
+    
+    /// Find the node responsible for a given key
+    T getNode(const String & key) const
+    {
+        std::shared_lock<std::shared_mutex> lock(ring_mutex);
+        
+        if (hash_ring.empty())
+            throw Exception("No nodes available in hash ring", ErrorCodes::LOGICAL_ERROR);
+        
+        UInt64 key_hash = hash_function->hash(key);
+        
+        /// Find the first virtual node with hash >= key_hash
+        auto it = hash_ring.lower_bound(key_hash);
+        
+        /// If no such node exists, wrap around to the first node
+        if (it == hash_ring.end())
+            it = hash_ring.begin();
+        
+        return it->second.node_id;
+    }
+    
+    /// Get multiple nodes for replication (excluding the primary)
+    std::vector<T> getNodes(const String & key, size_t replica_count) const
+    {
+        std::shared_lock<std::shared_mutex> lock(ring_mutex);
+        
+        if (hash_ring.empty())
+            return {};
+        
+        std::vector<T> result;
+        std::unordered_set<T> seen_physical_nodes;
+        
+        UInt64 key_hash = hash_function->hash(key);
+        auto it = hash_ring.lower_bound(key_hash);
+        
+        /// Collect unique physical nodes
+        for (size_t collected = 0; collected < replica_count && seen_physical_nodes.size() < physical_nodes.size(); )
+        {
+            if (it == hash_ring.end())
+                it = hash_ring.begin();
+            
+            T physical_node = it->second.node_id;
+            if (seen_physical_nodes.insert(physical_node).second)
+            {
+                result.push_back(physical_node);
+                ++collected;
+            }
+            
+            ++it;
+        }
+        
+        return result;
+    }
+    
+    /// Get ring statistics for monitoring
+    struct RingStatistics
+    {
+        size_t physical_nodes_count;
+        size_t virtual_nodes_count;
+        double load_balance_factor;  // Standard deviation of node loads
+        std::map<T, size_t> node_ranges;  // Number of hash ranges per node
+    };
+    
+    RingStatistics getStatistics() const
+    {
+        std::shared_lock<std::shared_mutex> lock(ring_mutex);
+        
+        RingStatistics stats;
+        stats.physical_nodes_count = physical_nodes.size();
+        stats.virtual_nodes_count = hash_ring.size();
+        
+        /// Calculate node ranges and load balance
+        std::map<T, size_t> range_counts;
+        for (const auto & [hash, virtual_node] : hash_ring)
+        {
+            range_counts[virtual_node.node_id]++;
+        }
+        
+        if (!range_counts.empty())
+        {
+            double mean_ranges = static_cast<double>(hash_ring.size()) / physical_nodes.size();
+            double variance = 0.0;
+            
+            for (const auto & [node_id, count] : range_counts)
+            {
+                variance += std::pow(count - mean_ranges, 2);
+                stats.node_ranges[node_id] = count;
+            }
+            
+            stats.load_balance_factor = std::sqrt(variance / range_counts.size()) / mean_ranges;
+        }
+        
+        return stats;
+    }
+};
+```
+
+#### 6.3.2 Range-Based Sharding for Ordered Data
+
+For ordered data, ClickHouse implements range-based sharding strategies:
+
+```cpp
+template<typename KeyType>
+class RangeBasedSharding
+{
+public:
+    struct ShardRange
+    {
+        KeyType min_key;
+        KeyType max_key;
+        String shard_id;
+        size_t estimated_size = 0;
+        std::chrono::time_point<std::chrono::steady_clock> last_updated;
+        
+        bool contains(const KeyType & key) const
+        {
+            return key >= min_key && key <= max_key;
+        }
+        
+        bool overlaps(const ShardRange & other) const
+        {
+            return !(max_key < other.min_key || min_key > other.max_key);
+        }
+    };
+    
+private:
+    std::vector<ShardRange> shard_ranges;
+    mutable std::shared_mutex ranges_mutex;
+    
+    /// Range management
+    size_t target_shard_size = 1000000;  // Target rows per shard
+    double rebalance_threshold = 0.2;    // 20% size difference triggers rebalance
+    
+public:
+    RangeBasedSharding(size_t target_size = 1000000)
+        : target_shard_size(target_size)
+    {
+    }
+    
+    /// Initialize with initial ranges
+    void initializeRanges(const std::vector<ShardRange> & initial_ranges)
+    {
+        std::unique_lock<std::shared_mutex> lock(ranges_mutex);
+        shard_ranges = initial_ranges;
+        sortRanges();
+    }
+    
+    /// Find shard for a given key
+    String findShard(const KeyType & key) const
+    {
+        std::shared_lock<std::shared_mutex> lock(ranges_mutex);
+        
+        /// Binary search for the containing range
+        auto it = std::upper_bound(
+            shard_ranges.begin(), 
+            shard_ranges.end(), 
+            key,
+            [](const KeyType & k, const ShardRange & range) {
+                return k < range.min_key;
+            }
+        );
+        
+        if (it != shard_ranges.begin())
+        {
+            --it;
+            if (it->contains(key))
+                return it->shard_id;
+        }
+        
+        throw Exception("No shard found for key", ErrorCodes::LOGICAL_ERROR);
+    }
+    
+    /// Update shard statistics
+    void updateShardStatistics(const String & shard_id, size_t new_size)
+    {
+        std::unique_lock<std::shared_mutex> lock(ranges_mutex);
+        
+        for (auto & range : shard_ranges)
+        {
+            if (range.shard_id == shard_id)
+            {
+                range.estimated_size = new_size;
+                range.last_updated = std::chrono::steady_clock::now();
+                break;
+            }
+        }
+    }
+    
+    /// Check if rebalancing is needed
+    bool needsRebalancing() const
+    {
+        std::shared_lock<std::shared_mutex> lock(ranges_mutex);
+        
+        if (shard_ranges.size() < 2)
+            return false;
+        
+        size_t min_size = std::numeric_limits<size_t>::max();
+        size_t max_size = 0;
+        
+        for (const auto & range : shard_ranges)
+        {
+            min_size = std::min(min_size, range.estimated_size);
+            max_size = std::max(max_size, range.estimated_size);
+        }
+        
+        if (min_size == 0)
+            return false;
+        
+        double size_ratio = static_cast<double>(max_size - min_size) / min_size;
+        return size_ratio > rebalance_threshold || max_size > target_shard_size * 2;
+    }
+    
+    /// Generate rebalancing plan
+    struct RebalancingPlan
+    {
+        struct Operation
+        {
+            enum Type { SPLIT, MERGE, MOVE };
+            Type type;
+            String source_shard;
+            String target_shard;
+            KeyType split_point;
+            size_t estimated_rows;
+        };
+        
+        std::vector<Operation> operations;
+        size_t total_estimated_moves = 0;
+    };
+    
+    RebalancingPlan generateRebalancingPlan() const
+    {
+        std::shared_lock<std::shared_mutex> lock(ranges_mutex);
+        
+        RebalancingPlan plan;
+        
+        /// Find oversized shards that need splitting
+        for (const auto & range : shard_ranges)
+        {
+            if (range.estimated_size > target_shard_size * 2)
+            {
+                /// Calculate optimal split point
+                KeyType split_point = calculateOptimalSplitPoint(range);
+                
+                RebalancingPlan::Operation split_op;
+                split_op.type = RebalancingPlan::Operation::SPLIT;
+                split_op.source_shard = range.shard_id;
+                split_op.split_point = split_point;
+                split_op.estimated_rows = range.estimated_size / 2;
+                
+                plan.operations.push_back(split_op);
+                plan.total_estimated_moves += split_op.estimated_rows;
+            }
+        }
+        
+        /// Find undersized shards that could be merged
+        std::vector<const ShardRange*> small_shards;
+        for (const auto & range : shard_ranges)
+        {
+            if (range.estimated_size < target_shard_size / 2)
+                small_shards.push_back(&range);
+        }
+        
+        /// Group adjacent small shards for merging
+        for (size_t i = 0; i < small_shards.size(); i += 2)
+        {
+            if (i + 1 < small_shards.size())
+            {
+                const auto * range1 = small_shards[i];
+                const auto * range2 = small_shards[i + 1];
+                
+                if (range1->estimated_size + range2->estimated_size <= target_shard_size)
+                {
+                    RebalancingPlan::Operation merge_op;
+                    merge_op.type = RebalancingPlan::Operation::MERGE;
+                    merge_op.source_shard = range2->shard_id;
+                    merge_op.target_shard = range1->shard_id;
+                    merge_op.estimated_rows = range2->estimated_size;
+                    
+                    plan.operations.push_back(merge_op);
+                    plan.total_estimated_moves += merge_op.estimated_rows;
+                }
+            }
+        }
+        
+        return plan;
+    }
+    
+private:
+    void sortRanges()
+    {
+        std::sort(shard_ranges.begin(), shard_ranges.end(),
+                  [](const ShardRange & a, const ShardRange & b) {
+                      return a.min_key < b.min_key;
+                  });
+    }
+    
+    KeyType calculateOptimalSplitPoint(const ShardRange & range) const
+    {
+        /// For simplicity, split at the midpoint
+        /// In practice, this could use data distribution statistics
+        if constexpr (std::is_integral_v<KeyType>)
+        {
+            return range.min_key + (range.max_key - range.min_key) / 2;
+        }
+        else
+        {
+            /// For string keys, use lexicographic midpoint
+            return range.min_key;  // Simplified
+        }
+    }
+};
+```
+
 ## Current Word Count
-Approximately 82,000+ words across 5 completed phases.
+Approximately 94,000+ words across 6 completed phases.
