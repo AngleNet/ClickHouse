@@ -16611,5 +16611,1285 @@ Phase 6 has provided a comprehensive exploration of ClickHouse's distributed que
 
 These components work together to create a robust distributed system that can scale horizontally while maintaining data consistency, performance, and availability even in the face of network partitions, node failures, and other distributed system challenges.
 
+## Phase 7: Threading and Concurrency (14,000 words)
+
+ClickHouse's threading and concurrency architecture represents one of the most sophisticated aspects of the system, enabling massive parallel processing while maintaining data consistency and optimal resource utilization. This phase explores the intricate threading model, task scheduling mechanisms, lock contention resolution, and the advanced concurrency control systems that make ClickHouse capable of handling thousands of concurrent queries with exceptional performance.
+
+### 7.1 Thread Pool Architecture and Task Scheduling (3,500 words)
+
+ClickHouse employs a sophisticated multi-level thread pool architecture that efficiently manages computational resources across different types of workloads. The system distinguishes between global thread pools for general computation and specialized thread pools for specific operations.
+
+#### 7.1.1 Global Thread Pool Design and Implementation
+
+The Global Thread Pool serves as the primary execution engine for query processing tasks:
+
+```cpp
+class GlobalThreadPool
+{
+public:
+    struct ThreadMetrics
+    {
+        std::atomic<size_t> jobs_processed{0};
+        std::atomic<size_t> lock_wait_microseconds{0};
+        std::atomic<size_t> job_wait_time_microseconds{0};
+        std::atomic<size_t> thread_creation_microseconds{0};
+        std::atomic<size_t> expansions{0};
+        std::atomic<size_t> shrinks{0};
+    };
+
+private:
+    mutable std::shared_mutex pool_mutex;
+    std::vector<std::unique_ptr<std::thread>> threads TSA_GUARDED_BY(pool_mutex);
+    std::queue<TaskPtr> task_queue TSA_GUARDED_BY(pool_mutex);
+    std::condition_variable_any task_available;
+    
+    std::atomic<size_t> active_threads{0};
+    std::atomic<size_t> scheduled_tasks{0};
+    
+    const size_t max_pool_size;
+    const size_t max_free_threads;
+    
+    ThreadMetrics metrics;
+
+public:
+    template<typename Func>
+    void scheduleOrThrowOnError(Func && func, Priority priority = Priority::NORMAL)
+    {
+        auto task = std::make_shared<Task>(std::forward<Func>(func), priority);
+        
+        ProfileEvents::increment(ProfileEvents::GlobalThreadPoolJobs);
+        Stopwatch lock_watch;
+        
+        {
+            std::unique_lock lock(pool_mutex);
+            ProfileEvents::increment(ProfileEvents::GlobalThreadPoolLockWaitMicroseconds, 
+                                   lock_watch.elapsedMicroseconds());
+            
+            if (shouldExpandPool())
+            {
+                expandPool();
+            }
+            
+            task_queue.push(task);
+            ++scheduled_tasks;
+        }
+        
+        task_available.notify_one();
+    }
+    
+private:
+    bool shouldExpandPool() const TSA_REQUIRES(pool_mutex)
+    {
+        return threads.size() < max_pool_size && 
+               active_threads.load() >= threads.size() * 0.8;
+    }
+    
+    void expandPool() TSA_REQUIRES(pool_mutex)
+    {
+        ProfileEvents::increment(ProfileEvents::GlobalThreadPoolExpansions);
+        Stopwatch creation_watch;
+        
+        auto thread = std::make_unique<std::thread>(&GlobalThreadPool::workerLoop, this);
+        threads.push_back(std::move(thread));
+        
+        ProfileEvents::increment(ProfileEvents::GlobalThreadPoolThreadCreationMicroseconds,
+                               creation_watch.elapsedMicroseconds());
+    }
+    
+    void workerLoop()
+    {
+        while (true)
+        {
+            TaskPtr task;
+            
+            {
+                std::unique_lock lock(pool_mutex);
+                task_available.wait(lock, [this] { 
+                    return !task_queue.empty() || should_terminate; 
+                });
+                
+                if (should_terminate && task_queue.empty())
+                    break;
+                
+                task = task_queue.front();
+                task_queue.pop();
+                --scheduled_tasks;
+                ++active_threads;
+            }
+            
+            Stopwatch execution_watch;
+            try 
+            {
+                task->execute();
+            }
+            catch (...)
+            {
+                // Error handling and logging
+            }
+            
+            ProfileEvents::increment(ProfileEvents::GlobalThreadPoolBusyMicroseconds,
+                                   execution_watch.elapsedMicroseconds());
+            --active_threads;
+        }
+    }
+};
+```
+
+#### 7.1.2 Local Thread Pool Specialization
+
+Local thread pools provide fine-grained control for specific query contexts:
+
+```cpp
+class LocalThreadPool
+{
+    struct PoolSettings
+    {
+        size_t max_threads = 64;
+        size_t max_thread_pool_free_size = 8;
+        Priority default_priority = Priority::NORMAL;
+        std::chrono::milliseconds idle_timeout{30000};
+    };
+    
+    class ThreadContext
+    {
+        std::thread::id thread_id;
+        QueryID query_id;
+        Priority current_priority;
+        std::atomic<bool> is_processing{false};
+        
+    public:
+        void setContext(const QueryID& id, Priority priority)
+        {
+            query_id = id;
+            current_priority = priority;
+        }
+    };
+    
+private:
+    PoolSettings settings;
+    std::vector<ThreadContext> thread_contexts TSA_GUARDED_BY(mutex);
+    PriorityQueue<TaskPtr> priority_queue TSA_GUARDED_BY(mutex);
+    
+public:
+    void scheduleWithPriority(TaskPtr task, Priority priority)
+    {
+        Stopwatch wait_watch;
+        
+        {
+            std::lock_guard lock(mutex);
+            task->setWaitStartTime(std::chrono::steady_clock::now());
+            priority_queue.push(task, priority);
+            
+            ProfileEvents::increment(ProfileEvents::LocalThreadPoolJobs);
+        }
+        
+        condition.notify_one();
+    }
+    
+private:
+    void processWithMetrics(TaskPtr task)
+    {
+        auto wait_time = std::chrono::steady_clock::now() - task->getWaitStartTime();
+        ProfileEvents::increment(ProfileEvents::LocalThreadPoolJobWaitTimeMicroseconds,
+            std::chrono::duration_cast<std::chrono::microseconds>(wait_time).count());
+        
+        Stopwatch execution_watch;
+        task->execute();
+        
+        ProfileEvents::increment(ProfileEvents::LocalThreadPoolBusyMicroseconds,
+                               execution_watch.elapsedMicroseconds());
+    }
+};
+```
+
+#### 7.1.3 Background Task Scheduling with SchedulePool
+
+The SchedulePool replaces the legacy BackgroundProcessingPool with a more efficient task scheduling system:
+
+```cpp
+class BackgroundSchedulePool
+{
+public:
+    class Task
+    {
+        std::function<void()> task_function;
+        std::atomic<bool> scheduled{false};
+        std::atomic<bool> executing{false};
+        std::chrono::milliseconds period;
+        std::chrono::steady_clock::time_point next_execution_time;
+        
+    public:
+        void schedule() 
+        {
+            if (scheduled.exchange(true))
+                return;
+                
+            next_execution_time = std::chrono::steady_clock::now() + period;
+            pool->scheduleTask(shared_from_this());
+        }
+        
+        void reschedule() 
+        {
+            scheduled = false;
+            schedule();
+        }
+        
+        void execute()
+        {
+            if (executing.exchange(true))
+                return;
+                
+            try 
+            {
+                task_function();
+            }
+            catch (...)
+            {
+                // Handle exceptions
+            }
+            
+            executing = false;
+            scheduled = false;
+        }
+    };
+    
+private:
+    ThreadPool thread_pool;
+    std::priority_queue<TaskPtr, std::vector<TaskPtr>, TaskComparator> delayed_tasks;
+    std::mutex delayed_tasks_mutex;
+    std::condition_variable delayed_task_notification;
+    std::atomic<bool> shutdown{false};
+    
+    void delayedTaskLoop()
+    {
+        while (!shutdown)
+        {
+            TaskPtr task_to_execute;
+            
+            {
+                std::unique_lock lock(delayed_tasks_mutex);
+                delayed_task_notification.wait(lock, [this] {
+                    return shutdown || (!delayed_tasks.empty() && 
+                           delayed_tasks.top()->shouldExecuteNow());
+                });
+                
+                if (shutdown)
+                    break;
+                    
+                if (!delayed_tasks.empty() && delayed_tasks.top()->shouldExecuteNow())
+                {
+                    task_to_execute = delayed_tasks.top();
+                    delayed_tasks.pop();
+                }
+            }
+            
+            if (task_to_execute)
+            {
+                thread_pool.scheduleOrThrowOnError([task_to_execute] {
+                    task_to_execute->execute();
+                });
+            }
+        }
+    }
+    
+public:
+    TaskHolder createTask(const std::string & log_name, TaskFunc && task_func)
+    {
+        return std::make_shared<Task>(log_name, std::move(task_func), *this);
+    }
+    
+    void scheduleTask(TaskPtr task)
+    {
+        {
+            std::lock_guard lock(delayed_tasks_mutex);
+            delayed_tasks.push(task);
+        }
+        delayed_task_notification.notify_one();
+    }
+};
+```
+
+### 7.2 Context Lock Redesign and Contention Resolution (3,500 words)
+
+One of the most significant threading improvements in ClickHouse involved resolving Context lock contention, which was causing severe performance bottlenecks under high concurrency loads.
+
+#### 7.2.1 Original Context Lock Architecture Problems
+
+The original design used a single global mutex for both ContextSharedPart and Context objects:
+
+```cpp
+// BEFORE: Problematic single-mutex design
+struct ContextSharedPart
+{
+    mutable std::mutex global_context_mutex;  // Single point of contention!
+    
+    // All shared resources protected by the same mutex
+    String path TSA_GUARDED_BY(global_context_mutex);
+    ConfigurationPtr config TSA_GUARDED_BY(global_context_mutex);
+    std::shared_ptr<Clusters> clusters TSA_GUARDED_BY(global_context_mutex);
+    // ... hundreds of other fields
+};
+
+class Context 
+{
+private:
+    std::shared_ptr<ContextSharedPart> shared;
+    
+    // Local context data also required global mutex!
+    Settings settings;  // Access required global_context_mutex
+    String current_database; // Access required global_context_mutex
+    
+public:
+    Settings getSettings() const
+    {
+        std::lock_guard lock(shared->global_context_mutex);  // Contention!
+        return settings;
+    }
+    
+    String getCurrentDatabase() const  
+    {
+        std::lock_guard lock(shared->global_context_mutex);  // More contention!
+        return current_database;
+    }
+};
+```
+
+This design caused:
+- High lock contention during concurrent query processing
+- Context creation becoming a major bottleneck
+- Thread pool delays due to Context lock waits
+- CPU underutilization despite high system load
+
+#### 7.2.2 Redesigned Lock Architecture with Reader-Writer Separation
+
+The solution implemented separate read-write mutexes for shared and local context data:
+
+```cpp
+// AFTER: Improved reader-writer lock design
+template <typename Derived, typename MutexType = SharedMutex>
+class TSA_CAPABILITY("SharedMutexHelper") SharedMutexHelper
+{
+    auto & getDerived() { return static_cast<Derived &>(*this); }
+
+public:
+    // Exclusive ownership
+    void lock() TSA_ACQUIRE() { getDerived().lockImpl(); }
+    bool try_lock() TSA_TRY_ACQUIRE(true) { return getDerived().tryLockImpl(); }
+    void unlock() TSA_RELEASE() { getDerived().unlockImpl(); }
+
+    // Shared ownership for concurrent reads
+    void lock_shared() TSA_ACQUIRE_SHARED() { getDerived().lockSharedImpl(); }
+    bool try_lock_shared() TSA_TRY_ACQUIRE_SHARED(true) { return getDerived().tryLockSharedImpl(); }
+    void unlock_shared() TSA_RELEASE_SHARED() { getDerived().unlockSharedImpl(); }
+
+protected:
+    void lockImpl() TSA_NO_THREAD_SAFETY_ANALYSIS { mutex.lock(); }
+    void unlockImpl() TSA_NO_THREAD_SAFETY_ANALYSIS { mutex.unlock(); }
+    void lockSharedImpl() TSA_NO_THREAD_SAFETY_ANALYSIS { mutex.lock_shared(); }
+    void unlockSharedImpl() TSA_NO_THREAD_SAFETY_ANALYSIS { mutex.unlock_shared(); }
+
+    MutexType mutex;
+};
+
+class ContextSharedMutex : public SharedMutexHelper<ContextSharedMutex>
+{
+private:
+    using Base = SharedMutexHelper<ContextSharedMutex, SharedMutex>;
+    friend class SharedMutexHelper<ContextSharedMutex, SharedMutex>;
+
+    void lockImpl()
+    {
+        ProfileEvents::increment(ProfileEvents::ContextLock);
+        CurrentMetrics::Increment increment{CurrentMetrics::ContextLockWait};
+        Stopwatch watch;
+        Base::lockImpl();
+        ProfileEvents::increment(ProfileEvents::ContextLockWaitMicroseconds,
+            watch.elapsedMicroseconds());
+    }
+
+    void lockSharedImpl()
+    {
+        ProfileEvents::increment(ProfileEvents::ContextLock);
+        CurrentMetrics::Increment increment{CurrentMetrics::ContextLockWait};
+        Stopwatch watch;
+        Base::lockSharedImpl();
+        ProfileEvents::increment(ProfileEvents::ContextLockWaitMicroseconds,
+            watch.elapsedMicroseconds());
+    }
+};
+
+// Separate mutexes for shared and local context data
+struct ContextSharedPart : boost::noncopyable
+{
+    mutable ContextSharedMutex mutex;  // For shared objects only
+
+    String path TSA_GUARDED_BY(mutex);
+    String flags_path TSA_GUARDED_BY(mutex);
+    ConfigurationPtr config TSA_GUARDED_BY(mutex);
+    std::shared_ptr<Clusters> clusters TSA_GUARDED_BY(mutex);
+};
+
+class Context
+{
+private:
+    std::shared_ptr<ContextSharedPart> shared;
+    mutable ContextSharedMutex mutex;  // Separate mutex for local data
+
+    Settings settings TSA_GUARDED_BY(mutex);
+    String current_database TSA_GUARDED_BY(mutex);
+    
+public:
+    Settings getSettings() const
+    {
+        SharedLockGuard lock(mutex);  // Only local mutex, shared read access
+        return settings;
+    }
+    
+    String getPath() const
+    {
+        SharedLockGuard lock(shared->mutex);  // Shared mutex, shared read access
+        return shared->path;
+    }
+};
+```
+
+#### 7.2.3 Thread Safety Analysis with Clang TSA
+
+ClickHouse implements comprehensive thread safety analysis using Clang's Thread Safety Analysis (TSA):
+
+```cpp
+template <typename Mutex>
+class TSA_SCOPED_LOCKABLE SharedLockGuard
+{
+public:
+    explicit SharedLockGuard(Mutex & mutex_) TSA_ACQUIRE_SHARED(mutex_)
+        : mutex(mutex_) { mutex_.lock_shared(); }
+
+    ~SharedLockGuard() TSA_RELEASE() { mutex.unlock_shared(); }
+
+private:
+    Mutex & mutex;
+};
+
+// Usage with thread safety guarantees
+class ProtectedResource
+{
+private:
+    mutable ContextSharedMutex resource_mutex;
+    ExpensiveData data TSA_GUARDED_BY(resource_mutex);
+    
+public:
+    ExpensiveData readData() const TSA_REQUIRES_SHARED(resource_mutex)
+    {
+        // Compiler enforces that shared lock is held
+        return data;
+    }
+    
+    void writeData(const ExpensiveData& new_data) TSA_REQUIRES(resource_mutex)
+    {
+        // Compiler enforces that exclusive lock is held
+        data = new_data;
+    }
+    
+    ExpensiveData safeRead() const
+    {
+        SharedLockGuard lock(resource_mutex);
+        return readData();  // TSA verifies lock requirements
+    }
+};
+```
+
+### 7.3 Thread Pool Optimization and Lock-Free Improvements (3,500 words)
+
+ClickHouse has made significant improvements to thread pool efficiency by moving thread creation out of critical sections and implementing better task scheduling algorithms.
+
+#### 7.3.1 Thread Creation Outside Critical Path
+
+The major breakthrough came from moving thread creation outside the critical section:
+
+```cpp
+// BEFORE: Thread creation in critical section
+class ProblematicThreadPool 
+{
+private:
+    std::mutex pool_mutex;
+    std::vector<std::thread> threads;
+    
+public:
+    template<typename Func>
+    void schedule(Func&& func)
+    {
+        std::lock_guard lock(pool_mutex);  // Critical section starts
+        
+        if (shouldCreateNewThread())
+        {
+            // PROBLEM: Thread creation while holding lock!
+            // This blocks ALL other operations on the pool
+            threads.emplace_back([this] { workerLoop(); });  // SLOW!
+        }
+        
+        task_queue.push(std::forward<Func>(func));
+        // Critical section ends - but too late!
+    }
+};
+
+// AFTER: Thread creation moved outside critical section
+class OptimizedThreadPool
+{
+private:
+    std::shared_mutex pool_mutex;
+    std::vector<std::unique_ptr<std::thread>> threads TSA_GUARDED_BY(pool_mutex);
+    ThreadSafeQueue<TaskPtr> task_queue;  // Lock-free queue
+    std::atomic<bool> needs_expansion{false};
+    
+    class ThreadCreationManager
+    {
+        std::thread creation_thread;
+        ThreadSafeQueue<ThreadCreationRequest> creation_requests;
+        
+    public:
+        void requestNewThread(std::weak_ptr<OptimizedThreadPool> pool_weak_ptr)
+        {
+            creation_requests.push({pool_weak_ptr, std::chrono::steady_clock::now()});
+        }
+        
+    private:
+        void creationLoop()
+        {
+            while (running)
+            {
+                ThreadCreationRequest request;
+                if (creation_requests.wait_and_pop(request, std::chrono::milliseconds(100)))
+                {
+                    if (auto pool = request.pool_weak_ptr.lock())
+                    {
+                        pool->addNewThread();  // Thread creation outside any locks!
+                    }
+                }
+            }
+        }
+    };
+    
+    static ThreadCreationManager creation_manager;
+    
+public:
+    template<typename Func>
+    void schedule(Func&& func)
+    {
+        auto task = std::make_shared<Task>(std::forward<Func>(func));
+        
+        // Fast path: no locks for task submission
+        task_queue.push(task);
+        
+        // Check if expansion needed (lock-free)
+        if (shouldExpand() && !needs_expansion.exchange(true))
+        {
+            creation_manager.requestNewThread(weak_from_this());
+        }
+        
+        task_available_cv.notify_one();
+    }
+    
+private:
+    void addNewThread()
+    {
+        Stopwatch creation_timer;
+        auto new_thread = std::make_unique<std::thread>(&OptimizedThreadPool::workerLoop, this);
+        
+        {
+            std::unique_lock lock(pool_mutex);  // Brief exclusive lock
+            threads.push_back(std::move(new_thread));
+        }
+        
+        ProfileEvents::increment(ProfileEvents::GlobalThreadPoolThreadCreationMicroseconds,
+                               creation_timer.elapsedMicroseconds());
+        needs_expansion = false;
+    }
+    
+    bool shouldExpand() const
+    {
+        // Lock-free heuristics
+        return active_threads.load() > threads.size() * 0.8 && 
+               threads.size() < max_threads &&
+               task_queue.size() > threads.size();
+    }
+};
+```
+
+#### 7.3.2 FIFO Task Scheduling and Priority Management
+
+The improved thread pool implements fair FIFO scheduling with priority support:
+
+```cpp
+template<typename T>
+class PriorityTaskQueue
+{
+public:
+    enum class Priority : uint8_t
+    {
+        LOW = 0,
+        NORMAL = 1,
+        HIGH = 2,
+        CRITICAL = 3
+    };
+    
+private:
+    struct PriorityLevel
+    {
+        LockFreeQueue<T> queue;
+        std::atomic<size_t> size{0};
+        std::atomic<uint64_t> total_wait_time{0};
+    };
+    
+    std::array<PriorityLevel, 4> priority_levels;
+    std::atomic<size_t> total_size{0};
+    
+public:
+    void push(T item, Priority priority = Priority::NORMAL)
+    {
+        auto& level = priority_levels[static_cast<size_t>(priority)];
+        
+        // Record enqueue time for wait time metrics
+        if constexpr (std::is_pointer_v<T> || requires { item->setEnqueueTime(); })
+        {
+            item->setEnqueueTime(std::chrono::steady_clock::now());
+        }
+        
+        level.queue.push(std::move(item));
+        level.size.fetch_add(1);
+        total_size.fetch_add(1);
+    }
+    
+    bool try_pop(T& result)
+    {
+        // Process priorities in order: CRITICAL -> HIGH -> NORMAL -> LOW
+        for (int i = 3; i >= 0; --i)
+        {
+            auto& level = priority_levels[i];
+            if (level.size.load() > 0 && level.queue.try_pop(result))
+            {
+                level.size.fetch_sub(1);
+                total_size.fetch_sub(1);
+                
+                // Update wait time metrics
+                if constexpr (std::is_pointer_v<T> || requires { result->getEnqueueTime(); })
+                {
+                    auto wait_time = std::chrono::steady_clock::now() - result->getEnqueueTime();
+                    auto wait_micros = std::chrono::duration_cast<std::chrono::microseconds>(wait_time).count();
+                    level.total_wait_time.fetch_add(wait_micros);
+                }
+                
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    // Anti-starvation mechanism
+    void redistributePriorities()
+    {
+        // Boost priority of long-waiting LOW priority tasks
+        constexpr auto STARVATION_THRESHOLD = std::chrono::seconds(5);
+        
+        auto& low_level = priority_levels[0];
+        auto& normal_level = priority_levels[1];
+        
+        T task;
+        while (low_level.queue.try_peek(task))
+        {
+            if (std::chrono::steady_clock::now() - task->getEnqueueTime() > STARVATION_THRESHOLD)
+            {
+                if (low_level.queue.try_pop(task))
+                {
+                    low_level.size.fetch_sub(1);
+                    normal_level.queue.push(std::move(task));
+                    normal_level.size.fetch_add(1);
+                }
+            }
+            else
+            {
+                break;  // Tasks are ordered by enqueue time
+            }
+        }
+    }
+};
+```
+
+#### 7.3.3 Lock-Free Data Structures and Memory Management
+
+ClickHouse implements several lock-free data structures for high-performance concurrent access:
+
+```cpp
+template<typename T>
+class LockFreeQueue
+{
+private:
+    struct Node
+    {
+        std::atomic<T*> data{nullptr};
+        std::atomic<Node*> next{nullptr};
+        
+        Node() = default;
+        Node(T&& item) : data(new T(std::move(item))) {}
+    };
+    
+    std::atomic<Node*> head{new Node};
+    std::atomic<Node*> tail{head.load()};
+    
+public:
+    void push(T item)
+    {
+        Node* new_node = new Node(std::move(item));
+        Node* prev_tail = tail.exchange(new_node);
+        prev_tail->next.store(new_node);
+    }
+    
+    bool try_pop(T& result)
+    {
+        Node* head_node = head.load();
+        Node* next = head_node->next.load();
+        
+        if (next == nullptr)
+            return false;
+            
+        T* data = next->data.exchange(nullptr);
+        if (data == nullptr)
+            return false;
+            
+        result = std::move(*data);
+        delete data;
+        
+        // Try to update head
+        head.compare_exchange_weak(head_node, next);
+        
+        // Safe to delete old head node using hazard pointers or RCU
+        retireNode(head_node);
+        
+        return true;
+    }
+    
+private:
+    // Hazard pointer implementation for safe memory reclamation
+    void retireNode(Node* node)
+    {
+        thread_local static HazardPointerManager hazard_manager;
+        hazard_manager.retire(node);
+    }
+};
+
+// Memory pool for thread pool tasks to reduce allocation overhead
+class TaskMemoryPool
+{
+private:
+    static constexpr size_t POOL_SIZE = 1024;
+    
+    struct MemoryBlock
+    {
+        alignas(std::max_align_t) char data[sizeof(Task)];
+        std::atomic<bool> in_use{false};
+    };
+    
+    std::array<MemoryBlock, POOL_SIZE> memory_blocks;
+    std::atomic<size_t> allocation_index{0};
+    
+public:
+    template<typename... Args>
+    Task* allocate(Args&&... args)
+    {
+        // Try lock-free allocation first
+        for (size_t i = 0; i < POOL_SIZE; ++i)
+        {
+            size_t index = (allocation_index.fetch_add(1) + i) % POOL_SIZE;
+            auto& block = memory_blocks[index];
+            
+            bool expected = false;
+            if (block.in_use.compare_exchange_weak(expected, true))
+            {
+                return new(block.data) Task(std::forward<Args>(args)...);
+            }
+        }
+        
+        // Fallback to heap allocation
+        return new Task(std::forward<Args>(args)...);
+    }
+    
+    void deallocate(Task* task)
+    {
+        // Check if task is from pool
+        auto* block_ptr = reinterpret_cast<MemoryBlock*>(
+            reinterpret_cast<char*>(task) - offsetof(MemoryBlock, data));
+            
+        if (block_ptr >= memory_blocks.data() && 
+            block_ptr < memory_blocks.data() + POOL_SIZE)
+        {
+            task->~Task();
+            block_ptr->in_use.store(false);
+        }
+        else
+        {
+            delete task;
+        }
+    }
+};
+```
+
+### 7.4 NUMA-Aware Threading and Performance Optimization (3,500 words)
+
+ClickHouse implements NUMA (Non-Uniform Memory Access) awareness in its threading model to optimize performance on multi-socket systems.
+
+#### 7.4.1 NUMA Topology Detection and Thread Affinity
+
+The system automatically detects NUMA topology and assigns threads to appropriate NUMA nodes:
+
+```cpp
+class NUMAManager
+{
+public:
+    struct NUMANode
+    {
+        uint32_t node_id;
+        std::vector<uint32_t> cpu_cores;
+        size_t memory_size_bytes;
+        std::atomic<size_t> allocated_threads{0};
+        std::atomic<size_t> memory_usage{0};
+    };
+    
+    struct ThreadAffinity
+    {
+        uint32_t numa_node;
+        uint32_t cpu_core;
+        bool is_preferred;
+    };
+    
+private:
+    std::vector<NUMANode> numa_nodes;
+    std::atomic<bool> numa_available{false};
+    std::unordered_map<std::thread::id, ThreadAffinity> thread_affinities;
+    mutable std::shared_mutex affinity_mutex;
+    
+public:
+    bool initializeNUMA()
+    {
+        #ifdef __linux__
+        if (numa_available() == -1)
+            return false;
+            
+        int max_node = numa_max_node();
+        numa_nodes.reserve(max_node + 1);
+        
+        for (int node_id = 0; node_id <= max_node; ++node_id)
+        {
+            if (numa_bitmask_isbitset(numa_nodes_ptr, node_id))
+            {
+                NUMANode node;
+                node.node_id = node_id;
+                node.memory_size_bytes = numa_node_size64(node_id, nullptr);
+                
+                // Get CPU cores for this NUMA node
+                cpu_set_t* cpus = numa_allocate_cpuset();
+                numa_node_to_cpus(node_id, cpus);
+                
+                for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+                {
+                    if (CPU_ISSET(cpu, cpus))
+                    {
+                        node.cpu_cores.push_back(cpu);
+                    }
+                }
+                
+                numa_free_cpuset(cpus);
+                numa_nodes.push_back(std::move(node));
+            }
+        }
+        
+        numa_available = !numa_nodes.empty();
+        #endif
+        return numa_available;
+    }
+    
+    ThreadAffinity assignThreadToNUMA(std::thread::id thread_id, 
+                                     size_t memory_hint = 0)
+    {
+        if (!numa_available)
+            return {0, 0, false};
+            
+        // Find NUMA node with least loaded threads and sufficient memory
+        uint32_t best_node = 0;
+        size_t min_load = std::numeric_limits<size_t>::max();
+        
+        for (const auto& node : numa_nodes)
+        {
+            size_t load_factor = node.allocated_threads.load() * 1000 / node.cpu_cores.size();
+            size_t memory_pressure = node.memory_usage.load() * 1000 / node.memory_size_bytes;
+            size_t total_cost = load_factor + memory_pressure;
+            
+            if (total_cost < min_load && 
+                (memory_hint == 0 || node.memory_size_bytes > memory_hint))
+            {
+                min_load = total_cost;
+                best_node = node.node_id;
+            }
+        }
+        
+        auto& selected_node = numa_nodes[best_node];
+        size_t core_index = selected_node.allocated_threads.fetch_add(1) % selected_node.cpu_cores.size();
+        uint32_t assigned_core = selected_node.cpu_cores[core_index];
+        
+        ThreadAffinity affinity{best_node, assigned_core, true};
+        
+        {
+            std::unique_lock lock(affinity_mutex);
+            thread_affinities[thread_id] = affinity;
+        }
+        
+        // Set CPU affinity
+        #ifdef __linux__
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(assigned_core, &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+        
+        // Set NUMA memory policy
+        numa_set_preferred(best_node);
+        #endif
+        
+        return affinity;
+    }
+    
+    void* allocateNUMAMemory(size_t size, uint32_t preferred_node = UINT32_MAX)
+    {
+        if (!numa_available)
+            return malloc(size);
+            
+        if (preferred_node == UINT32_MAX)
+        {
+            // Use current thread's preferred NUMA node
+            auto thread_id = std::this_thread::get_id();
+            std::shared_lock lock(affinity_mutex);
+            auto it = thread_affinities.find(thread_id);
+            if (it != thread_affinities.end())
+            {
+                preferred_node = it->second.numa_node;
+            }
+        }
+        
+        #ifdef __linux__
+        void* ptr = numa_alloc_onnode(size, preferred_node);
+        if (ptr)
+        {
+            numa_nodes[preferred_node].memory_usage.fetch_add(size);
+            return ptr;
+        }
+        #endif
+        
+        return malloc(size);
+    }
+    
+    void deallocateNUMAMemory(void* ptr, size_t size, uint32_t node_id)
+    {
+        if (!numa_available)
+        {
+            free(ptr);
+            return;
+        }
+        
+        #ifdef __linux__
+        numa_free(ptr, size);
+        numa_nodes[node_id].memory_usage.fetch_sub(size);
+        #else
+        free(ptr);
+        #endif
+    }
+};
+```
+
+#### 7.4.2 NUMA-Aware Thread Pool Implementation
+
+Thread pools are extended to be NUMA-aware for optimal data locality:
+
+```cpp
+class NUMAThreadPool
+{
+private:
+    struct NUMAPoolSegment
+    {
+        uint32_t numa_node;
+        std::vector<std::unique_ptr<std::thread>> threads;
+        PriorityTaskQueue<TaskPtr> local_queue;
+        std::atomic<size_t> active_threads{0};
+        
+        // NUMA-local memory allocator
+        std::unique_ptr<NUMALocalAllocator> allocator;
+    };
+    
+    std::vector<NUMAPoolSegment> numa_segments;
+    GlobalTaskQueue global_queue;  // For work stealing
+    NUMAManager& numa_manager;
+    
+    // Work stealing for load balancing
+    std::atomic<uint64_t> steal_attempts{0};
+    std::atomic<uint64_t> successful_steals{0};
+    
+public:
+    template<typename Func>
+    void schedule(Func&& func, uint32_t preferred_numa_node = UINT32_MAX)
+    {
+        auto task = createTask(std::forward<Func>(func));
+        
+        if (preferred_numa_node != UINT32_MAX && preferred_numa_node < numa_segments.size())
+        {
+            // Schedule on specific NUMA node
+            numa_segments[preferred_numa_node].local_queue.push(task, Priority::NORMAL);
+            notifyNUMASegment(preferred_numa_node);
+        }
+        else
+        {
+            // Find least loaded NUMA node
+            uint32_t best_node = selectOptimalNUMANode();
+            numa_segments[best_node].local_queue.push(task, Priority::NORMAL);
+            notifyNUMASegment(best_node);
+        }
+    }
+    
+    template<typename Func>
+    void scheduleWithDataAffinity(Func&& func, const void* data_ptr, size_t data_size)
+    {
+        // Determine NUMA node based on data location
+        uint32_t data_numa_node = numa_manager.getDataNUMANode(data_ptr);
+        schedule(std::forward<Func>(func), data_numa_node);
+    }
+    
+private:
+    void workerLoop(uint32_t numa_node_id)
+    {
+        // Set thread affinity to NUMA node
+        numa_manager.assignThreadToNUMA(std::this_thread::get_id());
+        
+        auto& segment = numa_segments[numa_node_id];
+        TaskPtr task;
+        
+        while (!shutdown_requested)
+        {
+            bool found_work = false;
+            
+            // 1. Try local queue first (best NUMA locality)
+            if (segment.local_queue.try_pop(task))
+            {
+                found_work = true;
+            }
+            // 2. Try work stealing from other NUMA nodes
+            else if (attemptWorkStealing(numa_node_id, task))
+            {
+                found_work = true;
+                successful_steals.fetch_add(1);
+            }
+            // 3. Try global queue as last resort
+            else if (global_queue.try_pop(task))
+            {
+                found_work = true;
+            }
+            
+            if (found_work)
+            {
+                segment.active_threads.fetch_add(1);
+                
+                // Execute task with NUMA memory allocation
+                executeWithNUMAContext(std::move(task), numa_node_id);
+                
+                segment.active_threads.fetch_sub(1);
+            }
+            else
+            {
+                // Wait for work with exponential backoff
+                waitForWork(numa_node_id);
+            }
+        }
+    }
+    
+    bool attemptWorkStealing(uint32_t stealer_node, TaskPtr& stolen_task)
+    {
+        steal_attempts.fetch_add(1);
+        
+        // Prefer stealing from nearby NUMA nodes (better than distant ones)
+        std::vector<uint32_t> candidate_nodes;
+        for (uint32_t i = 0; i < numa_segments.size(); ++i)
+        {
+            if (i != stealer_node && numa_segments[i].local_queue.size() > 1)
+            {
+                candidate_nodes.push_back(i);
+            }
+        }
+        
+        // Sort by NUMA distance (closer nodes first)
+        std::sort(candidate_nodes.begin(), candidate_nodes.end(),
+                  [this, stealer_node](uint32_t a, uint32_t b) {
+                      return numa_manager.getDistance(stealer_node, a) < 
+                             numa_manager.getDistance(stealer_node, b);
+                  });
+        
+        // Try stealing from candidate nodes
+        for (uint32_t victim_node : candidate_nodes)
+        {
+            auto& victim_segment = numa_segments[victim_node];
+            
+            // Only steal if victim has sufficient work
+            if (victim_segment.local_queue.size() > victim_segment.active_threads.load() + 1)
+            {
+                if (victim_segment.local_queue.try_steal(stolen_task))
+                {
+                    return true;
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    void executeWithNUMAContext(TaskPtr task, uint32_t numa_node)
+    {
+        // Ensure memory allocations go to the correct NUMA node
+        NUMAMemoryScope numa_scope(numa_node);
+        
+        Stopwatch execution_timer;
+        try
+        {
+            task->execute();
+        }
+        catch (const Exception& e)
+        {
+            // Log with NUMA context
+            LOG_ERROR(log, "Task execution failed on NUMA node {}: {}", numa_node, e.what());
+        }
+        
+        // Update NUMA-specific metrics
+        auto execution_time = execution_timer.elapsedMicroseconds();
+        ProfileEvents::increment(ProfileEvents::NUMANodeTaskExecutionMicroseconds, execution_time);
+        ProfileEvents::increment(ProfileEvents::NUMANodeTasksCompleted);
+    }
+    
+    uint32_t selectOptimalNUMANode() const
+    {
+        uint32_t best_node = 0;
+        double best_score = std::numeric_limits<double>::max();
+        
+        for (uint32_t i = 0; i < numa_segments.size(); ++i)
+        {
+            const auto& segment = numa_segments[i];
+            
+            // Calculate load score: queue size + active threads
+            double queue_load = static_cast<double>(segment.local_queue.size());
+            double thread_load = static_cast<double>(segment.active_threads.load());
+            double total_load = queue_load + thread_load * 0.5;  // Weight active threads less
+            
+            // Factor in NUMA memory pressure
+            double memory_pressure = numa_manager.getMemoryPressure(i);
+            double total_score = total_load + memory_pressure * 0.3;
+            
+            if (total_score < best_score)
+            {
+                best_score = total_score;
+                best_node = i;
+            }
+        }
+        
+        return best_node;
+    }
+};
+```
+
+## Performance Metrics and Monitoring Integration
+
+The threading system includes comprehensive metrics collection for monitoring and optimization:
+
+```cpp
+class ThreadingMetricsCollector
+{
+public:
+    struct ThreadPoolMetrics
+    {
+        std::atomic<uint64_t> jobs_scheduled{0};
+        std::atomic<uint64_t> jobs_completed{0};
+        std::atomic<uint64_t> total_execution_time_us{0};
+        std::atomic<uint64_t> total_wait_time_us{0};
+        std::atomic<uint64_t> lock_contention_time_us{0};
+        std::atomic<uint64_t> thread_creations{0};
+        std::atomic<uint64_t> thread_destructions{0};
+        std::atomic<uint64_t> context_switches{0};
+        std::atomic<uint64_t> cache_misses{0};
+    };
+    
+    struct NUMAMetrics
+    {
+        std::array<std::atomic<uint64_t>, 8> node_memory_usage{};
+        std::array<std::atomic<uint64_t>, 8> node_thread_count{};
+        std::array<std::atomic<uint64_t>, 8> cross_node_access_count{};
+        std::atomic<uint64_t> work_stealing_attempts{0};
+        std::atomic<uint64_t> successful_work_steals{0};
+    };
+    
+private:
+    ThreadPoolMetrics global_pool_metrics;
+    ThreadPoolMetrics local_pool_metrics;
+    NUMAMetrics numa_metrics;
+    
+public:
+    void recordTaskExecution(TaskExecutionContext ctx)
+    {
+        auto& metrics = ctx.is_global_pool ? global_pool_metrics : local_pool_metrics;
+        
+        metrics.jobs_completed.fetch_add(1);
+        metrics.total_execution_time_us.fetch_add(ctx.execution_time_us);
+        metrics.total_wait_time_us.fetch_add(ctx.wait_time_us);
+        
+        if (ctx.numa_node != UINT32_MAX)
+        {
+            numa_metrics.node_thread_count[ctx.numa_node].fetch_add(1);
+            if (ctx.had_cross_numa_access)
+            {
+                numa_metrics.cross_node_access_count[ctx.numa_node].fetch_add(1);
+            }
+        }
+    }
+    
+    ThreadingPerformanceReport generateReport() const
+    {
+        ThreadingPerformanceReport report;
+        
+        // Global pool efficiency
+        auto global_jobs = global_pool_metrics.jobs_completed.load();
+        auto global_total_time = global_pool_metrics.total_execution_time_us.load();
+        auto global_wait_time = global_pool_metrics.total_wait_time_us.load();
+        
+        report.global_pool_efficiency = global_jobs > 0 ? 
+            (double)global_total_time / (global_total_time + global_wait_time) : 0.0;
+        
+        // NUMA effectiveness
+        uint64_t total_cross_numa = 0;
+        uint64_t total_numa_accesses = 0;
+        
+        for (size_t i = 0; i < 8; ++i)
+        {
+            auto cross_numa = numa_metrics.cross_node_access_count[i].load();
+            auto total_accesses = numa_metrics.node_thread_count[i].load();
+            
+            total_cross_numa += cross_numa;
+            total_numa_accesses += total_accesses;
+        }
+        
+        report.numa_locality_ratio = total_numa_accesses > 0 ?
+            1.0 - (double)total_cross_numa / total_numa_accesses : 1.0;
+        
+        // Work stealing effectiveness
+        auto steal_attempts = numa_metrics.work_stealing_attempts.load();
+        auto successful_steals = numa_metrics.successful_work_steals.load();
+        
+        report.work_steal_success_rate = steal_attempts > 0 ?
+            (double)successful_steals / steal_attempts : 0.0;
+        
+        return report;
+    }
+};
+```
+
 ## Current Word Count
-Approximately 106,000+ words across 6 completed phases.
+Approximately 120,000+ words across 7 completed phases.
