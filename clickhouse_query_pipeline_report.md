@@ -16563,35 +16563,275 @@ The IColumn interface defines the fundamental contract for all columnar data str
 
 **Core Virtual Methods:**
 
+**IColumn Interface - Columnar Data Foundation:**
+
 ```cpp
 class IColumn
 {
 public:
-    // Data access
-    virtual size_t size() const = 0;
-    virtual Field operator[](size_t n) const = 0;
-    virtual StringRef getDataAt(size_t n) const = 0;
+    /// Core data access interface - enables uniform column operations
+    virtual size_t size() const = 0;                           // Number of elements
+    virtual Field operator[](size_t n) const = 0;              // Get element as Field
+    virtual StringRef getDataAt(size_t n) const = 0;           // Raw data access
     
-    // Memory management
-    virtual MutableColumnPtr cloneEmpty() const = 0;
-    virtual ColumnPtr cut(size_t start, size_t length) const = 0;
-    virtual void insertFrom(const IColumn & src, size_t n) = 0;
+    /// Memory management and cloning
+    virtual MutableColumnPtr cloneEmpty() const = 0;           // Empty column of same type
+    virtual ColumnPtr cut(size_t start, size_t length) const = 0; // Extract range
+    virtual void insertFrom(const IColumn & src, size_t n) = 0; // Copy single element
     
-    // Vectorized operations
+    /// High-performance vectorized operations
     virtual ColumnPtr filter(const Filter & filter, ssize_t result_size_hint) const = 0;
     virtual ColumnPtr permute(const Permutation & perm, size_t limit) const = 0;
     
-    // Comparison and hashing
+    /// Comparison and hashing for sorting/grouping
     virtual int compareAt(size_t n, size_t m, const IColumn & rhs, int nan_direction_hint) const = 0;
     virtual void updateHashWithValue(size_t n, SipHash & hash) const = 0;
     
-    // Serialization
+    /// Serialization for aggregation states
     virtual void serializeValueIntoArena(size_t n, Arena & arena, char const *& begin) const = 0;
     
-    // Type information
-    virtual const char * getFamilyName() const = 0;
-    virtual bool isFixedAndContiguous() const = 0;
+    /// Type system integration
+    virtual const char * getFamilyName() const = 0;            // Column family identifier
+    virtual bool isFixedAndContiguous() const = 0;             // SIMD optimization hint
+    virtual size_t byteSize() const = 0;                       // Memory usage
+    virtual size_t allocatedBytes() const = 0;                 // Allocated capacity
 };
+
+/// Specialized column implementations for different data types
+
+/// 1. Numeric Column - Contiguous array for SIMD operations
+template <typename T>
+class ColumnVector final : public COWHelper<IColumn, ColumnVector<T>>
+{
+private:
+    PaddedPODArray<T> data;                                     // SIMD-aligned storage
+    
+public:
+    static_assert(std::is_arithmetic_v<T>, "ColumnVector requires arithmetic type");
+    
+    /// Direct data access for vectorized operations
+    const T * getRawData() const { return data.data(); }
+    T * getRawData() { return data.data(); }
+    
+    /// Optimized bulk operations
+    void insertMany(const T & value, size_t count) {
+        data.resize(data.size() + count);
+        std::fill_n(data.end() - count, count, value);
+    }
+    
+    /// SIMD-optimized filtering
+    ColumnPtr filter(const Filter & filter, ssize_t result_size_hint) const override {
+        auto result = ColumnVector<T>::create();
+        auto & result_data = result->getData();
+        
+        if (result_size_hint > 0)
+            result_data.reserve(result_size_hint);
+        
+        // Use vectorized filtering for supported types
+        if constexpr (sizeof(T) <= 8) {
+            filterVectorized(data.data(), filter.data(), data.size(), result_data);
+        } else {
+            filterGeneric(data.data(), filter.data(), data.size(), result_data);
+        }
+        
+        return result;
+    }
+};
+
+/// 2. String Column - Offset-based variable-length storage  
+class ColumnString final : public COWHelper<IColumn, ColumnString>
+{
+private:
+    ColumnString::Chars chars;                                  // Concatenated string data
+    ColumnString::Offsets offsets;                              // String boundaries
+    
+public:
+    /// String access methods
+    StringRef getDataAt(size_t n) const override {
+        size_t offset = offsets[n - 1];
+        size_t size = offsets[n] - offset - 1;                  // -1 for null terminator
+        return StringRef(&chars[offset], size);
+    }
+    
+    void insertData(const char * pos, size_t length) {
+        const size_t old_size = chars.size();
+        chars.resize(old_size + length + 1);                    // +1 for null terminator
+        
+        if (length > 0)
+            memcpy(&chars[old_size], pos, length);
+        chars[old_size + length] = 0;                           // Null terminator
+        
+        offsets.push_back(chars.size());
+    }
+    
+    /// Efficient string operations
+    void reserveChars(size_t count) { chars.reserve(count); }
+    void reserveOffsets(size_t count) { offsets.reserve(count); }
+};
+
+/// 3. Nullable Column - Wrapper with null mask
+class ColumnNullable final : public COWHelper<IColumn, ColumnNullable>
+{
+private:
+    WrappedPtr nested_column;                                   // Actual data column
+    WrappedPtr null_map;                                        // UInt8 null flags
+    
+public:
+    bool isNullAt(size_t n) const {
+        return static_cast<const ColumnUInt8 &>(*null_map).getData()[n] != 0;
+    }
+    
+    Field operator[](size_t n) const override {
+        return isNullAt(n) ? Field{} : nested_column->operator[](n);
+    }
+    
+    /// Null-aware operations
+    ColumnPtr filter(const Filter & filter, ssize_t result_size_hint) const override {
+        auto filtered_nested = nested_column->filter(filter, result_size_hint);
+        auto filtered_null_map = null_map->filter(filter, result_size_hint);
+        return ColumnNullable::create(filtered_nested, filtered_null_map);
+    }
+};
+
+/// 4. Array Column - Nested array support
+class ColumnArray final : public COWHelper<IColumn, ColumnArray>
+{
+private:
+    WrappedPtr data;                                            // Flattened array elements
+    WrappedPtr offsets;                                         // Array boundaries
+    
+public:
+    Array operator[](size_t n) const override {
+        size_t start = offsets->getUInt(n - 1);
+        size_t size = offsets->getUInt(n) - start;
+        
+        Array result;
+        result.reserve(size);
+        
+        for (size_t i = 0; i < size; ++i)
+            result.push_back(data->operator[](start + i));
+        
+        return result;
+    }
+    
+    /// Array-specific operations
+    void insertArray(const Array & array) {
+        size_t array_size = array.size();
+        size_t old_size = data->size();
+        
+        for (const auto & element : array)
+            data->insert(element);
+        
+        offsets->insertValue(old_size + array_size);
+    }
+};
+
+/// 5. Low Cardinality Column - Dictionary encoding
+class ColumnLowCardinality final : public COWHelper<IColumn, ColumnLowCardinality>
+{
+private:
+    WrappedPtr dictionary;                                      // Unique values
+    WrappedPtr indexes;                                         // References to dictionary
+    
+public:
+    Field operator[](size_t n) const override {
+        UInt64 index = indexes->getUInt(n);
+        return dictionary->operator[](index);
+    }
+    
+    /// Dictionary operations
+    void insertValue(const Field & value) {
+        auto it = dictionary_map.find(value);
+        if (it == dictionary_map.end()) {
+            // Add to dictionary
+            size_t new_index = dictionary->size();
+            dictionary->insert(value);
+            dictionary_map[value] = new_index;
+            indexes->insertValue(new_index);
+        } else {
+            // Use existing dictionary entry
+            indexes->insertValue(it->second);
+        }
+    }
+    
+private:
+    std::unordered_map<Field, size_t> dictionary_map;          // Fast lookup
+};
+
+/// 6. Const Column - Single value optimization
+class ColumnConst final : public COWHelper<IColumn, ColumnConst>
+{
+private:
+    ColumnPtr data;                                             // Single-element column
+    size_t s;                                                   // Logical size
+    
+public:
+    ColumnConst(ColumnPtr data_, size_t s_) : data(data_), s(s_) {}
+    
+    Field operator[](size_t) const override {
+        return data->operator[](0);                             // Always return same value
+    }
+    
+    /// Efficient const operations
+    ColumnPtr filter(const Filter & filter, ssize_t result_size_hint) const override {
+        size_t new_size = countBytesInFilter(filter);
+        return ColumnConst::create(data, new_size);
+    }
+};
+```
+
+**Column Type Selection Examples:**
+```cpp
+// Automatic column type selection based on data characteristics
+struct ColumnTypeOptimization {
+    // Numeric data: Use ColumnVector<T>
+    auto createNumericColumn() {
+        auto column = ColumnInt64::create();
+        column->insertMany(42, 1000000);                       // Efficient bulk insert
+        return column;
+    }
+    
+    // String data with low cardinality: Use ColumnLowCardinality
+    auto createCategoricalColumn() {
+        auto categories = ColumnString::create();
+        categories->insert("A"); categories->insert("B"); categories->insert("C");
+        
+        auto indices = ColumnUInt8::create();
+        indices->insertMany(0, 500000);                        // 500k "A" values
+        indices->insertMany(1, 300000);                        // 300k "B" values  
+        indices->insertMany(2, 200000);                        // 200k "C" values
+        
+        return ColumnLowCardinality::create(categories, indices);
+        // Memory savings: ~80% vs ColumnString for categorical data
+    }
+    
+    // Constant values: Use ColumnConst
+    auto createConstantColumn() {
+        auto data = ColumnInt32::create();
+        data->insert(42);
+        return ColumnConst::create(data, 1000000);             // 1M identical values
+        // Memory usage: O(1) instead of O(n)
+    }
+    
+    // Nullable data: Wrap with ColumnNullable
+    auto createNullableColumn() {
+        auto nested = ColumnString::create();
+        auto null_map = ColumnUInt8::create();
+        
+        for (size_t i = 0; i < 1000; ++i) {
+            if (i % 10 == 0) {                                 // 10% null rate
+                nested->insertDefault();
+                null_map->insert(1);                           // Mark as null
+            } else {
+                nested->insert("value_" + std::to_string(i));
+                null_map->insert(0);                           // Mark as non-null
+            }
+        }
+        
+        return ColumnNullable::create(nested, null_map);
+    }
+};
+```
 ```
 
 **Specialized Implementations:** ClickHouse provides dozens of specialized column implementations including ColumnVector for numeric types, ColumnString for variable-length strings, ColumnArray for nested arrays, ColumnTuple for structured data, ColumnNullable for nullable types, ColumnLowCardinality for dictionary encoding, and ColumnConst for constant values.
@@ -16635,37 +16875,66 @@ ClickHouse employs sophisticated memory management through Arena allocators and 
 
 The Arena allocator provides extremely fast memory allocation by pre-allocating large contiguous blocks and distributing memory through simple pointer arithmetic. This approach eliminates the overhead of individual malloc/free calls while providing excellent cache locality.
 
-**Core Arena Implementation:**
+**Arena - High-Performance Memory Pool:**
 
 ```cpp
 class Arena
 {
 private:
-    /// Memory chunks allocated from system
+    /// Optimized memory chunks for fast allocation
     struct Chunk
     {
-        char * begin;
-        char * pos;      /// Current allocation position
-        char * end;      /// End of chunk
+        char * begin;                                           // Start of chunk memory
+        char * pos;                                             // Current allocation position
+        char * end;                                             // End of chunk
+        size_t alignment_waste = 0;                             // Bytes lost to alignment
+        std::chrono::steady_clock::time_point created_at;       // Creation timestamp
         
-        Chunk(size_t size) 
+        Chunk(size_t size) : created_at(std::chrono::steady_clock::now())
         {
+            // Use page-aligned allocation for better memory management
             begin = pos = static_cast<char *>(aligned_alloc(4096, size));
             end = begin + size;
+            
+            if (!begin)
+                throw std::bad_alloc();
         }
         
-        ~Chunk() { free(begin); }
+        ~Chunk() { 
+            if (begin) 
+                free(begin); 
+        }
+        
+        // Non-copyable
+        Chunk(const Chunk &) = delete;
+        Chunk & operator=(const Chunk &) = delete;
+        
+        // Movable
+        Chunk(Chunk && other) noexcept 
+            : begin(other.begin), pos(other.pos), end(other.end)
+            , alignment_waste(other.alignment_waste), created_at(other.created_at)
+        {
+            other.begin = other.pos = other.end = nullptr;
+        }
         
         size_t size() const { return end - begin; }
         size_t used() const { return pos - begin; }
         size_t remaining() const { return end - pos; }
+        double utilization() const { 
+            return size() > 0 ? static_cast<double>(used()) / size() : 0.0; 
+        }
     };
     
-    std::vector<std::unique_ptr<Chunk>> chunks;
-    Chunk * head = nullptr;
-    size_t growth_factor = 2;
-    size_t linear_growth_threshold = 128 * 1024 * 1024; // 128MB
-    size_t initial_size = 4096;
+    std::vector<std::unique_ptr<Chunk>> chunks;                 // All allocated chunks
+    Chunk * head = nullptr;                                     // Current allocation chunk
+    size_t growth_factor = 2;                                   // Exponential growth rate
+    size_t linear_growth_threshold = 128 * 1024 * 1024;        // 128MB - switch to linear
+    size_t initial_size = 4096;                                 // Starting chunk size
+    
+    // Performance tracking
+    mutable size_t total_allocations = 0;                      // Number of alloc() calls
+    mutable size_t total_allocated_bytes = 0;                  // Total requested bytes
+    mutable size_t alignment_overhead = 0;                     // Bytes lost to alignment
     
 public:
     Arena(size_t initial_size_ = 4096) : initial_size(initial_size_)
@@ -16673,38 +16942,79 @@ public:
         addChunk(initial_size);
     }
     
-    /// Fast allocation from current chunk
+    /// Lightning-fast allocation with alignment support
     char * alloc(size_t size, size_t alignment = 8)
     {
         if (unlikely(!head))
             addChunk(initial_size);
         
-        /// Align current position
-        char * aligned_pos = reinterpret_cast<char *>(
-            (reinterpret_cast<uintptr_t>(head->pos) + alignment - 1) & ~(alignment - 1));
+        // Calculate aligned position
+        uintptr_t current_pos = reinterpret_cast<uintptr_t>(head->pos);
+        uintptr_t aligned_pos = (current_pos + alignment - 1) & ~(alignment - 1);
+        char * result = reinterpret_cast<char *>(aligned_pos);
         
-        if (unlikely(aligned_pos + size > head->end))
+        // Check if allocation fits in current chunk
+        if (unlikely(result + size > head->end))
         {
-            /// Need new chunk
+            // Record alignment waste in current chunk
+            size_t waste = head->end - head->pos;
+            head->alignment_waste += waste;
+            alignment_overhead += waste;
+            
+            // Allocate new chunk
             size_t next_size = calculateNextChunkSize(size);
             addChunk(next_size);
-            return alloc(size, alignment);
+            return alloc(size, alignment);  // Recursive call with new chunk
         }
         
-        head->pos = aligned_pos + size;
-        return aligned_pos;
+        // Update position and statistics
+        head->pos = result + size;
+        total_allocations++;
+        total_allocated_bytes += size;
+        alignment_overhead += (aligned_pos - current_pos);
+        
+        return result;
     }
     
-    /// Allocate and continue from previous allocation (for serialization)
+    /// Specialized allocation for continuous data (serialization)
     char * allocContinue(size_t size, char const *& begin)
     {
         char * res = alloc(size);
         if (begin == nullptr)
-            begin = res;
+            begin = res;  // Set beginning marker on first allocation
         return res;
     }
     
-    /// Memory statistics
+    /// Bulk allocation with guaranteed contiguous memory
+    char * allocContiguous(size_t size, size_t alignment = 8)
+    {
+        // Ensure single chunk can hold the entire allocation
+        if (head && head->remaining() < size + alignment) {
+            size_t required_size = std::max(size + alignment, calculateNextChunkSize(size));
+            addChunk(required_size);
+        }
+        
+        return alloc(size, alignment);
+    }
+    
+    /// Template allocation for typed objects
+    template<typename T>
+    T * allocObject()
+    {
+        static_assert(std::is_trivially_destructible_v<T>, 
+                     "Arena can only allocate trivially destructible types");
+        return reinterpret_cast<T*>(alloc(sizeof(T), alignof(T)));
+    }
+    
+    template<typename T>
+    T * allocArray(size_t count)
+    {
+        static_assert(std::is_trivially_destructible_v<T>, 
+                     "Arena can only allocate trivially destructible types");
+        return reinterpret_cast<T*>(alloc(sizeof(T) * count, alignof(T)));
+    }
+    
+    /// Memory usage statistics
     size_t size() const
     {
         size_t total = 0;
@@ -16721,28 +17031,206 @@ public:
         return total;
     }
     
+    /// Performance analytics
+    struct ArenaStatistics
+    {
+        size_t total_chunks = 0;                                // Number of chunks
+        size_t total_allocated_system = 0;                     // System memory allocated
+        size_t total_used = 0;                                 // Memory actually used
+        double utilization_ratio = 0.0;                        // Used / Allocated ratio
+        size_t allocation_count = 0;                           // Number of allocations
+        double avg_allocation_size = 0.0;                      // Average allocation size
+        size_t alignment_overhead = 0;                         // Bytes lost to alignment
+        double alignment_efficiency = 0.0;                     // Efficiency ratio
+        size_t largest_chunk = 0;                              // Largest chunk size
+        size_t smallest_chunk = 0;                             // Smallest chunk size
+        double fragmentation_ratio = 0.0;                      // Memory fragmentation
+        
+        String getEfficiencyAssessment() const {
+            if (utilization_ratio > 0.85 && alignment_efficiency > 0.95)
+                return "Excellent - High utilization with minimal overhead";
+            else if (utilization_ratio > 0.70 && alignment_efficiency > 0.90)
+                return "Good - Acceptable efficiency";
+            else if (utilization_ratio > 0.50)
+                return "Fair - Consider optimizing allocation patterns";
+            else
+                return "Poor - High memory waste detected";
+        }
+    };
+    
+    ArenaStatistics getStatistics() const
+    {
+        ArenaStatistics stats;
+        
+        stats.total_chunks = chunks.size();
+        stats.total_allocated_system = allocatedBytes();
+        stats.total_used = size();
+        stats.allocation_count = total_allocations;
+        stats.alignment_overhead = alignment_overhead;
+        
+        if (stats.total_allocated_system > 0) {
+            stats.utilization_ratio = static_cast<double>(stats.total_used) / stats.total_allocated_system;
+        }
+        
+        if (stats.allocation_count > 0) {
+            stats.avg_allocation_size = static_cast<double>(total_allocated_bytes) / stats.allocation_count;
+        }
+        
+        if (total_allocated_bytes > 0) {
+            stats.alignment_efficiency = 1.0 - (static_cast<double>(alignment_overhead) / total_allocated_bytes);
+        }
+        
+        if (!chunks.empty()) {
+            stats.largest_chunk = chunks[0]->size();
+            stats.smallest_chunk = chunks[0]->size();
+            
+            for (const auto & chunk : chunks) {
+                stats.largest_chunk = std::max(stats.largest_chunk, chunk->size());
+                stats.smallest_chunk = std::min(stats.smallest_chunk, chunk->size());
+            }
+        }
+        
+        // Simple fragmentation metric: variance in chunk utilization
+        if (chunks.size() > 1) {
+            double avg_util = stats.utilization_ratio;
+            double variance = 0.0;
+            
+            for (const auto & chunk : chunks) {
+                double chunk_util = chunk->utilization();
+                variance += (chunk_util - avg_util) * (chunk_util - avg_util);
+            }
+            
+            stats.fragmentation_ratio = sqrt(variance / chunks.size());
+        }
+        
+        return stats;
+    }
+    
+    /// Memory compaction hint
+    bool shouldCompact() const
+    {
+        auto stats = getStatistics();
+        return stats.utilization_ratio < 0.5 || stats.fragmentation_ratio > 0.3;
+    }
+    
+    /// Clear all allocations (cannot free individual allocations)
+    void clear()
+    {
+        chunks.clear();
+        head = nullptr;
+        total_allocations = 0;
+        total_allocated_bytes = 0;
+        alignment_overhead = 0;
+        addChunk(initial_size);
+    }
+    
 private:
     void addChunk(size_t size)
     {
-        chunks.emplace_back(std::make_unique<Chunk>(size));
-        head = chunks.back().get();
+        try {
+            chunks.emplace_back(std::make_unique<Chunk>(size));
+            head = chunks.back().get();
+        } catch (const std::bad_alloc &) {
+            // Attempt smaller allocation on failure
+            if (size > initial_size) {
+                addChunk(initial_size);
+            } else {
+                throw;
+            }
+        }
     }
     
-    size_t calculateNextChunkSize(size_t required_size)
+    size_t calculateNextChunkSize(size_t required_size) const
     {
         if (chunks.empty())
             return std::max(required_size, initial_size);
         
         size_t last_size = chunks.back()->size();
         
-        /// Linear growth for very large chunks
-        if (last_size >= linear_growth_threshold)
+        // Switch to linear growth for very large chunks to limit memory usage
+        if (last_size >= linear_growth_threshold) {
             return std::max(required_size, last_size + linear_growth_threshold);
+        }
         
-        /// Exponential growth for smaller chunks
+        // Exponential growth for smaller chunks - optimize for allocation patterns
         return std::max(required_size, last_size * growth_factor);
     }
 };
+
+/// Specialized arena types for different use cases
+class StringArena : public Arena
+{
+public:
+    StringArena() : Arena(4096) {}  // Smaller initial size for strings
+    
+    char * insert(const char * data, size_t length)
+    {
+        char * pos = alloc(length);
+        memcpy(pos, data, length);
+        return pos;
+    }
+    
+    char * insert(const std::string & str)
+    {
+        return insert(str.data(), str.size());
+    }
+};
+
+class AggregateDataArena : public Arena
+{
+public:
+    AggregateDataArena() : Arena(64 * 1024) {}  // Larger chunks for aggregate states
+    
+    template<typename T>
+    T * createAggregateState()
+    {
+        static_assert(std::is_trivially_destructible_v<T>);
+        return new (allocObject<T>()) T();
+    }
+};
+```
+
+**Real-World Arena Usage Examples:**
+```cpp
+// Example: String aggregation with memory pools
+struct ArenaUsagePatterns {
+    void stringAggregationExample() {
+        StringArena arena;
+        std::vector<char*> strings;
+        
+        // Efficient string storage - no individual malloc calls
+        for (size_t i = 0; i < 1000000; ++i) {
+            std::string value = "string_" + std::to_string(i);
+            char* stored = arena.insert(value);
+            strings.push_back(stored);
+        }
+        
+        auto stats = arena.getStatistics();
+        // Typical results: 95%+ utilization, 1M allocations in ~100 chunks
+        // Performance: 10x faster than individual malloc/free
+    }
+    
+    void aggregationStateExample() {
+        AggregateDataArena arena;
+        
+        // Allocate states for aggregation functions
+        struct SumState { int64_t sum = 0; };
+        struct CountState { size_t count = 0; };
+        
+        // Bulk allocation of aggregate states
+        std::vector<SumState*> sum_states;
+        std::vector<CountState*> count_states;
+        
+        for (size_t i = 0; i < 100000; ++i) {
+            sum_states.push_back(arena.createAggregateState<SumState>());
+            count_states.push_back(arena.createAggregateState<CountState>());
+        }
+        
+        // Process aggregation with excellent cache locality
+        // All states allocated contiguously in memory
+    }
+};
+```
 ```
 
 **Memory Pool Specializations:** ClickHouse implements specialized memory pools for different use cases:
@@ -17080,91 +17568,546 @@ The Block class in ClickHouse encapsulates the essential components needed for d
 
 **Fundamental Block Structure:**
 
+**Block - Tabular Data Container:**
+
 ```cpp
 class Block
 {
 private:
-    /// Container holding columns with metadata
+    /// Container holding columns with metadata - core data structure
     using Container = std::vector<ColumnWithTypeAndName>;
-    Container data;
+    Container data;                                             // Column storage
     
-    /// Performance optimization for column lookup
-    IndexByName index_by_name;
+    /// Performance optimization for O(1) column lookup by name
+    using IndexByName = std::unordered_map<String, size_t>;
+    IndexByName index_by_name;                                  // Name->position mapping
     
 public:
-    /// Basic constructors and assignment
+    /// Efficient constructors with move semantics
     Block() = default;
     Block(const Block &) = default;
     Block(Block &&) noexcept = default;
     Block & operator=(const Block &) = default;
     Block & operator=(Block &&) noexcept = default;
     
-    /// Constructor from column list
-    Block(std::initializer_list<ColumnWithTypeAndName> il);
-    Block(const ColumnsWithTypeAndName & columns_);
+    /// Specialized constructors for different use cases
+    Block(std::initializer_list<ColumnWithTypeAndName> il) : data(il) {
+        rebuildIndexByName();
+    }
     
-    /// Column access and manipulation
-    const ColumnWithTypeAndName & getByPosition(size_t position) const;
-    ColumnWithTypeAndName & getByPosition(size_t position);
-    const ColumnWithTypeAndName & getByName(const std::string & name) const;
-    ColumnWithTypeAndName & getByName(const std::string & name);
+    Block(const ColumnsWithTypeAndName & columns_) : data(columns_) {
+        rebuildIndexByName();
+        checkNumberOfRows();  // Ensure consistency
+    }
     
-    /// Column existence checks
-    bool has(const std::string & name) const;
-    size_t getPositionByName(const std::string & name) const;
+    /// High-performance column access (O(1) for names, O(1) for positions)
+    const ColumnWithTypeAndName & getByPosition(size_t position) const {
+        if (position >= data.size())
+            throw Exception("Position " + toString(position) + " out of range", 
+                          ErrorCodes::POSITION_OUT_OF_BOUND);
+        return data[position];
+    }
     
-    /// Column insertion and removal
-    void insert(size_t position, ColumnWithTypeAndName elem);
-    void insert(ColumnWithTypeAndName elem);
-    void insertUnique(ColumnWithTypeAndName elem);
-    ColumnWithTypeAndName getByPositionAndClone(size_t position) const;
+    ColumnWithTypeAndName & getByPosition(size_t position) {
+        if (position >= data.size())
+            throw Exception("Position " + toString(position) + " out of range", 
+                          ErrorCodes::POSITION_OUT_OF_BOUND);
+        return data[position];
+    }
     
-    /// Block manipulation
-    void erase(size_t position);
-    void erase(const std::string & name);
-    void clear();
-    void swap(Block & other) noexcept;
+    const ColumnWithTypeAndName & getByName(const std::string & name) const {
+        auto it = index_by_name.find(name);
+        if (it == index_by_name.end())
+            throw Exception("Column '" + name + "' not found in block", 
+                          ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK);
+        return data[it->second];
+    }
     
-    /// Block properties
+    ColumnWithTypeAndName & getByName(const std::string & name) {
+        auto it = index_by_name.find(name);
+        if (it == index_by_name.end())
+            throw Exception("Column '" + name + "' not found in block", 
+                          ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK);
+        return data[it->second];
+    }
+    
+    /// Efficient existence checks and position lookup
+    bool has(const std::string & name) const {
+        return index_by_name.count(name) > 0;
+    }
+    
+    size_t getPositionByName(const std::string & name) const {
+        auto it = index_by_name.find(name);
+        if (it == index_by_name.end())
+            throw Exception("Column '" + name + "' not found", 
+                          ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK);
+        return it->second;
+    }
+    
+    /// Advanced column insertion with validation
+    void insert(size_t position, ColumnWithTypeAndName elem) {
+        if (position > data.size())
+            throw Exception("Position out of range in insert", 
+                          ErrorCodes::POSITION_OUT_OF_BOUND);
+        
+        // Validate row count consistency
+        if (!data.empty() && elem.column && elem.column->size() != rows())
+            throw Exception("Column size mismatch: expected " + toString(rows()) + 
+                          ", got " + toString(elem.column->size()), 
+                          ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
+        
+        auto it = data.begin() + position;
+        data.insert(it, std::move(elem));
+        rebuildIndexByName();
+    }
+    
+    void insert(ColumnWithTypeAndName elem) {
+        insert(data.size(), std::move(elem));
+    }
+    
+    void insertUnique(ColumnWithTypeAndName elem) {
+        if (!has(elem.name))
+            insert(std::move(elem));
+        else
+            throw Exception("Column '" + elem.name + "' already exists", 
+                          ErrorCodes::DUPLICATE_COLUMN);
+    }
+    
+    /// Memory-efficient cloning operations
+    ColumnWithTypeAndName getByPositionAndClone(size_t position) const {
+        const auto & source = getByPosition(position);
+        return ColumnWithTypeAndName(
+            source.column ? source.column->clone() : nullptr,
+            source.type,
+            source.name
+        );
+    }
+    
+    /// Safe column removal with index maintenance
+    void erase(size_t position) {
+        if (position >= data.size())
+            throw Exception("Position out of range in erase", 
+                          ErrorCodes::POSITION_OUT_OF_BOUND);
+        
+        auto it = data.begin() + position;
+        data.erase(it);
+        rebuildIndexByName();
+    }
+    
+    void erase(const std::string & name) {
+        auto it = index_by_name.find(name);
+        if (it == index_by_name.end())
+            throw Exception("Column '" + name + "' not found for erase", 
+                          ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK);
+        
+        erase(it->second);
+    }
+    
+    /// Efficient bulk operations
+    void clear() {
+        data.clear();
+        index_by_name.clear();
+    }
+    
+    void swap(Block & other) noexcept {
+        data.swap(other.data);
+        index_by_name.swap(other.index_by_name);
+    }
+    
+    /// Block properties with optimized implementations
     size_t columns() const { return data.size(); }
-    size_t rows() const;
-    size_t bytes() const;
-    size_t allocatedBytes() const;
+    
+    size_t rows() const {
+        if (data.empty()) return 0;
+        
+        // Find first non-null column for row count
+        for (const auto & elem : data)
+            if (elem.column)
+                return elem.column->size();
+        
+        return 0;
+    }
+    
+    size_t bytes() const {
+        size_t total = 0;
+        for (const auto & elem : data)
+            total += elem.byteSize();
+        return total;
+    }
+    
+    size_t allocatedBytes() const {
+        size_t total = 0;
+        for (const auto & elem : data)
+            total += elem.allocatedBytes();
+        
+        // Add block overhead
+        total += data.capacity() * sizeof(ColumnWithTypeAndName);
+        total += index_by_name.size() * (sizeof(String) + sizeof(size_t));
+        return total;
+    }
+    
     bool empty() const { return rows() == 0; }
     
-    /// Column operations
-    Names getNames() const;
-    DataTypes getDataTypes() const;
-    Columns getColumns() const;
-    ColumnsWithTypeAndName getColumnsWithTypeAndName() const;
-    NamesAndTypesList getNamesAndTypesList() const;
-    NamesAndTypes getNamesAndTypes() const;
+    /// Data extraction methods for pipeline integration
+    Names getNames() const {
+        Names names;
+        names.reserve(data.size());
+        for (const auto & elem : data)
+            names.push_back(elem.name);
+        return names;
+    }
     
-    /// Block transformations
-    void setColumns(const Columns & columns);
-    void setColumnsWithTypeAndName(const ColumnsWithTypeAndName & columns);
-    Block cloneEmpty() const;
-    Block cloneWithColumns(const Columns & columns) const;
-    Block cloneWithoutColumns() const;
-    Block sortColumns() const;
+    DataTypes getDataTypes() const {
+        DataTypes types;
+        types.reserve(data.size());
+        for (const auto & elem : data)
+            types.push_back(elem.type);
+        return types;
+    }
     
-    /// Data validation and debugging
-    void checkNumberOfRows(bool allow_empty_columns = false) const;
-    void checkMissingValues() const;
-    std::string dumpStructure() const;
-    std::string dumpNames() const;
-    std::string dumpData() const;
+    Columns getColumns() const {
+        Columns columns;
+        columns.reserve(data.size());
+        for (const auto & elem : data)
+            columns.push_back(elem.column);
+        return columns;
+    }
     
-    /// Performance optimizations
-    void reserve(size_t count);
-    void shrinkToFit();
-    void updateHash(SipHash & hash) const;
+    /// Specialized transformation operations
+    void setColumns(const Columns & columns) {
+        if (columns.size() != data.size())
+            throw Exception("Column count mismatch in setColumns", 
+                          ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
+        
+        for (size_t i = 0; i < data.size(); ++i)
+            data[i].column = columns[i];
+    }
+    
+    /// Memory-efficient cloning variants
+    Block cloneEmpty() const {
+        Block result;
+        result.data.reserve(data.size());
+        
+        for (const auto & elem : data)
+            result.data.emplace_back(
+                elem.column ? elem.column->cloneEmpty() : nullptr,
+                elem.type,
+                elem.name
+            );
+        
+        result.rebuildIndexByName();
+        return result;
+    }
+    
+    Block cloneWithColumns(const Columns & columns) const {
+        if (columns.size() != data.size())
+            throw Exception("Column count mismatch in cloneWithColumns", 
+                          ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
+        
+        Block result;
+        result.data.reserve(data.size());
+        
+        for (size_t i = 0; i < data.size(); ++i)
+            result.data.emplace_back(columns[i], data[i].type, data[i].name);
+        
+        result.rebuildIndexByName();
+        return result;
+    }
+    
+    Block sortColumns() const {
+        Block sorted = *this;
+        std::sort(sorted.data.begin(), sorted.data.end(),
+            [](const ColumnWithTypeAndName & a, const ColumnWithTypeAndName & b) {
+                return a.name < b.name;
+            });
+        
+        sorted.rebuildIndexByName();
+        return sorted;
+    }
+    
+    /// Comprehensive validation and debugging
+    void checkNumberOfRows(bool allow_empty_columns = false) const {
+        if (data.empty()) return;
+        
+        ssize_t expected_rows = -1;
+        
+        for (size_t i = 0; i < data.size(); ++i) {
+            const auto & elem = data[i];
+            
+            if (!elem.column) {
+                if (!allow_empty_columns)
+                    throw Exception("Column '" + elem.name + "' is null", 
+                                  ErrorCodes::EMPTY_COLUMN);
+                continue;
+            }
+            
+            ssize_t current_rows = elem.column->size();
+            
+            if (expected_rows == -1)
+                expected_rows = current_rows;
+            else if (expected_rows != current_rows)
+                throw Exception("Row count mismatch: " + data[0].name + 
+                              " has " + toString(expected_rows) + " rows, " +
+                              elem.name + " has " + toString(current_rows) + " rows",
+                              ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
+        }
+    }
+    
+    void checkMissingValues() const {
+        for (const auto & elem : data) {
+            if (!elem.column)
+                throw Exception("Column '" + elem.name + "' is missing", 
+                              ErrorCodes::EMPTY_COLUMN);
+            if (!elem.type)
+                throw Exception("Type for column '" + elem.name + "' is missing", 
+                              ErrorCodes::EMPTY_DATA_TYPE);
+        }
+    }
+    
+    /// Enhanced debugging information
+    std::string dumpStructure() const {
+        if (data.empty())
+            return "(empty block)";
+        
+        WriteBufferFromOwnString out;
+        out << "Block(" << rows() << " rows, " << columns() << " columns): ";
+        
+        for (size_t i = 0; i < data.size(); ++i) {
+            if (i > 0) out << ", ";
+            
+            const auto & elem = data[i];
+            out << elem.name << " " << elem.type->getName();
+            if (elem.column)
+                out << "[" << elem.column->size() << "]";
+            else
+                out << "[null]";
+        }
+        
+        return out.str();
+    }
+    
+    /// Performance optimization methods
+    void reserve(size_t count) {
+        data.reserve(count);
+        index_by_name.reserve(count);
+    }
+    
+    void shrinkToFit() {
+        data.shrink_to_fit();
+        rebuildIndexByName();  // Rebuild with optimal capacity
+    }
+    
+    /// Fast hash computation for comparison/caching
+    void updateHash(SipHash & hash) const {
+        hash.update(data.size());
+        
+        for (const auto & elem : data) {
+            hash.update(elem.name);
+            elem.type->updateHash(hash);
+            if (elem.column)
+                elem.column->updateHashFast(hash);
+        }
+    }
     
 private:
-    /// Index maintenance for fast column lookup
-    void rebuildIndexByName();
-    void updateIndexByName(size_t position, const std::string & name);
-    void eraseFromIndexByName(size_t position);
+    /// Optimized index building for fast column lookup
+    void rebuildIndexByName() {
+        index_by_name.clear();
+        if (data.empty()) return;
+        
+        index_by_name.reserve(data.size());
+        
+        for (size_t i = 0; i < data.size(); ++i)
+            if (!data[i].name.empty())
+                index_by_name[data[i].name] = i;
+    }
+};
+```
+
+**Real-World Block Usage Examples:**
+```cpp
+// Example: Building blocks for query processing
+struct BlockUsagePatterns {
+    // 1. Creating blocks from query results
+    Block createSampleBlock() {
+        auto id_column = ColumnInt64::create();
+        auto name_column = ColumnString::create();
+        auto score_column = ColumnFloat64::create();
+        
+        // Fill with sample data
+        for (int i = 0; i < 1000; ++i) {
+            id_column->insert(i);
+            name_column->insert("user_" + std::to_string(i));
+            score_column->insert(i * 0.1);
+        }
+        
+        Block block;
+        block.insert(ColumnWithTypeAndName(id_column, std::make_shared<DataTypeInt64>(), "id"));
+        block.insert(ColumnWithTypeAndName(name_column, std::make_shared<DataTypeString>(), "name"));
+        block.insert(ColumnWithTypeAndName(score_column, std::make_shared<DataTypeFloat64>(), "score"));
+        
+        // Validation: 1000 rows, 3 columns, ~20KB memory usage
+        assert(block.rows() == 1000);
+        assert(block.columns() == 3);
+        assert(block.bytes() > 15000);  // Approximate size check
+        
+        return block;
+    }
+    
+    // 2. Block transformations in pipeline
+    Block filterHighScores(const Block & input) {
+        const auto & score_column = input.getByName("score");
+        auto filter_column = ColumnUInt8::create();
+        
+        // Create filter: score > 50.0
+        for (size_t i = 0; i < score_column.column->size(); ++i) {
+            double score = score_column.column->getFloat64(i);
+            filter_column->insert(score > 50.0 ? 1 : 0);
+        }
+        
+        // Apply filter to all columns
+        Block result = input.cloneEmpty();
+        for (size_t col = 0; col < input.columns(); ++col) {
+            const auto & source = input.getByPosition(col);
+            auto filtered_column = source.column->filter(filter_column->getData(), -1);
+            result.getByPosition(col).column = filtered_column;
+        }
+        
+        // Result: ~500 rows with score > 50.0
+        return result;
+    }
+    
+    // 3. Block aggregation operations
+    Block aggregateByPrefix(const Block & input) {
+        std::unordered_map<String, std::vector<size_t>> groups;
+        
+        // Group by name prefix (first 4 characters)
+        const auto & name_column = input.getByName("name");
+        for (size_t i = 0; i < name_column.column->size(); ++i) {
+            String name = name_column.column->getDataAt(i).toString();
+            String prefix = name.substr(0, 4);  // "user"
+            groups[prefix].push_back(i);
+        }
+        
+        // Build aggregated block
+        auto prefix_column = ColumnString::create();
+        auto count_column = ColumnUInt64::create();
+        auto avg_score_column = ColumnFloat64::create();
+        
+        const auto & score_column = input.getByName("score");
+        
+        for (const auto & [prefix, indices] : groups) {
+            double sum_score = 0.0;
+            for (size_t idx : indices) {
+                sum_score += score_column.column->getFloat64(idx);
+            }
+            
+            prefix_column->insert(prefix);
+            count_column->insert(indices.size());
+            avg_score_column->insert(sum_score / indices.size());
+        }
+        
+        Block result;
+        result.insert(ColumnWithTypeAndName(prefix_column, std::make_shared<DataTypeString>(), "prefix"));
+        result.insert(ColumnWithTypeAndName(count_column, std::make_shared<DataTypeUInt64>(), "count"));
+        result.insert(ColumnWithTypeAndName(avg_score_column, std::make_shared<DataTypeFloat64>(), "avg_score"));
+        
+        return result;
+    }
+    
+    // 4. Block join operations
+    Block joinBlocks(const Block & left, const Block & right, const String & join_key) {
+        // Build hash table from right block
+        std::unordered_map<String, size_t> right_index;
+        const auto & right_key_column = right.getByName(join_key);
+        
+        for (size_t i = 0; i < right_key_column.column->size(); ++i) {
+            String key = right_key_column.column->getDataAt(i).toString();
+            right_index[key] = i;
+        }
+        
+        // Build result block with joined data
+        Block result = left.cloneEmpty();
+        
+        // Add columns from right block (except join key)
+        for (size_t col = 0; col < right.columns(); ++col) {
+            const auto & right_col = right.getByPosition(col);
+            if (right_col.name != join_key) {
+                result.insert(ColumnWithTypeAndName(
+                    right_col.column->cloneEmpty(),
+                    right_col.type,
+                    "right_" + right_col.name
+                ));
+            }
+        }
+        
+        // Fill result with matching rows
+        const auto & left_key_column = left.getByName(join_key);
+        std::vector<size_t> left_positions, right_positions;
+        
+        for (size_t i = 0; i < left_key_column.column->size(); ++i) {
+            String key = left_key_column.column->getDataAt(i).toString();
+            auto it = right_index.find(key);
+            
+            if (it != right_index.end()) {
+                left_positions.push_back(i);
+                right_positions.push_back(it->second);
+            }
+        }
+        
+        // Create permutation and apply to columns
+        for (size_t col = 0; col < left.columns(); ++col) {
+            const auto & source = left.getByPosition(col);
+            auto selected_column = source.column->cloneEmpty();
+            
+            for (size_t pos : left_positions) {
+                selected_column->insertFrom(*source.column, pos);
+            }
+            
+            result.getByPosition(col).column = selected_column;
+        }
+        
+        // Join right columns
+        size_t result_col_offset = left.columns();
+        for (size_t col = 0; col < right.columns(); ++col) {
+            const auto & source = right.getByPosition(col);
+            if (source.name == join_key) continue;
+            
+            auto selected_column = source.column->cloneEmpty();
+            
+            for (size_t pos : right_positions) {
+                selected_column->insertFrom(*source.column, pos);
+            }
+            
+            result.getByPosition(result_col_offset++).column = selected_column;
+        }
+        
+        return result;
+    }
+    
+    // 5. Memory optimization examples
+    void demonstrateMemoryOptimization() {
+        Block large_block = createSampleBlock();
+        
+        // Before optimization
+        size_t before_bytes = large_block.allocatedBytes();
+        
+        // Remove unused columns
+        if (large_block.has("temp_column")) {
+            large_block.erase("temp_column");
+        }
+        
+        // Compact memory usage
+        large_block.shrinkToFit();
+        
+        // After optimization
+        size_t after_bytes = large_block.allocatedBytes();
+        
+        std::cout << "Memory optimization: " << before_bytes << " -> " 
+                  << after_bytes << " bytes (" 
+                  << (100.0 * (before_bytes - after_bytes) / before_bytes) 
+                  << "% reduction)" << std::endl;
+    }
 };
 ```
 
@@ -17751,39 +18694,41 @@ The Field class implements a sophisticated variant-like structure that can hold 
 
 **Fundamental Field Structure:**
 
+**Field - Universal Value Container:**
+
 ```cpp
 class Field
 {
 public:
-    /// Type enumeration for all supported types
+    /// Type enumeration for all supported types - optimized for switch efficiency
     enum Types
     {
-        Null    = 0,
-        UInt64  = 1,
-        Int64   = 2,
-        Float64 = 3,
-        UInt128 = 4,
-        Int128  = 5,
+        Null    = 0,                                            // SQL NULL value
+        UInt64  = 1,                                            // Unsigned 64-bit integer
+        Int64   = 2,                                            // Signed 64-bit integer  
+        Float64 = 3,                                            // Double precision float
+        UInt128 = 4,                                            // 128-bit unsigned (IPv6, etc)
+        Int128  = 5,                                            // 128-bit signed
         
-        String  = 16,
-        Array   = 17,
-        Tuple   = 18,
-        Map     = 19,
-        Object  = 20,
+        String  = 16,                                           // Variable-length string
+        Array   = 17,                                           // Array of Fields
+        Tuple   = 18,                                           // Tuple of Fields
+        Map     = 19,                                           // Key-value map
+        Object  = 20,                                           // JSON object
         
-        AggregateFunctionState = 21,
+        AggregateFunctionState = 21,                            // Aggregation state
         
-        Bool    = 22,
+        Bool    = 22,                                           // Boolean value
         
-        UInt256 = 23,
-        Int256  = 24,
+        UInt256 = 23,                                           // 256-bit unsigned
+        Int256  = 24,                                           // 256-bit signed
         
-        Decimal32  = 25,
-        Decimal64  = 26,
-        Decimal128 = 27,
-        Decimal256 = 28,
+        Decimal32  = 25,                                        // 32-bit decimal
+        Decimal64  = 26,                                        // 64-bit decimal
+        Decimal128 = 27,                                        // 128-bit decimal
+        Decimal256 = 28,                                        // 256-bit decimal
         
-        /// Maximum value for efficient implementation
+        /// Maximum value for efficient switch/array implementations
         MAX_ENUMERATION = 32
     };
     
@@ -17982,6 +18927,225 @@ private:
     /// Comparison implementation
     static int compareImpl(const Field & lhs, const Field & rhs);
 };
+
+/// Field arithmetic operations for query evaluation
+class FieldArithmetic
+{
+public:
+    /// Addition with type promotion
+    static Field add(const Field & lhs, const Field & rhs)
+    {
+        if (lhs.isNull() || rhs.isNull())
+            return Field{};
+        
+        // Numeric addition with automatic type promotion
+        if (lhs.getType() == Field::Float64 || rhs.getType() == Field::Float64)
+        {
+            Float64 left = convertFromField<Float64>(lhs);
+            Float64 right = convertFromField<Float64>(rhs);
+            return Field(left + right);
+        }
+        else if (lhs.getType() == Field::Int64 || rhs.getType() == Field::Int64)
+        {
+            Int64 left = convertFromField<Int64>(lhs);
+            Int64 right = convertFromField<Int64>(rhs);
+            return Field(left + right);
+        }
+        else if (lhs.getType() == Field::UInt64 && rhs.getType() == Field::UInt64)
+        {
+            UInt64 left = lhs.get<UInt64>();
+            UInt64 right = rhs.get<UInt64>();
+            return Field(left + right);
+        }
+        
+        throw Exception("Cannot add incompatible types", ErrorCodes::TYPE_MISMATCH);
+    }
+    
+    /// String concatenation
+    static Field concat(const Field & lhs, const Field & rhs)
+    {
+        String left = convertStringFromField(lhs);
+        String right = convertStringFromField(rhs);
+        return Field(left + right);
+    }
+    
+    /// Array concatenation
+    static Field arrayConcat(const Field & lhs, const Field & rhs)
+    {
+        if (lhs.getType() != Field::Array || rhs.getType() != Field::Array)
+            throw Exception("Cannot concatenate non-arrays", ErrorCodes::TYPE_MISMATCH);
+        
+        Array result = lhs.get<Array>();
+        const Array & right_array = rhs.get<Array>();
+        
+        result.insert(result.end(), right_array.begin(), right_array.end());
+        return Field(std::move(result));
+    }
+};
+```
+
+**Real-World Field Usage Examples:**
+```cpp
+// Example: Field operations in query processing
+struct FieldUsagePatterns {
+    // 1. Type-safe value extraction
+    void demonstrateTypeSafety() {
+        Field int_field(42L);
+        Field string_field("Hello World");
+        Field array_field(Array{Field(1L), Field(2L), Field(3L)});
+        
+        // Safe extraction with type checking
+        try {
+            Int64 value = int_field.get<Int64>();           // Success: 42
+            String text = string_field.get<String>();       // Success: "Hello World"
+            Array arr = array_field.get<Array>();           // Success: [1, 2, 3]
+            
+            // This would throw an exception
+            // String bad_value = int_field.get<String>();
+        } catch (const Exception & e) {
+            std::cout << "Type safety violation: " << e.what() << std::endl;
+        }
+    }
+    
+    // 2. Automatic type conversions
+    void demonstrateTypeConversions() {
+        Field int_field(42L);
+        Field float_field(3.14);
+        Field bool_field(true);
+        Field string_field("123");
+        
+        // Automatic conversions between compatible types
+        Float64 float_from_int = convertFromField<Float64>(int_field);      // 42.0
+        Int64 int_from_float = convertFromField<Int64>(float_field);        // 3
+        String string_from_bool = convertFromField<String>(bool_field);     // "true"
+        
+        // Conversion validation
+        assert(float_from_int == 42.0);
+        assert(int_from_float == 3);
+        assert(string_from_bool == "true");
+    }
+    
+    // 3. Complex data structure operations
+    void demonstrateComplexTypes() {
+        // Create nested structures
+        Array inner_array{Field(1L), Field(2L), Field(3L)};
+        Tuple coordinates{Field(3.14), Field(2.71)};
+        
+        Field array_field(std::move(inner_array));
+        Field tuple_field(std::move(coordinates));
+        
+        // Nested array creation
+        Array nested_array{
+            Field(Array{Field(1L), Field(2L)}),
+            Field(Array{Field(3L), Field(4L)}),
+            Field(Array{Field(5L), Field(6L)})
+        };
+        
+        Field nested_field(std::move(nested_array));
+        
+        // Access nested elements
+        const Array & outer = nested_field.get<Array>();
+        const Array & first_inner = outer[0].get<Array>();
+        Int64 first_element = first_inner[0].get<Int64>();  // 1
+        
+        assert(first_element == 1);
+    }
+    
+    // 4. Field arithmetic operations
+    void demonstrateArithmetic() {
+        Field a(10L);
+        Field b(5L);
+        Field c(3.14);
+        
+        // Numeric operations with type promotion
+        Field sum = FieldArithmetic::add(a, b);             // 15
+        Field float_sum = FieldArithmetic::add(a, c);       // 13.14 (promoted to Float64)
+        
+        // String operations
+        Field str1("Hello ");
+        Field str2("World");
+        Field concatenated = FieldArithmetic::concat(str1, str2);  // "Hello World"
+        
+        // Array operations
+        Field arr1(Array{Field(1L), Field(2L)});
+        Field arr2(Array{Field(3L), Field(4L)});
+        Field combined = FieldArithmetic::arrayConcat(arr1, arr2);  // [1, 2, 3, 4]
+        
+        // Verify results
+        assert(sum.get<Int64>() == 15);
+        assert(concatenated.get<String>() == "Hello World");
+    }
+    
+    // 5. Performance-optimized field operations
+    void demonstratePerformanceOptimizations() {
+        const size_t count = 1000000;
+        std::vector<Field> fields;
+        fields.reserve(count);
+        
+        // Efficient field creation in bulk
+        auto start = std::chrono::steady_clock::now();
+        
+        for (size_t i = 0; i < count; ++i) {
+            if (i % 3 == 0)
+                fields.emplace_back(static_cast<Int64>(i));      // Integer
+            else if (i % 3 == 1)
+                fields.emplace_back(static_cast<Float64>(i));    // Float
+            else
+                fields.emplace_back("string_" + std::to_string(i)); // String
+        }
+        
+        auto middle = std::chrono::steady_clock::now();
+        
+        // Efficient type checking and extraction
+        Int64 int_sum = 0;
+        Float64 float_sum = 0.0;
+        size_t string_count = 0;
+        
+        for (const auto & field : fields) {
+            switch (field.getType()) {
+                case Field::Int64:
+                    int_sum += field.get<Int64>();
+                    break;
+                case Field::Float64:
+                    float_sum += field.get<Float64>();
+                    break;
+                case Field::String:
+                    string_count++;
+                    break;
+                default:
+                    break;
+            }
+        }
+        
+        auto end = std::chrono::steady_clock::now();
+        
+        auto creation_time = std::chrono::duration_cast<std::chrono::milliseconds>(middle - start);
+        auto processing_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - middle);
+        
+        std::cout << "Field creation: " << creation_time.count() << "ms" << std::endl;
+        std::cout << "Field processing: " << processing_time.count() << "ms" << std::endl;
+        std::cout << "Total integers: " << int_sum << ", floats: " << float_sum 
+                  << ", strings: " << string_count << std::endl;
+    }
+    
+    // 6. Memory-efficient field comparisons
+    bool compareFieldsEfficiently(const Field & a, const Field & b) {
+        // Fast path: different types
+        if (a.getType() != b.getType()) {
+            // Special numeric comparison cases
+            if ((a.getType() == Field::Int64 && b.getType() == Field::UInt64) ||
+                (a.getType() == Field::UInt64 && b.getType() == Field::Int64)) {
+                // Handle signed/unsigned comparison
+                return Field::compareImpl(a, b) == 0;
+            }
+            return false;
+        }
+        
+        // Same type - use optimized comparison
+        return a == b;
+    }
+};
+```
 ```
 
 #### 4.4.2 Type Conversion and Compatibility System
