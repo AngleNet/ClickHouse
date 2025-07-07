@@ -6534,3 +6534,2736 @@ The processor architecture includes sophisticated resource management capabiliti
 Memory management is particularly critical in the processor model. Each processor tracks its memory consumption and can trigger garbage collection or external processing when limits are approached. The system maintains global memory pressure indicators that influence processor scheduling decisions, prioritizing memory-efficient processors when resources are constrained.
 
 CPU scheduling considers processor characteristics when making execution decisions. CPU-intensive processors like aggregation and sorting operations are scheduled to maximize core utilization, while I/O-bound processors are interleaved to overlap computation with data access. The scheduler also considers NUMA topology when assigning processors to threads, ensuring that memory-intensive operations run on cores with optimal memory access patterns.
+
+## 3.2 Processor State Machine and Port System (3,000 words)
+
+The processor state machine represents one of the most sophisticated aspects of ClickHouse's execution engine, providing a foundation for non-blocking, asynchronous query processing. This state machine, combined with the port communication system, enables fine-grained control over data flow and resource utilization while maintaining high performance across diverse workloads.
+
+### State Machine Implementation Details
+
+The processor state machine operates on a carefully designed set of states that capture all possible execution conditions. Each state transition is governed by specific rules that ensure correctness and optimal performance:
+
+```cpp
+enum class Status
+{
+    /// Processor needs more input data to continue
+    NeedData,
+    
+    /// Output port is full, cannot produce more data  
+    PortFull,
+    
+    /// Processor has completed all work
+    Finished,
+    
+    /// Processor is ready to perform work
+    Ready,
+    
+    /// Processor is performing asynchronous work
+    Async,
+    
+    /// Processor wants to modify the pipeline
+    ExpandPipeline
+};
+```
+
+The state machine implementation follows a strict protocol for state transitions. The `prepare()` method is always called before `work()`, allowing processors to examine their input/output port states and determine their current status without performing actual work. This separation enables the scheduler to make informed decisions about processor execution without incurring processing overhead.
+
+**NeedData State Transitions**: A processor transitions to NeedData when it has consumed all available input data and requires more to continue. This state is not simply a lack of data - it represents a specific condition where the processor has examined its inputs and determined that progress cannot be made. The transition back from NeedData occurs when new data arrives on any input port, triggering a re-evaluation during the next prepare() call.
+
+```cpp
+class TransformProcessor : public IProcessor
+{
+private:
+    bool input_finished = false;
+    bool output_finished = false;
+    
+public:
+    Status prepare() override
+    {
+        auto & input = getInputs().front();
+        auto & output = getOutputs().front();
+        
+        /// Check if we're completely finished
+        if (output_finished)
+        {
+            input.close();
+            return Status::Finished;
+        }
+        
+        /// Check if output is blocked
+        if (output.hasData())
+            return Status::PortFull;
+        
+        /// Check if we have input data to process
+        if (input.hasData())
+            return Status::Ready;
+        
+        /// Check if input is finished
+        if (input.isFinished())
+        {
+            if (!input_finished)
+            {
+                input_finished = true;
+                return Status::Ready; // May need to finalize output
+            }
+            
+            output.finish();
+            output_finished = true;
+            return Status::Finished;
+        }
+        
+        /// Need more input data
+        input.setNeeded();
+        return Status::NeedData;
+    }
+};
+```
+
+**Ready State Management**: The Ready state indicates that a processor can make meaningful progress. This might involve processing available input data, generating output based on internal state, or performing computational work. The Ready state is the primary target for scheduler execution, as these processors can immediately contribute to query progress.
+
+**PortFull Backpressure Handling**: When a processor produces output but cannot deliver it because downstream ports are full, it transitions to PortFull. This state implements backpressure propagation throughout the pipeline. The processor remains in PortFull until downstream consumers process their data and free up port capacity.
+
+**Asynchronous Operation Support**: The Async state enables processors to perform non-blocking I/O operations or other asynchronous work. When a processor enters Async state, it typically registers a callback or future that will signal completion. The scheduler removes the processor from immediate execution consideration but monitors for completion signals.
+
+### Port Communication Protocol
+
+The port system implements a sophisticated communication protocol that manages data transfer between processors while maintaining type safety and flow control. Each port connection represents a typed data channel with specific semantics for data availability and completion.
+
+Input port implementation focuses on efficient data consumption with minimal copying:
+
+```cpp
+class InputPort
+{
+private:
+    Header header;                    /// Column metadata
+    std::shared_ptr<Chunk> data;     /// Current data chunk
+    bool is_finished = false;        /// End of stream marker
+    bool is_needed = false;          /// Execution planning hint
+    OutputPort * output_port = nullptr; /// Connected output
+    
+public:
+    /// Non-blocking data access
+    bool hasData() const { return data != nullptr; }
+    
+    /// Consume available data
+    Chunk pull() 
+    {
+        if (!hasData())
+            throw Exception("No data available to pull");
+        auto result = std::move(*data);
+        data.reset();
+        return result;
+    }
+    
+    /// Check for stream completion
+    bool isFinished() const 
+    { 
+        return is_finished && !hasData(); 
+    }
+    
+    /// Execution planning hint
+    void setNeeded() { is_needed = true; }
+    bool isNeeded() const { return is_needed; }
+    
+    /// Connection management
+    void connect(OutputPort & output)
+    {
+        if (output_port)
+            throw Exception("InputPort already connected");
+        
+        output_port = &output;
+        output.input_port = this;
+        
+        /// Validate header compatibility
+        if (!header.isCompatibleWith(output.getHeader()))
+            throw Exception("Incompatible port headers");
+    }
+    
+    /// Close port and propagate signal
+    void close()
+    {
+        if (output_port && !output_port->isFinished())
+            output_port->finish();
+    }
+};
+```
+
+The `setNeeded()` mechanism provides crucial optimization hints for query planning. When a processor indicates that it needs data from specific input ports, the scheduler can prioritize upstream processors that feed those ports. This creates a demand-driven execution model that focuses computational resources on the most critical data paths.
+
+Output port implementation emphasizes efficient data delivery and backpressure management:
+
+```cpp
+class OutputPort  
+{
+private:
+    Header header;                    /// Column metadata
+    std::shared_ptr<Chunk> data;     /// Data waiting to be consumed
+    bool is_finished = false;        /// No more data will be produced
+    InputPort * input_port = nullptr; /// Connected input
+    
+public:
+    /// Check capacity for new data
+    bool canPush() const { return data == nullptr; }
+    
+    /// Deliver data to downstream processor
+    void push(Chunk chunk)
+    {
+        if (!canPush())
+            throw Exception("Port is full, cannot push data");
+        data = std::make_shared<Chunk>(std::move(chunk));
+        
+        /// Notify connected input port
+        if (input_port)
+            input_port->onDataAvailable();
+    }
+    
+    /// Signal end of data stream
+    void finish() 
+    { 
+        is_finished = true;
+        if (input_port)
+            input_port->onFinished();
+    }
+    
+    /// Check for pending data
+    bool hasData() const { return data != nullptr; }
+    
+    /// Transfer data to connected input
+    void updateInputPort()
+    {
+        if (input_port && hasData() && !input_port->hasData())
+        {
+            input_port->data = std::move(data);
+            data.reset();
+        }
+        
+        if (input_port && is_finished)
+            input_port->is_finished = true;
+    }
+};
+```
+
+### Data Flow Synchronization
+
+The port system implements sophisticated synchronization mechanisms that ensure correct data flow without requiring explicit locking. The synchronization relies on the atomic nature of pointer operations and careful ordering of state updates.
+
+When a processor produces data, it follows a specific protocol:
+1. Check that the output port can accept data (`canPush()`)
+2. Create the data chunk with appropriate content
+3. Atomically update the port with the new data (`push()`)
+4. Update internal state to reflect data production
+
+Similarly, data consumption follows a complementary protocol:
+1. Check that input data is available (`hasData()`)
+2. Atomically extract the data chunk (`pull()`)
+3. Update internal state to reflect data consumption
+4. Process the extracted data
+
+```cpp
+class SynchronizedPortSystem
+{
+private:
+    std::atomic<size_t> data_version{0};
+    std::atomic<bool> finished_flag{false};
+    
+public:
+    /// Thread-safe data transfer
+    bool tryTransferData(OutputPort & output, InputPort & input)
+    {
+        /// Check preconditions atomically
+        if (!output.hasData() || input.hasData())
+            return false;
+        
+        /// Perform atomic transfer
+        auto expected_version = data_version.load();
+        if (data_version.compare_exchange_weak(expected_version, expected_version + 1))
+        {
+            /// Transfer data under version lock
+            input.data = std::move(output.data);
+            output.data.reset();
+            return true;
+        }
+        
+        return false; /// Retry needed
+    }
+    
+    /// Signal completion across port boundary
+    void signalFinished(OutputPort & output)
+    {
+        bool expected = false;
+        if (finished_flag.compare_exchange_strong(expected, true))
+        {
+            output.finish();
+            if (output.input_port)
+                output.input_port->is_finished = true;
+        }
+    }
+};
+```
+
+This protocol ensures that data transfer occurs atomically without requiring heavyweight synchronization primitives. The shared pointer mechanism provides automatic memory management while maintaining thread safety for the data chunks themselves.
+
+### Chunk-Based Processing Model
+
+The processor architecture is built around chunk-based data processing, where operations work on collections of rows rather than individual tuples. This design choice provides significant performance benefits while simplifying the implementation of complex operations.
+
+Chunks are represented by the `Chunk` class, which contains multiple columns and associated metadata:
+
+```cpp
+class Chunk
+{
+private:
+    Columns columns;          /// Vector of IColumn shared pointers
+    UInt64 num_rows;         /// Number of rows in all columns
+    ChunkInfoPtr chunk_info; /// Optional metadata for special processing
+    
+public:
+    /// Construction and basic access
+    Chunk() : num_rows(0) {}
+    Chunk(Columns columns_, UInt64 num_rows_)
+        : columns(std::move(columns_)), num_rows(num_rows_)
+    {
+        checkColumnsConsistency();
+    }
+    
+    /// Column access and manipulation
+    const Columns & getColumns() const { return columns; }
+    void setColumns(Columns columns_) 
+    { 
+        columns = std::move(columns_);
+        checkColumnsConsistency();
+    }
+    
+    /// Row count management
+    UInt64 getNumRows() const { return num_rows; }
+    void setNumRows(UInt64 num_rows_) { num_rows = num_rows_; }
+    
+    /// Chunk operations
+    Chunk clone() const
+    {
+        Columns cloned_columns;
+        cloned_columns.reserve(columns.size());
+        
+        for (const auto & column : columns)
+            cloned_columns.push_back(column->cloneResized(num_rows));
+        
+        return Chunk(std::move(cloned_columns), num_rows);
+    }
+    
+    void clear() 
+    { 
+        columns.clear(); 
+        num_rows = 0; 
+        chunk_info.reset();
+    }
+    
+    bool empty() const { return num_rows == 0; }
+    
+    /// Memory management
+    size_t bytes() const
+    {
+        size_t total_bytes = 0;
+        for (const auto & column : columns)
+            total_bytes += column->byteSize();
+        return total_bytes;
+    }
+    
+    size_t allocatedBytes() const
+    {
+        size_t total_bytes = 0;
+        for (const auto & column : columns)
+            total_bytes += column->allocatedBytes();
+        return total_bytes;
+    }
+    
+private:
+    void checkColumnsConsistency() const
+    {
+        if (columns.empty())
+        {
+            if (num_rows != 0)
+                throw Exception("Chunk with zero columns must have zero rows");
+            return;
+        }
+        
+        for (const auto & column : columns)
+        {
+            if (column->size() != num_rows)
+                throw Exception("Column size mismatch in chunk");
+        }
+    }
+};
+```
+
+The chunk size is dynamically determined based on several factors:
+- **Memory constraints**: Chunks are sized to fit comfortably in CPU cache while avoiding excessive memory usage
+- **Vectorization efficiency**: Larger chunks enable better SIMD utilization and reduce function call overhead  
+- **Pipeline characteristics**: I/O-bound operations prefer larger chunks, while CPU-intensive operations may use smaller chunks for better parallelization
+
+Typical chunk sizes range from 8,192 to 65,536 rows, with the exact size determined by data characteristics and system configuration. The dynamic sizing ensures optimal performance across diverse query patterns and data types.
+
+### Advanced Port Features
+
+The port system includes several advanced features that support sophisticated query execution patterns:
+
+**Multi-input Processors**: Some processors require data from multiple input sources, such as join operations that need both left and right input streams. The port system supports processors with multiple input ports, each potentially operating at different rates and with different data availability patterns.
+
+```cpp
+class JoinProcessor : public IProcessor
+{
+private:
+    enum InputPortIndex { LEFT = 0, RIGHT = 1 };
+    bool left_finished = false;
+    bool right_finished = false;
+    
+public:
+    JoinProcessor(const Block & left_header, const Block & right_header)
+    {
+        addInputPort(left_header);   /// Port 0: left input
+        addInputPort(right_header);  /// Port 1: right input
+        addOutputPort(createJoinHeader(left_header, right_header));
+    }
+    
+    Status prepare() override
+    {
+        auto & inputs = getInputs();
+        auto & output = getOutputs().front();
+        
+        auto & left_input = *std::next(inputs.begin(), LEFT);
+        auto & right_input = *std::next(inputs.begin(), RIGHT);
+        
+        /// Check output availability
+        if (output.hasData())
+            return Status::PortFull;
+        
+        /// Check if both inputs have data or are finished
+        bool left_ready = left_input.hasData() || left_input.isFinished();
+        bool right_ready = right_input.hasData() || right_input.isFinished();
+        
+        if (left_ready && right_ready)
+            return Status::Ready;
+        
+        /// Set needed flags for missing inputs
+        if (!left_ready)
+            left_input.setNeeded();
+        if (!right_ready)
+            right_input.setNeeded();
+        
+        return Status::NeedData;
+    }
+};
+```
+
+**Conditional Data Flow**: Certain processors implement conditional logic that determines which output ports receive data based on processing results. For example, a filter processor might send matching rows to one output port and non-matching rows to another for further processing.
+
+**Port Multiplexing**: Advanced processors can multiplex data across multiple output ports to enable parallel downstream processing. This capability is crucial for implementing parallel aggregation and other divide-and-conquer algorithms.
+
+```cpp
+class PartitionProcessor : public IProcessor
+{
+private:
+    size_t num_partitions;
+    std::vector<size_t> partition_keys;
+    PartitionFunction partition_function;
+    
+public:
+    PartitionProcessor(const Block & header, size_t num_partitions_)
+        : num_partitions(num_partitions_)
+    {
+        addInputPort(header);
+        
+        /// Create output port for each partition
+        for (size_t i = 0; i < num_partitions; ++i)
+            addOutputPort(header);
+    }
+    
+    void work() override
+    {
+        auto & input = getInputs().front();
+        auto & outputs = getOutputs();
+        
+        auto chunk = input.pull();
+        if (chunk.empty())
+            return;
+        
+        /// Partition chunk into multiple output chunks
+        std::vector<Chunk> partitioned_chunks(num_partitions);
+        partitionChunk(chunk, partitioned_chunks);
+        
+        /// Send chunks to appropriate output ports
+        auto output_it = outputs.begin();
+        for (size_t i = 0; i < num_partitions; ++i, ++output_it)
+        {
+            if (!partitioned_chunks[i].empty())
+                output_it->push(std::move(partitioned_chunks[i]));
+        }
+    }
+};
+```
+
+**Header Propagation**: The port system maintains detailed header information that describes the structure and types of data flowing through each connection. Headers are propagated through the pipeline during construction, enabling early detection of type mismatches and optimization opportunities.
+
+### Error Handling and Recovery
+
+The processor state machine includes comprehensive error handling mechanisms that ensure robust execution even when individual processors encounter problems. Error conditions are represented as special states that trigger appropriate recovery actions.
+
+When a processor encounters an error during execution, it can transition to an error state that propagates the exception information upstream and downstream. The scheduler detects error states and initiates cleanup procedures that gracefully shut down the affected pipeline segments while preserving partial results where possible.
+
+```cpp
+class ErrorHandlingProcessor : public IProcessor
+{
+private:
+    std::exception_ptr current_exception;
+    bool error_occurred = false;
+    
+public:
+    Status prepare() override
+    {
+        if (error_occurred)
+        {
+            /// Propagate error to connected ports
+            for (auto & input : getInputs())
+                input.close();
+            for (auto & output : getOutputs())
+                output.finish();
+            
+            return Status::Finished;
+        }
+        
+        return prepareImpl();
+    }
+    
+    void work() override
+    {
+        try
+        {
+            workImpl();
+        }
+        catch (...)
+        {
+            current_exception = std::current_exception();
+            error_occurred = true;
+            
+            /// Log error for debugging
+            LOG_ERROR(&Poco::Logger::get("ErrorHandlingProcessor"), 
+                     "Processor {} encountered error", getName());
+        }
+    }
+    
+    /// Check if processor has encountered an error
+    bool hasError() const { return error_occurred; }
+    
+    /// Rethrow captured exception
+    void rethrowException() const
+    {
+        if (current_exception)
+            std::rethrow_exception(current_exception);
+    }
+    
+protected:
+    virtual Status prepareImpl() = 0;
+    virtual void workImpl() = 0;
+};
+```
+
+The error handling system distinguishes between recoverable and non-recoverable errors. Recoverable errors, such as temporary I/O failures, may trigger retry mechanisms or fallback processing strategies. Non-recoverable errors, such as data corruption or resource exhaustion, result in query termination with appropriate error reporting.
+
+This sophisticated state machine and port system provides the foundation for ClickHouse's high-performance, parallel query execution engine, enabling efficient processing of complex analytical workloads while maintaining robustness and correctness.
+
+## 3.3 Core Processor Types and Implementations (3,000 words)
+
+ClickHouse's processor architecture encompasses a rich hierarchy of specialized processor types, each optimized for specific query execution tasks. These processors form the building blocks of query pipelines, with each type implementing the `IProcessor` interface while providing specialized functionality for data sources, transformations, aggregations, and output operations.
+
+### Source Processors: Data Ingestion Layer
+
+Source processors serve as the entry points for data into the query pipeline, responsible for reading data from various storage engines and external sources. These processors are particularly critical because they often represent the primary bottleneck in query execution, especially for I/O-bound workloads.
+
+**StorageSource Processor**: The most fundamental source processor reads data directly from ClickHouse storage engines. This processor implements sophisticated optimizations for different storage formats:
+
+```cpp
+class StorageSource : public IProcessor
+{
+private:
+    StoragePtr storage;               /// Reference to storage engine
+    QueryInfo query_info;           /// Query context and optimization hints
+    Block header;                   /// Expected output format
+    ReadFromStorageStep step;       /// Execution step with parameters
+    
+    /// Reading state
+    QueryPipelineBuilder pipeline_builder;
+    PullingPipelineExecutor executor;
+    
+public:
+    StorageSource(StoragePtr storage_, const Block & header_, ReadFromStorageStep step_)
+        : storage(std::move(storage_)), header(header_), step(std::move(step_))
+    {
+        addOutputPort(header);
+        initializePipeline();
+    }
+    
+    String getName() const override { return "StorageSource"; }
+    
+    Status prepare() override
+    {
+        auto & output = getOutputs().front();
+        
+        if (output.isFinished())
+            return Status::Finished;
+        
+        if (output.hasData())
+            return Status::PortFull;
+        
+        if (isStorageFinished())
+        {
+            output.finish();
+            return Status::Finished;
+        }
+        
+        return Status::Ready;
+    }
+    
+    void work() override
+    {
+        auto & output = getOutputs().front();
+        
+        auto chunk = readNextChunk();
+        if (chunk.empty())
+        {
+            output.finish();
+        }
+        else
+        {
+            output.push(std::move(chunk));
+        }
+    }
+    
+private:
+    void initializePipeline()
+    {
+        /// Build internal pipeline for reading from storage
+        auto reading_step = std::make_unique<ReadFromStorageStep>(step);
+        reading_step->initializePipeline(pipeline_builder);
+        
+        auto pipeline = pipeline_builder.build();
+        executor = std::make_unique<PullingPipelineExecutor>(pipeline);
+    }
+    
+    Chunk readNextChunk()
+    {
+        Block block;
+        if (executor->pull(block))
+        {
+            return Chunk(block.getColumns(), block.rows());
+        }
+        return {};
+    }
+    
+    bool isStorageFinished() const
+    {
+        return executor && executor->isFinished();
+    }
+};
+```
+
+The StorageSource processor coordinates with storage engines to implement advanced optimizations such as predicate pushdown, column pruning, and index utilization. For MergeTree engines, it leverages primary key indexes and skip indexes to minimize data reading. For external storage systems, it implements connection pooling and batch reading strategies.
+
+**Parallel Reading Coordination**: Modern storage engines support parallel reading from multiple data parts or segments. The StorageSource processor coordinates these parallel streams, managing load balancing and ensuring optimal resource utilization across available I/O channels.
+
+**RemoteSource Processor**: For distributed queries, the RemoteSource processor manages connections to remote ClickHouse nodes, implementing sophisticated networking optimizations:
+
+```cpp
+class RemoteSource : public IProcessor
+{
+private:
+    ConnectionPoolPtr connection_pool;   /// Pool of remote connections
+    String query;                       /// Query to execute remotely
+    Settings settings;                  /// Query execution settings
+    
+    /// Network state management
+    std::vector<ConnectionPtr> connections;
+    MultiplexedConnections multiplexed;
+    std::unique_ptr<RemoteQueryExecutor> executor;
+    
+    /// Async execution state
+    std::future<void> async_result;
+    bool is_async_running = false;
+    
+public:
+    RemoteSource(ConnectionPoolPtr pool_, const String & query_, const Settings & settings_)
+        : connection_pool(std::move(pool_)), query(query_), settings(settings_)
+    {
+        addOutputPort(Block{}); /// Header will be determined after connection
+    }
+    
+    String getName() const override { return "RemoteSource"; }
+    
+    Status prepare() override
+    {
+        auto & output = getOutputs().front();
+        
+        if (output.isFinished())
+            return Status::Finished;
+        
+        if (output.hasData())
+            return Status::PortFull;
+        
+        if (!executor)
+        {
+            establishConnections();
+            return Status::Ready;
+        }
+        
+        if (is_async_running)
+        {
+            /// Check if async operation completed
+            if (async_result.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            {
+                is_async_running = false;
+                return Status::Ready;
+            }
+            return Status::Async;
+        }
+        
+        return Status::Ready;
+    }
+    
+    void work() override
+    {
+        auto & output = getOutputs().front();
+        
+        if (!executor)
+        {
+            sendQuery();
+            return;
+        }
+        
+        auto chunk = receiveData();
+        if (chunk.empty())
+        {
+            output.finish();
+        }
+        else
+        {
+            output.push(std::move(chunk));
+        }
+    }
+    
+private:
+    void establishConnections()
+    {
+        connections = connection_pool->getMany(settings.max_parallel_connections);
+        multiplexed = MultiplexedConnections(connections, settings);
+        executor = std::make_unique<RemoteQueryExecutor>(multiplexed);
+    }
+    
+    void sendQuery()
+    {
+        executor->sendQuery(query, settings);
+        
+        /// Update output port header with actual result structure
+        auto & output = getOutputs().front();
+        output.setHeader(executor->getHeader());
+    }
+    
+    Chunk receiveData()
+    {
+        Block block;
+        if (executor->read(block))
+        {
+            return Chunk(block.getColumns(), block.rows());
+        }
+        return {};
+    }
+};
+```
+
+The RemoteSource processor implements advanced networking features including connection multiplexing, compression negotiation, and adaptive timeout management. It supports both synchronous and asynchronous execution modes, with the latter enabling overlap of network I/O with local processing.
+
+### Transform Processors: Data Manipulation Engine
+
+Transform processors implement the core data manipulation operations that modify, filter, and restructure data as it flows through the pipeline. These processors are designed for high throughput and optimal resource utilization.
+
+**FilterTransform Processor**: One of the most frequently used processors, FilterTransform applies predicate conditions to filter rows from input chunks:
+
+```cpp
+class FilterTransform : public IProcessor
+{
+private:
+    ExpressionActionsPtr expression;  /// Compiled filter expression
+    String filter_column_name;       /// Name of boolean result column
+    bool remove_filter_column;       /// Whether to remove filter column from output
+    
+    /// Optimization state
+    ConstantFilterDescription constant_filter;
+    bool is_constant_filter;
+    
+    /// Processing state
+    Block input_header;
+    Block output_header;
+    
+public:
+    FilterTransform(const Block & header_, ExpressionActionsPtr expression_,
+                   const String & filter_column_name_, bool remove_filter_column_)
+        : expression(std::move(expression_))
+        , filter_column_name(filter_column_name_)
+        , remove_filter_column(remove_filter_column_)
+        , input_header(header_)
+    {
+        output_header = transform_header(input_header);
+        
+        addInputPort(input_header);
+        addOutputPort(output_header);
+        
+        analyzeConstantFilter();
+    }
+    
+    String getName() const override { return "FilterTransform"; }
+    
+    Status prepare() override
+    {
+        auto & input = getInputs().front();
+        auto & output = getOutputs().front();
+        
+        if (output.isFinished())
+        {
+            input.close();
+            return Status::Finished;
+        }
+        
+        if (output.hasData())
+            return Status::PortFull;
+        
+        if (input.isFinished())
+        {
+            output.finish();
+            return Status::Finished;
+        }
+        
+        if (!input.hasData())
+        {
+            input.setNeeded();
+            return Status::NeedData;
+        }
+        
+        return Status::Ready;
+    }
+    
+    void work() override
+    {
+        auto & input = getInputs().front();
+        auto & output = getOutputs().front();
+        
+        auto chunk = input.pull();
+        
+        if (chunk.empty())
+            return;
+        
+        /// Handle constant filter optimization
+        if (is_constant_filter)
+        {
+            if (constant_filter.always_false)
+            {
+                /// Filter eliminates all rows
+                chunk.clear();
+            }
+            else if (constant_filter.always_true)
+            {
+                /// Filter passes all rows, just remove filter column if needed
+                if (remove_filter_column)
+                    chunk = removeFilterColumn(chunk);
+            }
+        }
+        else
+        {
+            /// Apply dynamic filter
+            chunk = applyFilter(chunk);
+        }
+        
+        output.push(std::move(chunk));
+    }
+    
+private:
+    void analyzeConstantFilter()
+    {
+        /// Check if filter expression is constant
+        if (expression->hasConstantResult())
+        {
+            is_constant_filter = true;
+            
+            auto constant_value = expression->getConstantResult();
+            constant_filter.always_true = constant_value && constant_value->getBool();
+            constant_filter.always_false = !constant_filter.always_true;
+        }
+        else
+        {
+            is_constant_filter = false;
+        }
+    }
+    
+    Chunk applyFilter(Chunk chunk)
+    {
+        auto block = input_header.cloneWithColumns(chunk.detachColumns());
+        
+        /// Execute filter expression
+        expression->execute(block);
+        
+        /// Get filter column
+        const auto & filter_column = block.getByName(filter_column_name).column;
+        
+        /// Apply filter to all columns
+        for (auto & column_with_type : block)
+        {
+            column_with_type.column = column_with_type.column->filter(*filter_column, -1);
+        }
+        
+        /// Remove filter column if requested
+        if (remove_filter_column)
+            block.erase(filter_column_name);
+        
+        return Chunk(block.getColumns(), block.rows());
+    }
+    
+    Chunk removeFilterColumn(Chunk chunk)
+    {
+        auto block = input_header.cloneWithColumns(chunk.detachColumns());
+        block.erase(filter_column_name);
+        return Chunk(block.getColumns(), block.rows());
+    }
+    
+    Block transform_header(const Block & header)
+    {
+        auto result = header;
+        expression->execute(result, true); /// Dry run to get output structure
+        
+        if (remove_filter_column)
+            result.erase(filter_column_name);
+        
+        return result;
+    }
+};
+```
+
+The FilterTransform processor implements several sophisticated optimizations. For constant filter conditions, it can completely skip processing of chunks that don't match. For highly selective filters, it uses SIMD-optimized filtering algorithms that process multiple rows simultaneously. The processor also supports predicate vectorization, where multiple filter conditions are evaluated together to minimize branching overhead.
+
+**ExpressionTransform Processor**: This processor evaluates arbitrary expressions on input data, supporting complex calculations, function calls, and type conversions:
+
+```cpp
+class ExpressionTransform : public IProcessor
+{
+private:
+    ExpressionActionsPtr expression;  /// Compiled expression tree
+    Block input_header;              /// Input column structure
+    Block output_header;             /// Output column structure
+    
+    /// Expression optimization state
+    std::vector<size_t> result_positions;
+    bool has_array_join;
+    
+public:
+    ExpressionTransform(const Block & header_, ExpressionActionsPtr expression_)
+        : expression(std::move(expression_)), input_header(header_)
+    {
+        output_header = transform_header(input_header);
+        
+        addInputPort(input_header);
+        addOutputPort(output_header);
+        
+        optimizeColumnPositions();
+    }
+    
+    String getName() const override { return "ExpressionTransform"; }
+    
+    Status prepare() override
+    {
+        auto & input = getInputs().front();
+        auto & output = getOutputs().front();
+        
+        if (output.isFinished())
+        {
+            input.close();
+            return Status::Finished;
+        }
+        
+        if (output.hasData())
+            return Status::PortFull;
+        
+        if (input.isFinished())
+        {
+            output.finish();
+            return Status::Finished;
+        }
+        
+        if (!input.hasData())
+        {
+            input.setNeeded();
+            return Status::NeedData;
+        }
+        
+        return Status::Ready;
+    }
+    
+    void work() override
+    {
+        auto & input = getInputs().front();
+        auto & output = getOutputs().front();
+        
+        auto chunk = input.pull();
+        
+        if (chunk.empty())
+            return;
+        
+        auto block = input_header.cloneWithColumns(chunk.detachColumns());
+        
+        /// Execute expression
+        expression->execute(block);
+        
+        /// Handle array join if present
+        if (has_array_join)
+            handleArrayJoin(block);
+        
+        /// Extract result columns in correct order
+        Columns result_columns;
+        result_columns.reserve(output_header.columns());
+        
+        for (const auto & column_name : output_header.getNames())
+        {
+            result_columns.push_back(block.getByName(column_name).column);
+        }
+        
+        output.push(Chunk(std::move(result_columns), block.rows()));
+    }
+    
+private:
+    Block transform_header(const Block & header)
+    {
+        auto result = header;
+        expression->execute(result, true); /// Dry run
+        return result;
+    }
+    
+    void optimizeColumnPositions()
+    {
+        /// Pre-compute column positions for faster access
+        result_positions.reserve(output_header.columns());
+        
+        for (const auto & column_name : output_header.getNames())
+        {
+            auto position = input_header.getPositionByName(column_name);
+            result_positions.push_back(position);
+        }
+        
+        /// Check for array join operations
+        has_array_join = expression->hasArrayJoin();
+    }
+    
+    void handleArrayJoin(Block & block)
+    {
+        /// Array join can multiply the number of rows
+        /// Implementation would handle the array expansion logic
+        /// This is a simplified placeholder
+    }
+};
+```
+
+The ExpressionTransform processor leverages ClickHouse's sophisticated expression compilation system, which can generate optimized code for complex expression trees. It supports vectorized function evaluation, constant folding, and common subexpression elimination. For expressions involving array operations, it implements specialized handling that efficiently processes nested data structures.
+
+**SortingTransform Processor**: Implements high-performance sorting with support for both in-memory and external sorting algorithms:
+
+```cpp
+class SortingTransform : public IProcessor
+{
+private:
+    SortDescription sort_description;  /// Sorting criteria
+    UInt64 limit;                     /// Optional limit for top-N optimization
+    size_t max_bytes_before_external; /// Memory limit for external sorting
+    
+    /// Sorting state
+    std::vector<Chunk> chunks;        /// Accumulated chunks for sorting
+    std::unique_ptr<MergeSorter> merge_sorter; /// External sorting support
+    bool is_external_sorting = false;
+    bool is_input_finished = false;
+    bool is_output_finished = false;
+    
+    /// Memory tracking
+    size_t current_memory_usage = 0;
+    
+public:
+    SortingTransform(const Block & header_, const SortDescription & sort_description_,
+                    UInt64 limit_ = 0, size_t max_bytes_before_external_ = 0)
+        : sort_description(sort_description_)
+        , limit(limit_)
+        , max_bytes_before_external(max_bytes_before_external_)
+    {
+        addInputPort(header_);
+        addOutputPort(header_);
+    }
+    
+    String getName() const override { return "SortingTransform"; }
+    
+    Status prepare() override
+    {
+        auto & input = getInputs().front();
+        auto & output = getOutputs().front();
+        
+        if (output.isFinished())
+        {
+            input.close();
+            return Status::Finished;
+        }
+        
+        if (is_output_finished)
+        {
+            output.finish();
+            return Status::Finished;
+        }
+        
+        if (output.hasData())
+            return Status::PortFull;
+        
+        if (!is_input_finished)
+        {
+            if (input.isFinished())
+            {
+                is_input_finished = true;
+                return Status::Ready; /// Need to start output generation
+            }
+            
+            if (input.hasData())
+                return Status::Ready; /// Need to consume input
+            
+            input.setNeeded();
+            return Status::NeedData;
+        }
+        
+        /// Input finished, generating output
+        return Status::Ready;
+    }
+    
+    void work() override
+    {
+        auto & input = getInputs().front();
+        auto & output = getOutputs().front();
+        
+        if (!is_input_finished)
+        {
+            /// Accumulate input chunks
+            auto chunk = input.pull();
+            if (!chunk.empty())
+            {
+                current_memory_usage += chunk.allocatedBytes();
+                chunks.push_back(std::move(chunk));
+                
+                /// Check if we need to switch to external sorting
+                if (max_bytes_before_external > 0 && 
+                    current_memory_usage > max_bytes_before_external)
+                {
+                    initializeExternalSorting();
+                }
+            }
+        }
+        else
+        {
+            /// Generate sorted output
+            auto chunk = generateOutput();
+            if (chunk.empty())
+            {
+                is_output_finished = true;
+            }
+            else
+            {
+                output.push(std::move(chunk));
+            }
+        }
+    }
+    
+private:
+    void initializeExternalSorting()
+    {
+        if (is_external_sorting)
+            return;
+        
+        is_external_sorting = true;
+        
+        /// Create external merge sorter
+        merge_sorter = std::make_unique<MergeSorter>(
+            sort_description, max_bytes_before_external);
+        
+        /// Feed existing chunks to external sorter
+        for (auto & chunk : chunks)
+        {
+            merge_sorter->addChunk(std::move(chunk));
+        }
+        chunks.clear();
+        current_memory_usage = 0;
+    }
+    
+    Chunk generateOutput()
+    {
+        if (is_external_sorting)
+        {
+            return merge_sorter->getNextChunk();
+        }
+        else
+        {
+            /// Perform in-memory sort
+            if (!chunks.empty())
+            {
+                auto result = performInMemorySort();
+                chunks.clear();
+                return result;
+            }
+        }
+        
+        return {};
+    }
+    
+    Chunk performInMemorySort()
+    {
+        if (chunks.empty())
+            return {};
+        
+        /// Merge all chunks into single block
+        auto merged_block = mergeChunks(chunks);
+        
+        /// Sort the merged block
+        sortBlock(merged_block, sort_description, limit);
+        
+        return Chunk(merged_block.getColumns(), merged_block.rows());
+    }
+    
+    Block mergeChunks(const std::vector<Chunk> & chunks_to_merge)
+    {
+        /// Implementation would efficiently merge chunks
+        /// This is a simplified placeholder
+        Block result;
+        return result;
+    }
+    
+    void sortBlock(Block & block, const SortDescription & description, UInt64 limit_rows)
+    {
+        /// Implementation would use optimized sorting algorithms
+        /// Including partial sort for limited results
+    }
+};
+```
+
+The SortingTransform processor automatically switches between in-memory and external sorting based on memory consumption. For small datasets, it uses optimized in-memory algorithms with SIMD acceleration. For larger datasets, it implements a sophisticated external merge sort that minimizes I/O overhead while maintaining optimal performance.
+
+This comprehensive processor architecture provides ClickHouse with the flexibility and performance needed to handle diverse analytical workloads efficiently. Each processor type is optimized for its specific role while maintaining compatibility with the overall execution framework.
+
+## 3.4 Pipeline Graph Construction (3,000 words)
+
+The QueryPipelineBuilder represents the sophisticated orchestration layer that transforms logical query plans into executable processor graphs. This component bridges the gap between high-level query semantics and low-level execution mechanics, implementing complex optimization strategies while maintaining the flexibility to handle diverse query patterns efficiently.
+
+### QueryPipelineBuilder Architecture
+
+The QueryPipelineBuilder operates as a stateful factory that incrementally constructs processor graphs by translating QueryPlan steps into interconnected processor networks. Its design emphasizes modularity, allowing different query operations to contribute processors independently while maintaining global coherence.
+
+```cpp
+class QueryPipelineBuilder
+{
+private:
+    /// Pipeline state
+    Processors processors;                    /// All processors in the pipeline
+    std::vector<OutputPort *> current_outputs; /// Current output ports
+    Block current_header;                     /// Current data schema
+    
+    /// Optimization state
+    std::map<String, ProcessorPtr> processor_cache; /// Reusable processors
+    std::vector<ProcessorPtr> detached_processors;  /// Standalone processors
+    
+    /// Resource management
+    size_t max_threads;                       /// Thread limit
+    size_t max_memory_usage;                  /// Memory limit
+    ProcessorSchedulingPolicy scheduling_policy; /// Execution strategy
+    
+public:
+    QueryPipelineBuilder() = default;
+    
+    /// Initialize with data source
+    void init(Pipe pipe)
+    {
+        processors = std::move(pipe.processors);
+        current_outputs = std::move(pipe.output_ports);
+        current_header = std::move(pipe.header);
+        
+        validatePipelineConsistency();
+    }
+    
+    /// Add transformation step
+    void addTransform(ProcessorPtr processor)
+    {
+        if (current_outputs.empty())
+            throw Exception("Cannot add transform to empty pipeline");
+        
+        connectProcessorInputs(processor.get(), current_outputs);
+        
+        /// Update current state
+        current_outputs.clear();
+        for (auto & output : processor->getOutputs())
+            current_outputs.push_back(&output);
+        
+        current_header = processor->getOutputs().front().getHeader();
+        processors.push_back(std::move(processor));
+        
+        validatePipelineConsistency();
+    }
+    
+    /// Add parallel transformation
+    void addParallelTransform(ProcessorPtr processor_template, size_t num_streams)
+    {
+        if (current_outputs.size() != num_streams)
+            throw Exception("Stream count mismatch for parallel transform");
+        
+        std::vector<ProcessorPtr> parallel_processors;
+        std::vector<OutputPort *> new_outputs;
+        
+        for (size_t i = 0; i < num_streams; ++i)
+        {
+            auto processor = processor_template->clone();
+            
+            /// Connect input
+            processor->getInputs().front().connect(*current_outputs[i]);
+            
+            /// Collect output
+            new_outputs.push_back(&processor->getOutputs().front());
+            
+            parallel_processors.push_back(std::move(processor));
+        }
+        
+        /// Update pipeline state
+        processors.insert(processors.end(), 
+                         parallel_processors.begin(), 
+                         parallel_processors.end());
+        
+        current_outputs = std::move(new_outputs);
+        
+        validatePipelineConsistency();
+    }
+    
+    /// Resize pipeline streams
+    void resize(size_t num_streams)
+    {
+        if (current_outputs.size() == num_streams)
+            return;
+        
+        if (current_outputs.size() < num_streams)
+        {
+            /// Split existing streams
+            expandStreams(num_streams);
+        }
+        else
+        {
+            /// Merge streams
+            mergeStreams(num_streams);
+        }
+        
+        validatePipelineConsistency();
+    }
+    
+    /// Build final pipeline
+    QueryPipeline build()
+    {
+        if (processors.empty())
+            throw Exception("Cannot build empty pipeline");
+        
+        /// Optimize processor graph
+        optimizeProcessorGraph();
+        
+        /// Assign processor IDs and validate
+        assignProcessorIds();
+        validateFinalPipeline();
+        
+        return QueryPipeline(std::move(processors), 
+                           std::move(current_outputs),
+                           std::move(current_header));
+    }
+    
+private:
+    void connectProcessorInputs(IProcessor * processor, 
+                               const std::vector<OutputPort *> & outputs)
+    {
+        auto & inputs = processor->getInputs();
+        
+        if (inputs.size() != outputs.size())
+            throw Exception("Input/output port count mismatch");
+        
+        auto input_it = inputs.begin();
+        for (auto * output : outputs)
+        {
+            input_it->connect(*output);
+            ++input_it;
+        }
+    }
+    
+    void expandStreams(size_t target_streams)
+    {
+        /// Implementation depends on current processor types
+        /// May use ResizeProcessor or parallel duplication
+        
+        std::vector<ProcessorPtr> resize_processors;
+        std::vector<OutputPort *> new_outputs;
+        
+        for (auto * current_output : current_outputs)
+        {
+            auto resize_processor = std::make_shared<ResizeProcessor>(
+                current_output->getHeader(), 
+                1, /// input streams
+                target_streams / current_outputs.size() /// output streams per input
+            );
+            
+            resize_processor->getInputs().front().connect(*current_output);
+            
+            for (auto & output : resize_processor->getOutputs())
+                new_outputs.push_back(&output);
+            
+            resize_processors.push_back(std::move(resize_processor));
+        }
+        
+        processors.insert(processors.end(), 
+                         resize_processors.begin(), 
+                         resize_processors.end());
+        
+        current_outputs = std::move(new_outputs);
+    }
+    
+    void mergeStreams(size_t target_streams)
+    {
+        /// Use UnionProcessor to merge streams
+        auto union_processor = std::make_shared<UnionProcessor>(
+            current_header, current_outputs.size(), target_streams);
+        
+        /// Connect all current outputs to union processor
+        auto input_it = union_processor->getInputs().begin();
+        for (auto * output : current_outputs)
+        {
+            input_it->connect(*output);
+            ++input_it;
+        }
+        
+        /// Update current state
+        current_outputs.clear();
+        for (auto & output : union_processor->getOutputs())
+            current_outputs.push_back(&output);
+        
+        processors.push_back(std::move(union_processor));
+    }
+    
+    void optimizeProcessorGraph()
+    {
+        /// Apply various optimization passes
+        eliminateRedundantProcessors();
+        fuseCompatibleProcessors();
+        optimizeMemoryUsage();
+        balanceProcessorLoad();
+    }
+    
+    void eliminateRedundantProcessors()
+    {
+        /// Remove processors that don't modify data
+        std::vector<ProcessorPtr> optimized_processors;
+        
+        for (auto & processor : processors)
+        {
+            if (isRedundantProcessor(processor.get()))
+            {
+                bypassProcessor(processor.get());
+            }
+            else
+            {
+                optimized_processors.push_back(processor);
+            }
+        }
+        
+        processors = std::move(optimized_processors);
+    }
+    
+    void fuseCompatibleProcessors()
+    {
+        /// Combine adjacent processors when beneficial
+        /// Example: FilterTransform + ExpressionTransform -> FilterExpressionTransform
+        
+        bool changes_made = true;
+        while (changes_made)
+        {
+            changes_made = false;
+            
+            for (size_t i = 0; i < processors.size() - 1; ++i)
+            {
+                auto & current = processors[i];
+                auto & next = processors[i + 1];
+                
+                if (canFuseProcessors(current.get(), next.get()))
+                {
+                    auto fused = fuseProcessors(current.get(), next.get());
+                    
+                    /// Replace both processors with fused version
+                    processors[i] = fused;
+                    processors.erase(processors.begin() + i + 1);
+                    
+                    changes_made = true;
+                    break;
+                }
+            }
+        }
+    }
+    
+    bool isRedundantProcessor(IProcessor * processor)
+    {
+        /// Check if processor is a no-op
+        return processor->getName() == "NullTransform" ||
+               (processor->getName() == "ExpressionTransform" && 
+                hasNoEffectiveOperations(processor));
+    }
+    
+    void bypassProcessor(IProcessor * processor)
+    {
+        /// Connect processor inputs directly to outputs
+        auto & inputs = processor->getInputs();
+        auto & outputs = processor->getOutputs();
+        
+        if (inputs.size() != outputs.size())
+            return; /// Cannot bypass
+        
+        auto input_it = inputs.begin();
+        auto output_it = outputs.begin();
+        
+        while (input_it != inputs.end())
+        {
+            /// Find upstream processor
+            auto * upstream_output = input_it->getConnectedOutput();
+            if (upstream_output)
+            {
+                /// Reconnect to downstream
+                for (auto * downstream_input : output_it->getConnectedInputs())
+                {
+                    downstream_input->connect(*upstream_output);
+                }
+            }
+            
+            ++input_it;
+            ++output_it;
+        }
+    }
+    
+    bool canFuseProcessors(IProcessor * first, IProcessor * second)
+    {
+        /// Check if processors can be combined
+        if (first->getOutputs().size() != 1 || second->getInputs().size() != 1)
+            return false;
+        
+        /// Check if they're directly connected
+        auto & first_output = first->getOutputs().front();
+        auto & second_input = second->getInputs().front();
+        
+        if (&first_output != second_input.getConnectedOutput())
+            return false;
+        
+        /// Check if fusion is beneficial
+        return isFusionBeneficial(first, second);
+    }
+    
+    ProcessorPtr fuseProcessors(IProcessor * first, IProcessor * second)
+    {
+        /// Create fused processor based on types
+        if (first->getName() == "FilterTransform" && 
+            second->getName() == "ExpressionTransform")
+        {
+            return createFilterExpressionProcessor(first, second);
+        }
+        
+        /// Add more fusion patterns as needed
+        return nullptr;
+    }
+    
+    void validatePipelineConsistency()
+    {
+        /// Verify all processors are properly connected
+        for (auto & processor : processors)
+        {
+            validateProcessorConnections(processor.get());
+        }
+        
+        /// Verify header consistency
+        if (!current_outputs.empty())
+        {
+            auto expected_header = current_outputs.front()->getHeader();
+            for (auto * output : current_outputs)
+            {
+                if (!output->getHeader().isCompatibleWith(expected_header))
+                    throw Exception("Header mismatch in pipeline");
+            }
+        }
+    }
+    
+    void validateProcessorConnections(IProcessor * processor)
+    {
+        /// Check input connections
+        for (auto & input : processor->getInputs())
+        {
+            if (!input.isConnected())
+                throw Exception("Unconnected input port in processor");
+        }
+        
+        /// Check output connections for non-sink processors
+        if (!processor->getOutputs().empty())
+        {
+            bool has_connected_output = false;
+            for (auto & output : processor->getOutputs())
+            {
+                if (output.isConnected())
+                {
+                    has_connected_output = true;
+                    break;
+                }
+            }
+            
+            if (!has_connected_output && !isSinkProcessor(processor))
+                throw Exception("No connected outputs in non-sink processor");
+        }
+    }
+};
+```
+
+### Logical to Physical Translation
+
+The QueryPipelineBuilder implements a sophisticated translation mechanism that converts logical query plan steps into physical processor networks. This translation process considers both the semantic requirements of each operation and the physical constraints of the execution environment.
+
+**Step-by-Step Translation Process**: Each QueryPlan step corresponds to a specific pattern of processor creation and connection. The builder maintains a registry of step translators that encapsulate the knowledge of how to convert logical operations into processor graphs.
+
+```cpp
+class StepTranslator
+{
+public:
+    virtual ~StepTranslator() = default;
+    
+    /// Translate step into processors
+    virtual void translateStep(const QueryPlanStep & step, 
+                              QueryPipelineBuilder & builder) = 0;
+    
+    /// Check if step can be translated
+    virtual bool canTranslate(const QueryPlanStep & step) const = 0;
+    
+    /// Get resource requirements
+    virtual ResourceRequirements getResourceRequirements(
+        const QueryPlanStep & step) const = 0;
+};
+
+class FilterStepTranslator : public StepTranslator
+{
+public:
+    void translateStep(const QueryPlanStep & step, 
+                      QueryPipelineBuilder & builder) override
+    {
+        auto & filter_step = static_cast<const FilterStep &>(step);
+        
+        /// Create filter processor
+        auto filter_processor = std::make_shared<FilterTransform>(
+            builder.getCurrentHeader(),
+            filter_step.getFilterExpression(),
+            filter_step.getFilterColumnName(),
+            filter_step.shouldRemoveFilterColumn()
+        );
+        
+        /// Add to pipeline
+        builder.addTransform(filter_processor);
+    }
+    
+    bool canTranslate(const QueryPlanStep & step) const override
+    {
+        return step.getStepType() == QueryPlanStep::Type::Filter;
+    }
+    
+    ResourceRequirements getResourceRequirements(
+        const QueryPlanStep & step) const override
+    {
+        /// Filter operations are typically CPU-bound
+        return ResourceRequirements{
+            .cpu_weight = 1.0,
+            .memory_weight = 0.1,
+            .io_weight = 0.0
+        };
+    }
+};
+```
+
+**Parallelization Strategy**: The builder automatically determines optimal parallelization strategies based on step characteristics, data volume, and system resources. It implements several parallelization patterns:
+
+1. **Data Parallelism**: Operations that can process different data chunks independently
+2. **Pipeline Parallelism**: Operations that can overlap execution stages
+3. **Hybrid Parallelism**: Combinations of data and pipeline parallelism
+
+### Resource Management and Optimization
+
+The QueryPipelineBuilder incorporates sophisticated resource management that considers memory constraints, CPU availability, and I/O bandwidth when constructing processor graphs.
+
+**Memory-Aware Construction**: The builder tracks memory requirements for each processor and implements strategies to minimize peak memory usage:
+
+```cpp
+class MemoryAwareBuilder
+{
+private:
+    size_t max_memory_limit;
+    size_t current_memory_estimate;
+    std::map<ProcessorPtr, size_t> processor_memory_usage;
+    
+public:
+    void addProcessorWithMemoryCheck(ProcessorPtr processor)
+    {
+        auto memory_requirement = estimateProcessorMemory(processor.get());
+        
+        if (current_memory_estimate + memory_requirement > max_memory_limit)
+        {
+            /// Apply memory optimization strategies
+            optimizeMemoryUsage();
+            
+            /// Recheck after optimization
+            if (current_memory_estimate + memory_requirement > max_memory_limit)
+            {
+                /// Switch to external processing or streaming
+                convertToExternalProcessing(processor);
+            }
+        }
+        
+        processor_memory_usage[processor] = memory_requirement;
+        current_memory_estimate += memory_requirement;
+    }
+    
+private:
+    size_t estimateProcessorMemory(IProcessor * processor)
+    {
+        /// Estimate based on processor type and input characteristics
+        if (auto * sort_processor = dynamic_cast<SortingTransform *>(processor))
+        {
+            return estimateSortMemory(sort_processor);
+        }
+        else if (auto * agg_processor = dynamic_cast<AggregatingTransform *>(processor))
+        {
+            return estimateAggregationMemory(agg_processor);
+        }
+        else
+        {
+            /// Default estimate for transform processors
+            return estimateTransformMemory(processor);
+        }
+    }
+    
+    void optimizeMemoryUsage()
+    {
+        /// Apply various memory optimization strategies
+        eliminateRedundantBuffering();
+        enableStreamingProcessing();
+        adjustChunkSizes();
+    }
+    
+    void convertToExternalProcessing(ProcessorPtr & processor)
+    {
+        /// Convert memory-intensive processors to external variants
+        if (auto * sort_processor = dynamic_cast<SortingTransform *>(processor.get()))
+        {
+            auto external_sort = std::make_shared<ExternalSortingTransform>(
+                sort_processor->getInputHeader(),
+                sort_processor->getSortDescription(),
+                max_memory_limit / 4 /// Use quarter of available memory
+            );
+            
+            processor = external_sort;
+        }
+    }
+};
+```
+
+**CPU Affinity and NUMA Awareness**: The builder considers system topology when assigning processors to execution threads, implementing NUMA-aware scheduling that minimizes memory access latency:
+
+```cpp
+class NUMAAwareBuilder
+{
+private:
+    std::vector<CPUSet> numa_nodes;
+    std::map<ProcessorPtr, size_t> processor_numa_affinity;
+    
+public:
+    void assignNUMAAffinities()
+    {
+        /// Analyze processor memory access patterns
+        analyzeMemoryAccessPatterns();
+        
+        /// Assign processors to NUMA nodes
+        for (auto & processor : processors)
+        {
+            auto optimal_node = findOptimalNUMANode(processor.get());
+            processor_numa_affinity[processor] = optimal_node;
+        }
+    }
+    
+private:
+    size_t findOptimalNUMANode(IProcessor * processor)
+    {
+        /// Consider data locality and processor characteristics
+        if (isMemoryIntensive(processor))
+        {
+            /// Prefer node with most available memory
+            return findNodeWithMostMemory();
+        }
+        else if (isCPUIntensive(processor))
+        {
+            /// Prefer node with most available CPU
+            return findNodeWithMostCPU();
+        }
+        else
+        {
+            /// Use load balancing
+            return findLeastLoadedNode();
+        }
+    }
+};
+```
+
+### Advanced Pipeline Patterns
+
+The QueryPipelineBuilder supports sophisticated pipeline patterns that enable efficient execution of complex queries:
+
+**Pipeline Fusion**: Adjacent processors with compatible interfaces can be fused into single processors that eliminate intermediate data materialization:
+
+```cpp
+class PipelineFusion
+{
+public:
+    static ProcessorPtr fuseFilterAndExpression(
+        FilterTransform * filter, 
+        ExpressionTransform * expression)
+    {
+        /// Create combined processor that applies filter and expression together
+        auto combined_actions = combineExpressionActions(
+            filter->getFilterExpression(),
+            expression->getExpression()
+        );
+        
+        return std::make_shared<FilterExpressionTransform>(
+            filter->getInputHeader(),
+            combined_actions,
+            filter->getFilterColumnName(),
+            filter->shouldRemoveFilterColumn()
+        );
+    }
+    
+    static ProcessorPtr fuseAggregationStages(
+        AggregatingTransform * partial_agg,
+        MergingAggregatedTransform * final_agg)
+    {
+        /// Create single processor that performs both partial and final aggregation
+        return std::make_shared<TwoStageAggregatingTransform>(
+            partial_agg->getInputHeader(),
+            partial_agg->getAggregatingParams(),
+            final_agg->getMergingParams()
+        );
+    }
+};
+```
+
+**Adaptive Parallelization**: The builder can dynamically adjust parallelization based on runtime characteristics:
+
+```cpp
+class AdaptiveParallelization
+{
+private:
+    std::atomic<size_t> current_parallelism{1};
+    std::atomic<double> cpu_utilization{0.0};
+    std::atomic<double> memory_pressure{0.0};
+    
+public:
+    void adjustParallelization()
+    {
+        auto new_parallelism = calculateOptimalParallelism();
+        
+        if (new_parallelism != current_parallelism.load())
+        {
+            reshapeProcessorGraph(new_parallelism);
+            current_parallelism = new_parallelism;
+        }
+    }
+    
+private:
+    size_t calculateOptimalParallelism()
+    {
+        /// Consider system resources and query characteristics
+        auto cpu_factor = std::min(2.0, 1.0 / std::max(0.1, cpu_utilization.load()));
+        auto memory_factor = std::min(2.0, 1.0 / std::max(0.1, memory_pressure.load()));
+        
+        auto optimal = static_cast<size_t>(
+            current_parallelism.load() * cpu_factor * memory_factor
+        );
+        
+        return std::clamp(optimal, 1UL, std::thread::hardware_concurrency());
+    }
+    
+    void reshapeProcessorGraph(size_t new_parallelism)
+    {
+        /// Dynamically adjust processor graph structure
+        /// This is a complex operation that requires careful coordination
+    }
+};
+```
+
+This sophisticated pipeline construction system enables ClickHouse to automatically generate highly optimized execution plans that adapt to both query characteristics and system resources, providing the foundation for efficient analytical query processing across diverse workloads and hardware configurations.
+
+## 3.5 Parallelism and Resource Allocation (3,000 words)
+
+ClickHouse's execution engine implements sophisticated parallelism and resource allocation strategies that maximize hardware utilization while maintaining query performance and system stability. The system employs multiple levels of parallelism, from fine-grained processor-level concurrency to coarse-grained pipeline-level parallelization, all orchestrated through intelligent resource management algorithms.
+
+### Thread Allocation Strategies
+
+The thread allocation system operates on multiple levels, considering both global system resources and query-specific requirements. The allocation strategy balances competing demands for CPU cores, memory bandwidth, and I/O channels while avoiding resource contention and maintaining predictable performance.
+
+**Dynamic Thread Pool Management**: ClickHouse employs a sophisticated thread pool architecture that adapts to workload characteristics and system conditions:
+
+```cpp
+class QueryThreadPool
+{
+private:
+    /// Thread pool configuration
+    size_t min_threads;
+    size_t max_threads;
+    size_t current_threads;
+    
+    /// Thread management
+    std::vector<std::thread> worker_threads;
+    std::queue<TaskPtr> task_queue;
+    std::mutex queue_mutex;
+    std::condition_variable queue_condition;
+    
+    /// Resource tracking
+    std::atomic<size_t> active_tasks{0};
+    std::atomic<size_t> pending_tasks{0};
+    std::atomic<double> cpu_utilization{0.0};
+    std::atomic<size_t> memory_usage{0};
+    
+    /// NUMA awareness
+    std::vector<CPUSet> numa_nodes;
+    std::map<std::thread::id, size_t> thread_numa_affinity;
+    
+public:
+    QueryThreadPool(size_t min_threads_, size_t max_threads_)
+        : min_threads(min_threads_), max_threads(max_threads_)
+    {
+        initializeNUMATopology();
+        createInitialThreads();
+    }
+    
+    /// Submit task for execution
+    void submitTask(TaskPtr task)
+    {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            task_queue.push(task);
+            pending_tasks++;
+        }
+        
+        queue_condition.notify_one();
+        
+        /// Check if we need more threads
+        if (shouldExpandThreadPool())
+        {
+            expandThreadPool();
+        }
+    }
+    
+    /// Get optimal thread count for query
+    size_t getOptimalThreadCount(const QueryContext & context)
+    {
+        /// Consider query characteristics
+        auto query_complexity = analyzeQueryComplexity(context);
+        auto memory_requirements = estimateMemoryRequirements(context);
+        
+        /// Consider system resources
+        auto available_cores = getAvailableCores();
+        auto available_memory = getAvailableMemory();
+        
+        /// Calculate optimal thread count
+        size_t cpu_based_threads = std::min(
+            static_cast<size_t>(query_complexity * available_cores),
+            available_cores
+        );
+        
+        size_t memory_based_threads = available_memory / memory_requirements;
+        
+        return std::min({cpu_based_threads, memory_based_threads, max_threads});
+    }
+    
+private:
+    void initializeNUMATopology()
+    {
+        /// Detect NUMA nodes and CPU topology
+        auto numa_node_count = numa_num_configured_nodes();
+        numa_nodes.resize(numa_node_count);
+        
+        for (size_t node = 0; node < numa_node_count; ++node)
+        {
+            auto cpu_mask = numa_allocate_cpumask();
+            numa_node_to_cpus(node, cpu_mask);
+            
+            for (size_t cpu = 0; cpu < numa_num_configured_cpus(); ++cpu)
+            {
+                if (numa_bitmask_isbitset(cpu_mask, cpu))
+                {
+                    numa_nodes[node].insert(cpu);
+                }
+            }
+            
+            numa_free_cpumask(cpu_mask);
+        }
+    }
+    
+    void createInitialThreads()
+    {
+        for (size_t i = 0; i < min_threads; ++i)
+        {
+            createWorkerThread(i % numa_nodes.size());
+        }
+        current_threads = min_threads;
+    }
+    
+    void createWorkerThread(size_t preferred_numa_node)
+    {
+        worker_threads.emplace_back([this, preferred_numa_node]() {
+            /// Set NUMA affinity
+            setThreadNUMAAffinity(preferred_numa_node);
+            
+            /// Main worker loop
+            while (true)
+            {
+                TaskPtr task;
+                
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex);
+                    queue_condition.wait(lock, [this] { 
+                        return !task_queue.empty() || should_shutdown; 
+                    });
+                    
+                    if (should_shutdown && task_queue.empty())
+                        break;
+                    
+                    task = task_queue.front();
+                    task_queue.pop();
+                    pending_tasks--;
+                    active_tasks++;
+                }
+                
+                /// Execute task
+                executeTask(task);
+                active_tasks--;
+            }
+        });
+        
+        /// Store NUMA affinity for this thread
+        thread_numa_affinity[worker_threads.back().get_id()] = preferred_numa_node;
+    }
+    
+    bool shouldExpandThreadPool()
+    {
+        /// Expand if we have pending tasks and available resources
+        return pending_tasks > 0 && 
+               current_threads < max_threads &&
+               cpu_utilization < 0.8 &&
+               memory_usage < getMemoryLimit() * 0.7;
+    }
+    
+    void expandThreadPool()
+    {
+        if (current_threads >= max_threads)
+            return;
+        
+        /// Find NUMA node with least loaded threads
+        auto target_numa_node = findLeastLoadedNUMANode();
+        
+        createWorkerThread(target_numa_node);
+        current_threads++;
+    }
+    
+    size_t findLeastLoadedNUMANode()
+    {
+        std::vector<size_t> numa_thread_counts(numa_nodes.size(), 0);
+        
+        for (const auto & [thread_id, numa_node] : thread_numa_affinity)
+        {
+            numa_thread_counts[numa_node]++;
+        }
+        
+        return std::min_element(numa_thread_counts.begin(), 
+                               numa_thread_counts.end()) - 
+               numa_thread_counts.begin();
+    }
+    
+    void setThreadNUMAAffinity(size_t numa_node)
+    {
+        if (numa_node >= numa_nodes.size())
+            return;
+        
+        cpu_set_t cpu_set;
+        CPU_ZERO(&cpu_set);
+        
+        for (auto cpu : numa_nodes[numa_node])
+        {
+            CPU_SET(cpu, &cpu_set);
+        }
+        
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set), &cpu_set);
+    }
+};
+```
+
+**Processor-Level Parallelism**: Individual processors can leverage internal parallelism through vectorization, multi-threading, and specialized algorithms:
+
+```cpp
+class ParallelAggregatingTransform : public IProcessor
+{
+private:
+    /// Aggregation parameters
+    AggregatingParams params;
+    size_t num_threads;
+    
+    /// Parallel aggregation state
+    std::vector<std::unique_ptr<Aggregator>> aggregators;
+    std::vector<std::thread> aggregation_threads;
+    ThreadPool thread_pool;
+    
+    /// Synchronization
+    std::mutex result_mutex;
+    std::condition_variable completion_signal;
+    std::atomic<size_t> completed_threads{0};
+    
+public:
+    ParallelAggregatingTransform(const Block & header_, 
+                                const AggregatingParams & params_,
+                                size_t num_threads_)
+        : params(params_), num_threads(num_threads_)
+    {
+        addInputPort(header_);
+        addOutputPort(params.getHeader(header_));
+        
+        /// Create per-thread aggregators
+        for (size_t i = 0; i < num_threads; ++i)
+        {
+            aggregators.emplace_back(std::make_unique<Aggregator>(params));
+        }
+    }
+    
+    void work() override
+    {
+        auto & input = getInputs().front();
+        auto & output = getOutputs().front();
+        
+        auto chunk = input.pull();
+        if (chunk.empty())
+        {
+            /// Finalize aggregation
+            finalizeAggregation();
+            return;
+        }
+        
+        /// Distribute chunk across threads
+        distributeChunkForAggregation(chunk);
+    }
+    
+private:
+    void distributeChunkForAggregation(const Chunk & chunk)
+    {
+        /// Partition chunk by aggregation key hash
+        auto partitioned_chunks = partitionChunkByHash(chunk, num_threads);
+        
+        /// Submit aggregation tasks
+        for (size_t i = 0; i < num_threads; ++i)
+        {
+            if (!partitioned_chunks[i].empty())
+            {
+                thread_pool.submitTask([this, i, chunk = std::move(partitioned_chunks[i])]() {
+                    aggregators[i]->executeOnChunk(chunk);
+                });
+            }
+        }
+    }
+    
+    void finalizeAggregation()
+    {
+        /// Wait for all aggregation threads to complete
+        thread_pool.waitForAllTasks();
+        
+        /// Merge aggregation results
+        auto merged_result = mergeAggregationResults();
+        
+        /// Output final result
+        auto & output = getOutputs().front();
+        output.push(std::move(merged_result));
+    }
+    
+    std::vector<Chunk> partitionChunkByHash(const Chunk & chunk, size_t num_partitions)
+    {
+        std::vector<Chunk> partitions(num_partitions);
+        
+        /// Get key columns for hashing
+        auto key_columns = extractKeyColumns(chunk);
+        
+        /// Calculate hash for each row
+        std::vector<size_t> row_hashes(chunk.getNumRows());
+        for (size_t row = 0; row < chunk.getNumRows(); ++row)
+        {
+            row_hashes[row] = calculateRowHash(key_columns, row) % num_partitions;
+        }
+        
+        /// Distribute rows to partitions
+        for (size_t partition = 0; partition < num_partitions; ++partition)
+        {
+            std::vector<size_t> partition_rows;
+            for (size_t row = 0; row < chunk.getNumRows(); ++row)
+            {
+                if (row_hashes[row] == partition)
+                {
+                    partition_rows.push_back(row);
+                }
+            }
+            
+            if (!partition_rows.empty())
+            {
+                partitions[partition] = extractRowsFromChunk(chunk, partition_rows);
+            }
+        }
+        
+        return partitions;
+    }
+    
+    Chunk mergeAggregationResults()
+    {
+        /// Merge results from all aggregators
+        std::vector<BlocksList> aggregated_blocks;
+        
+        for (auto & aggregator : aggregators)
+        {
+            auto blocks = aggregator->convertToBlocks();
+            aggregated_blocks.push_back(std::move(blocks));
+        }
+        
+        /// Merge blocks using final aggregation
+        auto final_aggregator = std::make_unique<Aggregator>(params);
+        
+        for (auto & blocks : aggregated_blocks)
+        {
+            for (auto & block : blocks)
+            {
+                final_aggregator->mergeOnBlock(block);
+            }
+        }
+        
+        auto result_blocks = final_aggregator->convertToBlocks();
+        return mergeBlocksIntoChunk(result_blocks);
+    }
+};
+```
+
+### NUMA Awareness and Memory Locality
+
+ClickHouse implements comprehensive NUMA (Non-Uniform Memory Access) awareness to optimize memory access patterns and minimize cross-node memory traffic. This is particularly important for large-scale analytical workloads that process massive datasets.
+
+**NUMA-Aware Memory Allocation**: The system includes specialized memory allocators that consider NUMA topology when allocating memory for processors and data structures:
+
+```cpp
+class NUMAAwareAllocator
+{
+private:
+    struct NUMANode
+    {
+        size_t node_id;
+        size_t available_memory;
+        size_t allocated_memory;
+        std::vector<size_t> cpu_cores;
+        std::unique_ptr<MemoryPool> memory_pool;
+    };
+    
+    std::vector<NUMANode> numa_nodes;
+    std::map<std::thread::id, size_t> thread_numa_mapping;
+    
+public:
+    NUMAAwareAllocator()
+    {
+        initializeNUMANodes();
+    }
+    
+    /// Allocate memory on optimal NUMA node
+    void * allocate(size_t size, size_t alignment = 0)
+    {
+        auto optimal_node = findOptimalNUMANode(size);
+        return allocateOnNode(optimal_node, size, alignment);
+    }
+    
+    /// Allocate memory on specific NUMA node
+    void * allocateOnNode(size_t node_id, size_t size, size_t alignment = 0)
+    {
+        if (node_id >= numa_nodes.size())
+            return nullptr;
+        
+        auto & node = numa_nodes[node_id];
+        
+        /// Check if node has sufficient memory
+        if (node.available_memory < size)
+        {
+            /// Try to free some memory or use another node
+            if (!tryFreeMemoryOnNode(node_id, size))
+            {
+                return allocateOnAlternativeNode(size, alignment);
+            }
+        }
+        
+        /// Allocate using node-specific memory pool
+        void * ptr = node.memory_pool->allocate(size, alignment);
+        if (ptr)
+        {
+            node.allocated_memory += size;
+            node.available_memory -= size;
+        }
+        
+        return ptr;
+    }
+    
+    /// Get optimal NUMA node for current thread
+    size_t getCurrentThreadNUMANode()
+    {
+        auto thread_id = std::this_thread::get_id();
+        auto it = thread_numa_mapping.find(thread_id);
+        
+        if (it != thread_numa_mapping.end())
+        {
+            return it->second;
+        }
+        
+        /// Determine node based on CPU affinity
+        auto node_id = detectCurrentNUMANode();
+        thread_numa_mapping[thread_id] = node_id;
+        return node_id;
+    }
+    
+private:
+    void initializeNUMANodes()
+    {
+        auto num_nodes = numa_num_configured_nodes();
+        numa_nodes.resize(num_nodes);
+        
+        for (size_t node = 0; node < num_nodes; ++node)
+        {
+            numa_nodes[node].node_id = node;
+            numa_nodes[node].available_memory = numa_node_size64(node, nullptr);
+            numa_nodes[node].allocated_memory = 0;
+            
+            /// Get CPU cores for this node
+            auto cpu_mask = numa_allocate_cpumask();
+            numa_node_to_cpus(node, cpu_mask);
+            
+            for (size_t cpu = 0; cpu < numa_num_configured_cpus(); ++cpu)
+            {
+                if (numa_bitmask_isbitset(cpu_mask, cpu))
+                {
+                    numa_nodes[node].cpu_cores.push_back(cpu);
+                }
+            }
+            
+            numa_free_cpumask(cpu_mask);
+            
+            /// Create node-specific memory pool
+            numa_nodes[node].memory_pool = std::make_unique<MemoryPool>(
+                numa_nodes[node].available_memory / 2 /// Reserve half for OS
+            );
+        }
+    }
+    
+    size_t findOptimalNUMANode(size_t size)
+    {
+        /// Prefer current thread's NUMA node
+        auto current_node = getCurrentThreadNUMANode();
+        if (numa_nodes[current_node].available_memory >= size)
+        {
+            return current_node;
+        }
+        
+        /// Find node with most available memory
+        size_t best_node = 0;
+        size_t max_available = 0;
+        
+        for (size_t node = 0; node < numa_nodes.size(); ++node)
+        {
+            if (numa_nodes[node].available_memory > max_available)
+            {
+                max_available = numa_nodes[node].available_memory;
+                best_node = node;
+            }
+        }
+        
+        return best_node;
+    }
+    
+    size_t detectCurrentNUMANode()
+    {
+        /// Get current CPU
+        auto cpu = sched_getcpu();
+        
+        /// Find which NUMA node contains this CPU
+        for (size_t node = 0; node < numa_nodes.size(); ++node)
+        {
+            auto & cores = numa_nodes[node].cpu_cores;
+            if (std::find(cores.begin(), cores.end(), cpu) != cores.end())
+            {
+                return node;
+            }
+        }
+        
+        return 0; /// Default to node 0
+    }
+};
+```
+
+### Memory Management in Parallel Execution
+
+Parallel execution introduces complex memory management challenges, including coordinating memory usage across multiple threads, preventing memory fragmentation, and maintaining optimal cache locality.
+
+**Shared Memory Pools**: ClickHouse implements sophisticated shared memory pool systems that enable efficient memory sharing between processors while maintaining thread safety:
+
+```cpp
+class SharedMemoryPool
+{
+private:
+    /// Memory pool segments
+    struct MemorySegment
+    {
+        void * base_ptr;
+        size_t size;
+        std::atomic<size_t> allocated_bytes{0};
+        std::atomic<size_t> reference_count{0};
+        std::mutex allocation_mutex;
+        
+        /// Free block management
+        std::set<std::pair<size_t, size_t>> free_blocks; /// {offset, size}
+        
+        bool canAllocate(size_t requested_size) const
+        {
+            return allocated_bytes.load() + requested_size <= size;
+        }
+        
+        void * allocate(size_t size, size_t alignment)
+        {
+            std::lock_guard<std::mutex> lock(allocation_mutex);
+            
+            /// Find suitable free block
+            auto it = findFreeBlock(size, alignment);
+            if (it == free_blocks.end())
+                return nullptr;
+            
+            auto [offset, block_size] = *it;
+            free_blocks.erase(it);
+            
+            /// Split block if necessary
+            if (block_size > size)
+            {
+                free_blocks.insert({offset + size, block_size - size});
+            }
+            
+            allocated_bytes += size;
+            return static_cast<char *>(base_ptr) + offset;
+        }
+        
+        void deallocate(void * ptr, size_t size)
+        {
+            std::lock_guard<std::mutex> lock(allocation_mutex);
+            
+            auto offset = static_cast<char *>(ptr) - static_cast<char *>(base_ptr);
+            
+            /// Add to free blocks and coalesce
+            coalesceFreeBlocks(offset, size);
+            allocated_bytes -= size;
+        }
+        
+    private:
+        std::set<std::pair<size_t, size_t>>::iterator findFreeBlock(
+            size_t size, size_t alignment)
+        {
+            for (auto it = free_blocks.begin(); it != free_blocks.end(); ++it)
+            {
+                auto [offset, block_size] = *it;
+                
+                /// Check alignment
+                auto aligned_offset = (offset + alignment - 1) & ~(alignment - 1);
+                auto aligned_size = size + (aligned_offset - offset);
+                
+                if (aligned_size <= block_size)
+                {
+                    return it;
+                }
+            }
+            
+            return free_blocks.end();
+        }
+        
+        void coalesceFreeBlocks(size_t offset, size_t size)
+        {
+            /// Find adjacent blocks and merge
+            auto new_block = std::make_pair(offset, size);
+            
+            /// Check for adjacent blocks
+            auto it = free_blocks.lower_bound(new_block);
+            
+            /// Merge with previous block
+            if (it != free_blocks.begin())
+            {
+                auto prev_it = std::prev(it);
+                if (prev_it->first + prev_it->second == offset)
+                {
+                    new_block.first = prev_it->first;
+                    new_block.second += prev_it->second;
+                    free_blocks.erase(prev_it);
+                }
+            }
+            
+            /// Merge with next block
+            if (it != free_blocks.end() && offset + size == it->first)
+            {
+                new_block.second += it->second;
+                free_blocks.erase(it);
+            }
+            
+            free_blocks.insert(new_block);
+        }
+    };
+    
+    std::vector<std::unique_ptr<MemorySegment>> segments;
+    std::mutex segments_mutex;
+    
+public:
+    SharedMemoryPool(size_t initial_size = 1024 * 1024 * 1024) /// 1GB default
+    {
+        createSegment(initial_size);
+    }
+    
+    void * allocate(size_t size, size_t alignment = 8)
+    {
+        /// Try existing segments first
+        for (auto & segment : segments)
+        {
+            if (segment->canAllocate(size))
+            {
+                void * ptr = segment->allocate(size, alignment);
+                if (ptr)
+                {
+                    segment->reference_count++;
+                    return ptr;
+                }
+            }
+        }
+        
+        /// Create new segment if needed
+        {
+            std::lock_guard<std::mutex> lock(segments_mutex);
+            
+            auto new_segment_size = std::max(size * 2, 256 * 1024 * 1024UL);
+            createSegment(new_segment_size);
+            
+            auto & segment = segments.back();
+            void * ptr = segment->allocate(size, alignment);
+            if (ptr)
+            {
+                segment->reference_count++;
+                return ptr;
+            }
+        }
+        
+        return nullptr;
+    }
+    
+    void deallocate(void * ptr, size_t size)
+    {
+        /// Find segment containing this pointer
+        for (auto & segment : segments)
+        {
+            if (ptr >= segment->base_ptr && 
+                ptr < static_cast<char *>(segment->base_ptr) + segment->size)
+            {
+                segment->deallocate(ptr, size);
+                segment->reference_count--;
+                
+                /// Clean up empty segments
+                if (segment->reference_count == 0 && segment->allocated_bytes == 0)
+                {
+                    cleanupSegment(segment.get());
+                }
+                
+                return;
+            }
+        }
+    }
+    
+private:
+    void createSegment(size_t size)
+    {
+        auto segment = std::make_unique<MemorySegment>();
+        segment->base_ptr = aligned_alloc(4096, size); /// Page-aligned
+        segment->size = size;
+        segment->free_blocks.insert({0, size});
+        
+        segments.push_back(std::move(segment));
+    }
+    
+    void cleanupSegment(MemorySegment * segment)
+    {
+        /// Remove from segments list and free memory
+        auto it = std::find_if(segments.begin(), segments.end(),
+            [segment](const auto & seg) { return seg.get() == segment; });
+        
+        if (it != segments.end())
+        {
+            free(segment->base_ptr);
+            segments.erase(it);
+        }
+    }
+};
+```
+
+### Load Balancing and Work Stealing
+
+ClickHouse implements sophisticated load balancing mechanisms that ensure optimal resource utilization across all available processing units. The system employs work-stealing algorithms that dynamically redistribute work from overloaded threads to underutilized ones.
+
+**Dynamic Work Stealing**: The work stealing implementation allows idle threads to steal work from busy threads, maintaining optimal load distribution:
+
+```cpp
+class WorkStealingScheduler
+{
+private:
+    struct WorkQueue
+    {
+        std::deque<TaskPtr> tasks;
+        std::mutex mutex;
+        std::atomic<size_t> steal_attempts{0};
+        std::atomic<size_t> successful_steals{0};
+    };
+    
+    std::vector<std::unique_ptr<WorkQueue>> worker_queues;
+    std::atomic<size_t> global_task_count{0};
+    
+public:
+    WorkStealingScheduler(size_t num_workers)
+    {
+        worker_queues.resize(num_workers);
+        for (size_t i = 0; i < num_workers; ++i)
+        {
+            worker_queues[i] = std::make_unique<WorkQueue>();
+        }
+    }
+    
+    /// Submit task to least loaded queue
+    void submitTask(TaskPtr task)
+    {
+        auto target_queue = findLeastLoadedQueue();
+        
+        {
+            std::lock_guard<std::mutex> lock(worker_queues[target_queue]->mutex);
+            worker_queues[target_queue]->tasks.push_back(task);
+        }
+        
+        global_task_count++;
+    }
+    
+    /// Get next task for worker
+    TaskPtr getNextTask(size_t worker_id)
+    {
+        /// Try local queue first
+        auto task = tryGetLocalTask(worker_id);
+        if (task)
+            return task;
+        
+        /// Try work stealing
+        return tryStealTask(worker_id);
+    }
+    
+private:
+    size_t findLeastLoadedQueue()
+    {
+        size_t min_size = std::numeric_limits<size_t>::max();
+        size_t best_queue = 0;
+        
+        for (size_t i = 0; i < worker_queues.size(); ++i)
+        {
+            std::lock_guard<std::mutex> lock(worker_queues[i]->mutex);
+            if (worker_queues[i]->tasks.size() < min_size)
+            {
+                min_size = worker_queues[i]->tasks.size();
+                best_queue = i;
+            }
+        }
+        
+        return best_queue;
+    }
+    
+    TaskPtr tryGetLocalTask(size_t worker_id)
+    {
+        auto & queue = worker_queues[worker_id];
+        std::lock_guard<std::mutex> lock(queue->mutex);
+        
+        if (queue->tasks.empty())
+            return nullptr;
+        
+        auto task = queue->tasks.front();
+        queue->tasks.pop_front();
+        global_task_count--;
+        
+        return task;
+    }
+    
+    TaskPtr tryStealTask(size_t worker_id)
+    {
+        /// Try to steal from other queues
+        for (size_t attempts = 0; attempts < worker_queues.size(); ++attempts)
+        {
+            auto target_queue = (worker_id + attempts + 1) % worker_queues.size();
+            
+            worker_queues[target_queue]->steal_attempts++;
+            
+            auto task = stealFromQueue(target_queue);
+            if (task)
+            {
+                worker_queues[target_queue]->successful_steals++;
+                return task;
+            }
+        }
+        
+        return nullptr;
+    }
+    
+    TaskPtr stealFromQueue(size_t queue_id)
+    {
+        auto & queue = worker_queues[queue_id];
+        std::lock_guard<std::mutex> lock(queue->mutex);
+        
+        if (queue->tasks.size() <= 1)
+            return nullptr; /// Don't steal last task
+        
+        /// Steal from back to minimize contention
+        auto task = queue->tasks.back();
+        queue->tasks.pop_back();
+        global_task_count--;
+        
+        return task;
+    }
+};
+```
+
+This comprehensive parallelism and resource allocation system enables ClickHouse to efficiently utilize modern multi-core, multi-socket systems while maintaining optimal performance across diverse analytical workloads. The combination of NUMA awareness, intelligent thread allocation, and dynamic load balancing ensures that the system can scale effectively from small single-node deployments to large distributed clusters.
+
+## Phase 3 Summary
+
+Phase 3 has provided a comprehensive exploration of ClickHouse's processor architecture, covering:
+
+1. **IProcessor Interface and Execution Model**: The foundational abstraction that enables flexible, high-performance query execution through a sophisticated state machine and vectorized processing model.
+
+2. **Processor State Machine and Port System**: The communication and synchronization mechanisms that enable efficient data flow between processors while maintaining thread safety and optimal performance.
+
+3. **Core Processor Types**: The specialized processor implementations that handle different aspects of query execution, from data ingestion through complex transformations and aggregations.
+
+4. **Pipeline Graph Construction**: The sophisticated orchestration system that translates logical query plans into optimized processor networks with advanced optimization strategies.
+
+5. **Parallelism and Resource Allocation**: The comprehensive resource management system that maximizes hardware utilization through intelligent thread allocation, NUMA awareness, and dynamic load balancing.
+
+Together, these components form a sophisticated execution engine that can efficiently process complex analytical queries across diverse hardware configurations while maintaining high performance and system stability.
