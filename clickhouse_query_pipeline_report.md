@@ -3215,3 +3215,3176 @@ Phase 1 has provided a comprehensive foundation covering ClickHouse's query pipe
 4. **Pipeline Construction**: Processor architecture, core processor types, pipeline graph construction, and resource allocation with parallelism.
 
 This foundation sets the stage for the deeper technical exploration that will follow in subsequent phases, covering storage engines, distributed execution, memory management, and performance optimization techniques.
+
+---
+
+# Phase 2: Storage Engine Deep Dive (20,000 words)
+
+## 2.1 IStorage Interface and Storage Engine Architecture (4,000 words)
+
+ClickHouse's storage layer is built around a sophisticated abstraction that enables diverse storage engines while maintaining a consistent interface for query execution. At the heart of this architecture lies the `IStorage` interface, which defines the contract between the query processing layer and the underlying storage implementations.
+
+### 2.1.1 IStorage Interface Design
+
+The `IStorage` interface represents one of ClickHouse's most critical abstractions, providing a unified API for all storage engines:
+
+```cpp
+class IStorage : public std::enable_shared_from_this<IStorage>
+{
+public:
+    using StoragePtr = std::shared_ptr<IStorage>;
+    
+    // Core metadata interface
+    virtual String getName() const = 0;
+    virtual String getTableName() const = 0;
+    virtual String getDatabaseName() const = 0;
+    
+    // Schema management
+    virtual StorageInMemoryMetadata getInMemoryMetadata() const = 0;
+    virtual Block getHeader() const = 0;
+    virtual NamesAndTypesList getColumns() const = 0;
+    virtual NamesAndTypesList getVirtuals() const { return {}; }
+    
+    // Query execution interface
+    virtual void read(
+        QueryPlan & query_plan,
+        const Names & column_names,
+        const StorageSnapshotPtr & storage_snapshot,
+        SelectQueryInfo & query_info,
+        ContextPtr context,
+        QueryProcessingStage::Enum processed_stage,
+        size_t max_block_size,
+        size_t num_streams) = 0;
+    
+    virtual SinkToStoragePtr write(
+        const ASTPtr & query,
+        const StorageMetadataPtr & metadata_snapshot,
+        ContextPtr context,
+        bool async_insert = false) = 0;
+    
+    // Transaction and consistency
+    virtual void startup() {}
+    virtual void shutdown() {}
+    virtual void flush() {}
+    
+    // Storage capabilities
+    virtual bool supportsParallelInsert() const { return false; }
+    virtual bool supportsSubcolumns() const { return false; }
+    virtual bool supportsDynamicSubcolumns() const { return false; }
+    virtual bool supportsPrewhere() const { return false; }
+    virtual bool supportsFinal() const { return false; }
+    virtual bool supportsIndexForIn() const { return false; }
+    virtual bool supportsReplication() const { return false; }
+    virtual bool supportsDeduplication() const { return false; }
+    
+    // Optimization hints
+    virtual std::optional<UInt64> totalRows(const Settings & settings) const { return {}; }
+    virtual std::optional<UInt64> totalBytes(const Settings & settings) const { return {}; }
+    
+    // Advanced operations
+    virtual void alter(const AlterCommands & commands, ContextPtr context, 
+                      AlterLockHolder & table_lock_holder) {}
+    virtual void checkAlterIsPossible(const AlterCommands & commands, 
+                                    ContextPtr context) const {}
+    
+    virtual Pipe alterPartition(const ASTPtr & query, const StorageMetadataPtr & metadata_snapshot,
+                               const PartitionCommands & commands, ContextPtr context) { return {}; }
+    
+    // Mutation support
+    virtual void mutate(const MutationCommands & commands, ContextPtr context) {}
+    virtual bool hasMutationsToWaitFor() const { return false; }
+    virtual void waitForMutation(Int64 version, const String & file_name) {}
+    
+protected:
+    mutable std::shared_mutex metadata_mutex;
+    StorageInMemoryMetadata metadata;
+    
+    // Storage identification
+    StorageID storage_id;
+    String relative_data_path;
+    
+    // Engine-specific settings
+    ContextPtr global_context;
+    LoggerPtr log;
+};
+```
+
+### 2.1.2 Storage Engine Registration and Factory Pattern
+
+ClickHouse uses a sophisticated factory pattern to manage storage engine registration and instantiation:
+
+```cpp
+class StorageFactory : private boost::noncopyable
+{
+public:
+    using Creator = std::function<StoragePtr(const StorageFactory::Arguments & args)>;
+    using Features = std::set<String>;
+    
+    struct Arguments
+    {
+        const String & engine_name;
+        ASTs & engine_args;
+        ASTStorage * storage_def;
+        const ASTCreateQuery & query;
+        const String & relative_data_path;
+        const StorageID & table_id;
+        ContextPtr local_context;
+        ContextPtr context;
+        const ColumnsDescription & columns;
+        const ConstraintsDescription & constraints;
+        bool attach;
+        bool has_force_restore_data_flag;
+        const String & comment;
+    };
+    
+    static StorageFactory & instance()
+    {
+        static StorageFactory factory;
+        return factory;
+    }
+    
+    StoragePtr get(const Arguments & arguments) const
+    {
+        auto it = storages.find(arguments.engine_name);
+        if (it == storages.end())
+            throw Exception("Unknown storage engine " + arguments.engine_name, 
+                          ErrorCodes::UNKNOWN_STORAGE);
+        
+        return it->second.creator(arguments);
+    }
+    
+    void registerStorage(const String & name, Creator creator, Features features = {})
+    {
+        if (!storages.emplace(name, StorageInfo{std::move(creator), std::move(features)}).second)
+            throw Exception("Storage engine " + name + " already registered", 
+                          ErrorCodes::LOGICAL_ERROR);
+    }
+    
+    const auto & getAllStorages() const { return storages; }
+    
+    bool isStorageSupported(const String & name) const
+    {
+        return storages.find(name) != storages.end();
+    }
+    
+    Features getStorageFeatures(const String & name) const
+    {
+        auto it = storages.find(name);
+        return it != storages.end() ? it->second.features : Features{};
+    }
+    
+private:
+    struct StorageInfo
+    {
+        Creator creator;
+        Features features;
+    };
+    
+    std::unordered_map<String, StorageInfo> storages;
+};
+
+// Registration macro for storage engines
+#define REGISTER_STORAGE(NAME, CREATOR) \
+    namespace { \
+        class Register##NAME { \
+        public: \
+            Register##NAME() { \
+                StorageFactory::instance().registerStorage(#NAME, CREATOR); \
+            } \
+        }; \
+        static Register##NAME register_##NAME; \
+    }
+```
+
+### 2.1.3 Storage Metadata Management
+
+ClickHouse maintains comprehensive metadata for each storage engine through the `StorageInMemoryMetadata` class:
+
+```cpp
+class StorageInMemoryMetadata
+{
+public:
+    ColumnsDescription columns;
+    IndicesDescription secondary_indices;
+    ConstraintsDescription constraints;
+    ProjectionsDescription projections;
+    
+    // Table properties
+    ASTPtr partition_key;
+    ASTPtr primary_key;
+    ASTPtr order_by;
+    ASTPtr sample_by;
+    ASTPtr ttl_table;
+    
+    // Settings and configuration
+    ASTStorage storage_def;
+    String comment;
+    
+    // Derived metadata
+    KeyDescription partition_key_desc;
+    KeyDescription primary_key_desc;
+    KeyDescription sorting_key_desc;
+    KeyDescription sampling_key_desc;
+    
+    TTLDescription ttl_description;
+    
+public:
+    StorageInMemoryMetadata() = default;
+    StorageInMemoryMetadata(const StorageInMemoryMetadata & other);
+    StorageInMemoryMetadata & operator=(const StorageInMemoryMetadata & other);
+    
+    bool empty() const { return columns.empty(); }
+    
+    void setColumns(ColumnsDescription columns_);
+    void setSecondaryIndices(IndicesDescription secondary_indices_);
+    void setConstraints(ConstraintsDescription constraints_);
+    void setProjections(ProjectionsDescription projections_);
+    
+    void setPartitionKey(const ASTPtr & partition_key_);
+    void setPrimaryKey(const ASTPtr & primary_key_);
+    void setOrderBy(const ASTPtr & order_by_);
+    void setSampleBy(const ASTPtr & sample_by_);
+    void setTTL(const ASTPtr & ttl_);
+    
+    // Validation and consistency checks
+    void check(const NamesAndTypesList & provided_columns) const;
+    void checkCompatibility(const StorageInMemoryMetadata & other) const;
+    
+    // Key analysis
+    Names getColumnsRequiredForPartitionKey() const;
+    Names getColumnsRequiredForPrimaryKey() const;
+    Names getColumnsRequiredForSortingKey() const;
+    Names getColumnsRequiredForSampling() const;
+    
+    // Serialization for DDL operations
+    ASTPtr getCreateTableQuery() const;
+    String getCreateTableQueryString() const;
+    
+private:
+    void buildKeyDescriptions(ContextPtr context);
+    void validateKeyExpressions() const;
+};
+```
+
+### 2.1.4 Storage Snapshot System
+
+ClickHouse implements a sophisticated snapshot system to ensure consistent reads across concurrent operations:
+
+```cpp
+class StorageSnapshot
+{
+public:
+    using Ptr = std::shared_ptr<StorageSnapshot>;
+    
+    StorageSnapshot(
+        IStorage & storage_,
+        StorageMetadataPtr metadata_,
+        ContextPtr context_)
+        : storage(storage_)
+        , metadata(std::move(metadata_))
+        , context(context_)
+        , snapshot_time(std::chrono::system_clock::now())
+    {
+        // Capture current state
+        object_columns = metadata->getColumns();
+        
+        // Build column dependencies
+        buildColumnDependencies();
+        
+        // Initialize virtual columns
+        virtual_columns = storage.getVirtuals();
+    }
+    
+    // Column access interface
+    const ColumnsDescription & getColumns() const { return object_columns; }
+    const NamesAndTypesList & getVirtuals() const { return virtual_columns; }
+    
+    ColumnPtr getColumn(const String & column_name) const
+    {
+        if (auto column = object_columns.tryGetPhysical(column_name))
+            return column;
+        
+        // Check virtual columns
+        for (const auto & virtual_column : virtual_columns)
+        {
+            if (virtual_column.name == column_name)
+                return virtual_column.type->createColumn();
+        }
+        
+        throw Exception("Column " + column_name + " not found", ErrorCodes::NO_SUCH_COLUMN_IN_TABLE);
+    }
+    
+    // Metadata access
+    const StorageMetadataPtr & getMetadata() const { return metadata; }
+    
+    // Consistency validation
+    bool isValid() const
+    {
+        auto current_metadata = storage.getInMemoryMetadata();
+        return metadata->hash() == current_metadata.hash();
+    }
+    
+    // Column dependency tracking
+    Names getRequiredColumns(const Names & requested_columns) const
+    {
+        std::set<String> required;
+        
+        for (const auto & column_name : requested_columns)
+        {
+            required.insert(column_name);
+            
+            // Add dependent columns
+            auto it = column_dependencies.find(column_name);
+            if (it != column_dependencies.end())
+            {
+                for (const auto & dep : it->second)
+                    required.insert(dep);
+            }
+        }
+        
+        return Names(required.begin(), required.end());
+    }
+    
+private:
+    IStorage & storage;
+    StorageMetadataPtr metadata;
+    ContextPtr context;
+    
+    ColumnsDescription object_columns;
+    NamesAndTypesList virtual_columns;
+    
+    std::chrono::system_clock::time_point snapshot_time;
+    
+    // Column dependency graph for computed columns
+    std::unordered_map<String, std::set<String>> column_dependencies;
+    
+    void buildColumnDependencies()
+    {
+        // Build dependency graph for computed columns, materialized columns, etc.
+        for (const auto & column : object_columns)
+        {
+            if (column.default_desc.kind == ColumnDefaultKind::Materialized ||
+                column.default_desc.kind == ColumnDefaultKind::Alias)
+            {
+                auto dependencies = extractColumnDependencies(column.default_desc.expression);
+                column_dependencies[column.name] = std::move(dependencies);
+            }
+        }
+    }
+    
+    std::set<String> extractColumnDependencies(const ASTPtr & expression) const
+    {
+        std::set<String> dependencies;
+        
+        if (!expression)
+            return dependencies;
+        
+        // Traverse AST to find column references
+        class ColumnVisitor : public InDepthNodeVisitor<ColumnVisitor, true>
+        {
+        public:
+            std::set<String> & dependencies;
+            explicit ColumnVisitor(std::set<String> & deps) : dependencies(deps) {}
+            
+            void visit(ASTPtr & node)
+            {
+                if (auto identifier = node->as<ASTIdentifier>())
+                {
+                    dependencies.insert(identifier->name());
+                }
+            }
+        };
+        
+        ColumnVisitor visitor(dependencies);
+        visitor.visit(const_cast<ASTPtr&>(expression));
+        
+        return dependencies;
+    }
+};
+```
+
+This comprehensive storage architecture provides ClickHouse with the flexibility to support diverse storage engines while maintaining consistent performance and reliability characteristics across all implementations.
+
+## 2.2 MergeTree Family Architecture (5,000 words)
+
+The MergeTree family of storage engines forms the cornerstone of ClickHouse's storage architecture, designed specifically for high-performance analytical workloads with massive data volumes and high ingestion rates.
+
+### 2.2.1 Core MergeTree Implementation
+
+The basic MergeTree engine implements the fundamental LSM-tree-inspired architecture that underlies all variants in the family:
+
+```cpp
+class StorageMergeTree : public MergeTreeData, public IStorage
+{
+public:
+    StorageMergeTree(
+        const StorageID & table_id_,
+        const String & relative_data_path_,
+        const StorageInMemoryMetadata & metadata_,
+        ContextMutablePtr context_,
+        const String & date_column_name,
+        const MergingParams & merging_params_,
+        std::unique_ptr<MergeTreeSettings> storage_settings_,
+        bool has_force_restore_data_flag)
+        : MergeTreeData(table_id_, relative_data_path_, metadata_, context_,
+                       date_column_name, merging_params_, std::move(storage_settings_),
+                       has_force_restore_data_flag)
+        , background_operations_assignee(*this, BackgroundOperationsAssignee::Type::DataProcessing)
+        , background_moves_assignee(*this, BackgroundOperationsAssignee::Type::DataMoving)
+    {
+        initializeBackgroundTasks();
+    }
+    
+    String getName() const override { return merging_params.getModeName() + "MergeTree"; }
+    
+    void read(
+        QueryPlan & query_plan,
+        const Names & column_names,
+        const StorageSnapshotPtr & storage_snapshot,
+        SelectQueryInfo & query_info,
+        ContextPtr context,
+        QueryProcessingStage::Enum processed_stage,
+        size_t max_block_size,
+        size_t num_streams) override
+    {
+        // Create read-from-merge-tree step
+        auto reading_step = std::make_unique<ReadFromMergeTree>(
+            column_names,
+            storage_snapshot,
+            query_info,
+            context,
+            max_block_size,
+            num_streams,
+            processed_stage,
+            shared_from_this());
+        
+        query_plan.addStep(std::move(reading_step));
+    }
+    
+    SinkToStoragePtr write(
+        const ASTPtr & query,
+        const StorageMetadataPtr & metadata_snapshot,
+        ContextPtr context,
+        bool async_insert) override
+    {
+        return std::make_shared<MergeTreeSink>(
+            *this, metadata_snapshot, context, async_insert);
+    }
+    
+    void startup() override
+    {
+        background_operations_assignee.start();
+        background_moves_assignee.start();
+        
+        // Start background merge scheduler
+        if (auto pool = getContext()->getBackgroundPool())
+        {
+            background_operations_assignee.assignToPool(pool);
+        }
+        
+        // Start background move scheduler for tiered storage
+        if (auto move_pool = getContext()->getBackgroundMovePool())
+        {
+            background_moves_assignee.assignToPool(move_pool);
+        }
+    }
+    
+    void shutdown() override
+    {
+        background_operations_assignee.finish();
+        background_moves_assignee.finish();
+        
+        // Wait for all background operations to complete
+        std::unique_lock lock(background_operations_mutex);
+        background_operations_condition.wait(lock, [this] {
+            return background_operations_count == 0;
+        });
+    }
+    
+    // Merge operations
+    bool scheduleDataProcessingJob(BackgroundJobsAssignee & assignee) override
+    {
+        if (shutdown_called)
+            return false;
+        
+        auto merge_entry = selectPartsToMerge();
+        if (!merge_entry)
+            return false;
+        
+        assignee.scheduleCommonTask([this, merge_entry]() mutable {
+            return executeMerge(std::move(merge_entry));
+        });
+        
+        return true;
+    }
+    
+    // Mutation operations  
+    void mutate(const MutationCommands & commands, ContextPtr context) override
+    {
+        auto mutation_entry = std::make_shared<MergeTreeMutationEntry>(commands, context);
+        
+        std::lock_guard lock(mutation_mutex);
+        
+        // Add mutation to queue
+        Int64 version = mutation_entry->commit(zookeeper);
+        current_mutations_by_version.emplace(version, mutation_entry);
+        
+        // Wake up background merger to process mutation
+        background_operations_condition.notify_all();
+    }
+    
+private:
+    BackgroundJobsAssignee background_operations_assignee;
+    BackgroundJobsAssignee background_moves_assignee;
+    
+    std::mutex background_operations_mutex;
+    std::condition_variable background_operations_condition;
+    std::atomic<size_t> background_operations_count{0};
+    
+    // Mutation tracking
+    std::mutex mutation_mutex;
+    std::map<Int64, MergeTreeMutationEntryPtr> current_mutations_by_version;
+    
+    void initializeBackgroundTasks()
+    {
+        // Set up merge selection strategy
+        merge_selecting_task = std::make_shared<MergeSelectingTask>(*this);
+        
+        // Set up cleanup tasks
+        cleanup_task = std::make_shared<CleanupTask>(*this);
+        
+        // Set up moving task for tiered storage
+        moving_task = std::make_shared<MovingTask>(*this);
+    }
+    
+    MergeTreeDataMergerMutator::FutureMergedMutatedPartPtr selectPartsToMerge()
+    {
+        std::lock_guard lock(currently_processing_in_background_mutex);
+        
+        auto data_settings = getSettings();
+        auto metadata_snapshot = getInMemoryMetadataPtr();
+        
+        // Select parts for merge based on various strategies
+        auto future_part = merger_mutator.selectPartsToMerge(
+            future_parts,
+            false, // aggressive
+            data_settings->max_bytes_to_merge_at_max_space_in_pool,
+            merge_pred,
+            nullptr, // txn
+            nullptr); // out_disable_reason
+        
+        if (!future_part)
+            return nullptr;
+        
+        // Reserve selected parts
+        for (const auto & part : future_part->parts)
+        {
+            currently_merging_mutating_parts.emplace(part, future_part);
+        }
+        
+        return future_part;
+    }
+    
+    bool executeMerge(MergeTreeDataMergerMutator::FutureMergedMutatedPartPtr future_part)
+    {
+        ++background_operations_count;
+        
+        try
+        {
+            auto transaction = createTransaction();
+            
+            // Execute the actual merge
+            auto part = merger_mutator.mergePartsToTemporaryPart(
+                future_part,
+                metadata_snapshot,
+                nullptr, // merge_entry
+                nullptr, // table_lock_holder
+                time(nullptr),
+                getContext(),
+                transaction->getTID(),
+                space_reservation,
+                deduplicate,
+                deduplicate_by_columns,
+                cleanup,
+                merge_mutate_entry,
+                need_prefix);
+            
+            // Commit the merge
+            renameTempPartAndAdd(part, transaction);
+            transaction->commit();
+            
+            // Update part selection predicates
+            updateMergePredicates();
+            
+            return true;
+        }
+        catch (...)
+        {
+            // Handle merge failure
+            LOG_ERROR(log, "Failed to execute merge: {}", getCurrentExceptionMessage(false));
+            
+            // Clean up reserved parts
+            std::lock_guard lock(currently_processing_in_background_mutex);
+            for (const auto & part : future_part->parts)
+            {
+                currently_merging_mutating_parts.erase(part);
+            }
+            
+            --background_operations_count;
+            background_operations_condition.notify_all();
+            
+            return false;
+        }
+        
+        --background_operations_count;
+        background_operations_condition.notify_all();
+        
+        return true;
+    }
+};
+```
+
+### 2.2.2 Specialized MergeTree Variants
+
+ClickHouse provides several specialized variants of MergeTree, each optimized for specific use cases:
+
+**ReplacingMergeTree for Data Deduplication:**
+
+```cpp
+class StorageReplacingMergeTree : public StorageMergeTree
+{
+public:
+    StorageReplacingMergeTree(/* parameters */)
+        : StorageMergeTree(/* base parameters */)
+    {
+        // Set replacing merge parameters
+        merging_params.mode = MergingParams::Replacing;
+        merging_params.version_column = version_column_name;
+        merging_params.is_deleted_column = is_deleted_column_name;
+    }
+    
+    String getName() const override { return "ReplacingMergeTree"; }
+    
+protected:
+    // Custom merge logic for deduplication
+    class ReplacingMergedBlockOutputStream : public MergedBlockOutputStream
+    {
+    public:
+        ReplacingMergedBlockOutputStream(/* parameters */)
+            : MergedBlockOutputStream(/* base parameters */)
+            , version_column_num(version_column_num_)
+            , is_deleted_column_num(is_deleted_column_num_)
+        {}
+        
+        void write(Block && block) override
+        {
+            if (!block)
+                return;
+            
+            // Sort by primary key + version (if present)
+            sortBlock(block);
+            
+            // Deduplicate rows with same primary key
+            auto deduplicated_block = deduplicateBlock(block);
+            
+            MergedBlockOutputStream::write(std::move(deduplicated_block));
+        }
+        
+    private:
+        size_t version_column_num;
+        size_t is_deleted_column_num;
+        
+        Block deduplicateBlock(const Block & block)
+        {
+            if (block.rows() <= 1)
+                return block;
+            
+            // Group rows by primary key
+            std::map<String, std::vector<size_t>> key_to_rows;
+            
+            for (size_t i = 0; i < block.rows(); ++i)
+            {
+                String key = extractPrimaryKey(block, i);
+                key_to_rows[key].push_back(i);
+            }
+            
+            // Select latest version for each key
+            std::vector<size_t> selected_rows;
+            for (const auto & [key, rows] : key_to_rows)
+            {
+                size_t selected_row = selectLatestVersion(block, rows);
+                
+                // Check if row is deleted
+                if (is_deleted_column_num != std::numeric_limits<size_t>::max())
+                {
+                    auto is_deleted_column = block.getByPosition(is_deleted_column_num).column;
+                    if (is_deleted_column->getBool(selected_row))
+                        continue; // Skip deleted rows
+                }
+                
+                selected_rows.push_back(selected_row);
+            }
+            
+            // Build result block
+            return buildResultBlock(block, selected_rows);
+        }
+        
+        size_t selectLatestVersion(const Block & block, const std::vector<size_t> & rows)
+        {
+            if (version_column_num == std::numeric_limits<size_t>::max())
+                return rows.back(); // No version column, use last row
+            
+            size_t best_row = rows[0];
+            auto version_column = block.getByPosition(version_column_num).column;
+            
+            for (size_t i = 1; i < rows.size(); ++i)
+            {
+                if (version_column->compareAt(rows[i], best_row, *version_column, 1) > 0)
+                    best_row = rows[i];
+            }
+            
+            return best_row;
+        }
+    };
+};
+```
+
+**SummingMergeTree for Aggregation:**
+
+```cpp
+class StorageSummingMergeTree : public StorageMergeTree
+{
+public:
+    StorageSummingMergeTree(/* parameters */)
+        : StorageMergeTree(/* base parameters */)
+    {
+        merging_params.mode = MergingParams::Summing;
+        merging_params.columns_to_sum = columns_to_sum_;
+        merging_params.partition_value_types = partition_value_types_;
+    }
+    
+    String getName() const override { return "SummingMergeTree"; }
+    
+protected:
+    class SummingMergedBlockOutputStream : public MergedBlockOutputStream
+    {
+    public:
+        SummingMergedBlockOutputStream(/* parameters */)
+            : MergedBlockOutputStream(/* base parameters */)
+            , columns_to_sum(columns_to_sum_)
+        {
+            // Identify summable columns
+            for (size_t i = 0; i < header.columns(); ++i)
+            {
+                const auto & column_name = header.getByPosition(i).name;
+                const auto & column_type = header.getByPosition(i).type;
+                
+                if (columns_to_sum.empty() || columns_to_sum.count(column_name))
+                {
+                    if (column_type->isNumeric())
+                    {
+                        summable_columns.push_back(i);
+                    }
+                }
+            }
+        }
+        
+        void write(Block && block) override
+        {
+            if (!block)
+                return;
+            
+            // Sort by primary key
+            sortBlock(block);
+            
+            // Sum rows with same primary key
+            auto summed_block = sumBlock(block);
+            
+            MergedBlockOutputStream::write(std::move(summed_block));
+        }
+        
+    private:
+        Names columns_to_sum;
+        std::vector<size_t> summable_columns;
+        
+        Block sumBlock(const Block & block)
+        {
+            if (block.rows() <= 1)
+                return block;
+            
+            // Group rows by primary key
+            std::map<String, std::vector<size_t>> key_to_rows;
+            
+            for (size_t i = 0; i < block.rows(); ++i)
+            {
+                String key = extractPrimaryKey(block, i);
+                key_to_rows[key].push_back(i);
+            }
+            
+            // Sum rows for each key
+            MutableColumns result_columns = block.cloneEmptyColumns();
+            
+            for (const auto & [key, rows] : key_to_rows)
+            {
+                if (rows.size() == 1)
+                {
+                    // Single row, just copy
+                    for (size_t col = 0; col < result_columns.size(); ++col)
+                    {
+                        result_columns[col]->insertFrom(*block.getByPosition(col).column, rows[0]);
+                    }
+                }
+                else
+                {
+                    // Multiple rows, sum them
+                    sumRows(block, rows, result_columns);
+                }
+            }
+            
+            return block.cloneWithColumns(std::move(result_columns));
+        }
+        
+        void sumRows(const Block & block, const std::vector<size_t> & rows, MutableColumns & result_columns)
+        {
+            // Copy first row as base
+            for (size_t col = 0; col < result_columns.size(); ++col)
+            {
+                result_columns[col]->insertFrom(*block.getByPosition(col).column, rows[0]);
+            }
+            
+            size_t result_row = result_columns[0]->size() - 1;
+            
+            // Sum numeric columns
+            for (size_t col_idx : summable_columns)
+            {
+                auto & result_column = result_columns[col_idx];
+                auto source_column = block.getByPosition(col_idx).column;
+                
+                // Sum all rows into the result
+                for (size_t i = 1; i < rows.size(); ++i)
+                {
+                    addToColumn(*result_column, result_row, *source_column, rows[i]);
+                }
+            }
+        }
+        
+        void addToColumn(IColumn & result_column, size_t result_row, 
+                        const IColumn & source_column, size_t source_row)
+        {
+            // Type-specific addition logic
+            WhichDataType which(result_column.getDataType());
+            
+            if (which.isInt8())
+                addNumeric<Int8>(result_column, result_row, source_column, source_row);
+            else if (which.isInt16())
+                addNumeric<Int16>(result_column, result_row, source_column, source_row);
+            else if (which.isInt32())
+                addNumeric<Int32>(result_column, result_row, source_column, source_row);
+            else if (which.isInt64())
+                addNumeric<Int64>(result_column, result_row, source_column, source_row);
+            else if (which.isFloat32())
+                addNumeric<Float32>(result_column, result_row, source_column, source_row);
+            else if (which.isFloat64())
+                addNumeric<Float64>(result_column, result_row, source_column, source_row);
+            // ... other numeric types
+        }
+        
+        template<typename T>
+        void addNumeric(IColumn & result_column, size_t result_row,
+                       const IColumn & source_column, size_t source_row)
+        {
+            auto & typed_result = static_cast<ColumnVector<T> &>(result_column);
+            auto & typed_source = static_cast<const ColumnVector<T> &>(source_column);
+            
+            typed_result.getData()[result_row] += typed_source.getData()[source_row];
+        }
+    };
+};
+```
+
+### 2.2.3 Part Management and Lifecycle
+
+MergeTree engines implement sophisticated part management to optimize storage and query performance:
+
+```cpp
+class MergeTreeData
+{
+public:
+    using DataPartPtr = std::shared_ptr<IMergeTreeDataPart>;
+    using DataPartsVector = std::vector<DataPartPtr>;
+    using DataPartState = IMergeTreeDataPart::State;
+    
+    struct LessDataPart
+    {
+        using is_transparent = void;
+        
+        bool operator()(const DataPartPtr & lhs, const DataPartPtr & rhs) const
+        {
+            return lhs->info < rhs->info;
+        }
+    };
+    
+    using DataPartsIndexes = std::map<DataPartPtr, size_t, LessDataPart>;
+    using DataPartsLock = std::unique_lock<std::shared_mutex>;
+    
+protected:
+    mutable std::shared_mutex data_parts_mutex;
+    
+    /// Current set of data parts.
+    DataPartsIndexes data_parts_indexes;
+    DataPartsVector data_parts_by_state_and_info[DataPartState::MAX_VALUE];
+    
+    /// Index of parts by partition and min_block_number, for fast search of parts within partition.
+    std::map<String, std::map<Int64, DataPartPtr>> data_parts_by_info;
+    
+public:
+    DataPartsVector getDataPartsVector(
+        const DataPartStates & affordable_states = DataPartStates({DataPartState::Active}),
+        DataPartsLock * acquired_lock = nullptr) const
+    {
+        DataPartsLock lock(data_parts_mutex);
+        
+        if (acquired_lock)
+            *acquired_lock = std::move(lock);
+        
+        DataPartsVector result;
+        for (auto state : affordable_states)
+        {
+            auto & parts_in_state = data_parts_by_state_and_info[state];
+            result.insert(result.end(), parts_in_state.begin(), parts_in_state.end());
+        }
+        
+        return result;
+    }
+    
+    DataPartPtr getPartIfExists(const MergeTreePartInfo & part_info, const DataPartStates & valid_states)
+    {
+        DataPartsLock lock(data_parts_mutex);
+        
+        auto it = data_parts_by_info.find(part_info.partition_id);
+        if (it == data_parts_by_info.end())
+            return nullptr;
+        
+        auto part_it = it->second.find(part_info.min_block_number);
+        if (part_it == it->second.end())
+            return nullptr;
+        
+        auto part = part_it->second;
+        if (valid_states.count(part->getState()))
+            return part;
+        
+        return nullptr;
+    }
+    
+    void addPart(DataPartPtr part)
+    {
+        DataPartsLock lock(data_parts_mutex);
+        addPartNoLock(part, lock);
+    }
+    
+    bool renamePart(DataPartPtr part, const String & new_name)
+    {
+        DataPartsLock lock(data_parts_mutex);
+        
+        if (part->getState() != DataPartState::Active)
+            return false;
+        
+        // Remove from indexes
+        removePartFromIndexes(part);
+        
+        // Rename on disk
+        auto old_path = part->getFullPath();
+        auto new_path = relative_data_path + new_name + "/";
+        
+        if (!Poco::File(old_path).exists())
+            return false;
+        
+        Poco::File(old_path).renameTo(new_path);
+        
+        // Update part info
+        part->name = new_name;
+        part->info = MergeTreePartInfo::fromPartName(new_name, format_version);
+        
+        // Add back to indexes
+        addPartToIndexes(part);
+        
+        return true;
+    }
+    
+    void removePartsInRangeFromWorkingSet(const MergeTreePartInfo & drop_range, 
+                                         DataPartsVector & parts_to_remove)
+    {
+        DataPartsLock lock(data_parts_mutex);
+        
+        auto partition_it = data_parts_by_info.find(drop_range.partition_id);
+        if (partition_it == data_parts_by_info.end())
+            return;
+        
+        auto & parts_in_partition = partition_it->second;
+        
+        // Find all parts that intersect with drop range
+        auto begin_it = parts_in_partition.lower_bound(drop_range.min_block_number);
+        auto end_it = parts_in_partition.upper_bound(drop_range.max_block_number);
+        
+        for (auto it = begin_it; it != end_it; ++it)
+        {
+            auto part = it->second;
+            if (part->info.intersects(drop_range))
+            {
+                parts_to_remove.push_back(part);
+                removePartFromIndexes(part);
+                part->setState(DataPartState::Outdated);
+            }
+        }
+    }
+    
+private:
+    void addPartNoLock(DataPartPtr part, DataPartsLock & /* lock */)
+    {
+        auto state = part->getState();
+        
+        // Add to main indexes
+        data_parts_indexes.emplace(part, data_parts_by_state_and_info[state].size());
+        data_parts_by_state_and_info[state].push_back(part);
+        
+        // Add to partition index
+        data_parts_by_info[part->info.partition_id][part->info.min_block_number] = part;
+        
+        // Update statistics
+        updateDataPartsStats();
+    }
+    
+    void removePartFromIndexes(DataPartPtr part)
+    {
+        auto state = part->getState();
+        
+        // Remove from main index
+        auto main_it = data_parts_indexes.find(part);
+        if (main_it != data_parts_indexes.end())
+        {
+            auto & parts_vector = data_parts_by_state_and_info[state];
+            auto vector_index = main_it->second;
+            
+            // Swap with last element and pop
+            if (vector_index < parts_vector.size() - 1)
+            {
+                std::swap(parts_vector[vector_index], parts_vector.back());
+                data_parts_indexes[parts_vector[vector_index]] = vector_index;
+            }
+            
+            parts_vector.pop_back();
+            data_parts_indexes.erase(main_it);
+        }
+        
+        // Remove from partition index
+        auto partition_it = data_parts_by_info.find(part->info.partition_id);
+        if (partition_it != data_parts_by_info.end())
+        {
+            partition_it->second.erase(part->info.min_block_number);
+            if (partition_it->second.empty())
+                data_parts_by_info.erase(partition_it);
+        }
+    }
+    
+    void updateDataPartsStats()
+    {
+        // Update various statistics about data parts
+        total_active_size_bytes = 0;
+        total_active_size_rows = 0;
+        
+        for (const auto & part : data_parts_by_state_and_info[DataPartState::Active])
+        {
+            total_active_size_bytes += part->getBytesOnDisk();
+            total_active_size_rows += part->rows_count;
+        }
+    }
+};
+```
+
+This sophisticated part management system enables ClickHouse to efficiently handle massive datasets while maintaining excellent query performance through intelligent part organization, lifecycle management, and background optimization processes.
+
+## 2.3 Data Parts, Granules, and Blocks Implementation (4,000 words)
+
+The physical storage organization in ClickHouse is built around a three-tier hierarchy: data parts, granules, and blocks. This sophisticated structure enables efficient compression, indexing, and parallel processing while maintaining excellent query performance.
+
+### 2.3.1 Data Part Structure and Implementation
+
+Each data part represents an immutable collection of data stored on disk, implementing the fundamental unit of ClickHouse's LSM-tree-inspired storage:
+
+```cpp
+class IMergeTreeDataPart : public std::enable_shared_from_this<IMergeTreeDataPart>
+{
+public:
+    enum State
+    {
+        Temporary,       // Part is being created
+        PreActive,       // Part is created but not yet active
+        Active,          // Part is active and can be read
+        Outdated,        // Part is outdated but not yet deleted
+        Deleting,        // Part is being deleted
+        DeleteOnDestroy, // Part will be deleted when object is destroyed
+        MAX_VALUE = DeleteOnDestroy
+    };
+    
+    using Checksums = MergeTreeDataPartChecksums;
+    using ColumnSize = std::pair<size_t, size_t>; // compressed, uncompressed
+    using ColumnSizeByName = std::map<String, ColumnSize>;
+    
+protected:
+    const MergeTreeData & storage;
+    String name;
+    MergeTreePartInfo info;
+    
+    mutable State state{Temporary};
+    mutable std::mutex state_mutex;
+    
+    // Part metadata
+    size_t rows_count = 0;
+    time_t modification_time = 0;
+    mutable time_t remove_time = std::numeric_limits<time_t>::max();
+    
+    // Storage paths
+    String relative_path;
+    mutable String absolute_path;
+    
+    // Checksums and validation
+    mutable Checksums checksums;
+    mutable bool checksums_loaded = false;
+    
+    // Column information
+    mutable ColumnSizeByName columns_sizes;
+    mutable std::optional<time_t> columns_sizes_on_disk_load_time;
+    
+    // Index and marks
+    mutable MarkCache::MappedPtr marks_cache;
+    mutable UncompressedCache::MappedPtr uncompressed_cache;
+    
+public:
+    IMergeTreeDataPart(
+        const MergeTreeData & storage_,
+        const String & name_,
+        const MergeTreePartInfo & info_,
+        const VolumePtr & volume_,
+        const std::optional<String> & relative_path_ = {})
+        : storage(storage_)
+        , name(name_)
+        , info(info_)
+        , volume(volume_)
+    {
+        if (relative_path_.has_value())
+            relative_path = relative_path_.value();
+        else
+            relative_path = info.getPartName();
+    }
+    
+    virtual ~IMergeTreeDataPart() = default;
+    
+    // Basic accessors
+    const String & getName() const { return name; }
+    const MergeTreePartInfo & getInfo() const { return info; }
+    String getFullPath() const
+    {
+        if (absolute_path.empty())
+            absolute_path = storage.getFullPathOnDisk(volume->getDisk()) + relative_path + "/";
+        return absolute_path;
+    }
+    
+    // State management
+    State getState() const
+    {
+        std::lock_guard lock(state_mutex);
+        return state;
+    }
+    
+    void setState(State new_state) const
+    {
+        std::lock_guard lock(state_mutex);
+        state = new_state;
+    }
+    
+    bool isStoredOnDisk() const
+    {
+        return volume->getDisk()->exists(relative_path);
+    }
+    
+    // Size and statistics
+    virtual UInt64 getBytesOnDisk() const = 0;
+    virtual UInt64 getMarksCount() const = 0;
+    
+    size_t getRowsCount() const { return rows_count; }
+    time_t getModificationTime() const { return modification_time; }
+    
+    // Column operations
+    virtual bool hasColumnFiles(const NameAndTypePair & column) const = 0;
+    virtual std::optional<String> getFileNameForColumn(const NameAndTypePair & column) const = 0;
+    virtual void checkConsistency(bool require_part_metadata) const = 0;
+    
+    // Serialization
+    virtual void loadRowsCount() = 0;
+    virtual void loadPartitionAndMinMaxIndex() = 0;
+    virtual void loadIndex() = 0;
+    virtual void loadProjections(bool require_columns_checksums) = 0;
+    
+    // Column size calculation
+    ColumnSize getColumnSize(const String & column_name) const
+    {
+        loadColumnsSizes();
+        auto it = columns_sizes.find(column_name);
+        return it == columns_sizes.end() ? ColumnSize{0, 0} : it->second;
+    }
+    
+    ColumnSizeByName getColumnsSizes() const
+    {
+        loadColumnsSizes();
+        return columns_sizes;
+    }
+    
+    // Checksums management
+    const Checksums & getChecksums() const
+    {
+        loadChecksums();
+        return checksums;
+    }
+    
+    void setChecksums(const Checksums & checksums_)
+    {
+        checksums = checksums_;
+        checksums_loaded = true;
+    }
+    
+    // Index access
+    virtual void loadPrimaryIndex() = 0;
+    virtual void unloadPrimaryIndex() = 0;
+    virtual bool isPrimaryIndexLoaded() const = 0;
+    
+protected:
+    VolumePtr volume;
+    DiskPtr disk;
+    
+    virtual void loadChecksums() const = 0;
+    virtual void loadColumnsSizes() const = 0;
+    
+    // Helper methods for derived classes
+    void calculateColumnsSizesOnDisk()
+    {
+        if (columns_sizes_on_disk_load_time && 
+            *columns_sizes_on_disk_load_time >= modification_time)
+            return;
+        
+        columns_sizes.clear();
+        
+        auto disk = volume->getDisk();
+        String path = getFullPath();
+        
+        for (const auto & [file_name, checksum] : checksums.files)
+        {
+            if (file_name.ends_with(".bin"))
+            {
+                String column_name = file_name.substr(0, file_name.length() - 4);
+                auto file_size = disk->getFileSize(path + file_name);
+                columns_sizes[column_name] = ColumnSize{file_size, checksum.uncompressed_size};
+            }
+        }
+        
+        columns_sizes_on_disk_load_time = modification_time;
+    }
+};
+```
+
+### 2.3.2 Wide vs Compact Part Formats
+
+ClickHouse supports two physical storage formats for data parts, each optimized for different scenarios:
+
+**Wide Format Implementation:**
+
+```cpp
+class MergeTreeDataPartWide : public IMergeTreeDataPart
+{
+public:
+    MergeTreeDataPartWide(/* parameters */)
+        : IMergeTreeDataPart(/* base parameters */)
+    {}
+    
+    String getTypeName() const override { return "Wide"; }
+    
+    bool hasColumnFiles(const NameAndTypePair & column) const override
+    {
+        auto disk = volume->getDisk();
+        String path = getFullPath();
+        
+        // Check for main column file
+        String data_file = path + escapeForFileName(column.name) + ".bin";
+        if (!disk->exists(data_file))
+            return false;
+        
+        // Check for mark file
+        String mark_file = path + escapeForFileName(column.name) + ".mrk2";
+        if (!disk->exists(mark_file))
+            return false;
+        
+        return true;
+    }
+    
+    std::optional<String> getFileNameForColumn(const NameAndTypePair & column) const override
+    {
+        String escaped_name = escapeForFileName(column.name);
+        
+        // Handle different column types
+        if (column.type->isNullable())
+        {
+            // Nullable columns have separate null map files
+            return escaped_name + ".null.bin";
+        }
+        else if (column.type->isArray())
+        {
+            // Array columns have separate size files
+            return escaped_name + ".size0.bin";
+        }
+        else if (column.type->isLowCardinality())
+        {
+            // LowCardinality columns have dictionary files
+            return escaped_name + ".dict.bin";
+        }
+        
+        return escaped_name + ".bin";
+    }
+    
+    UInt64 getBytesOnDisk() const override
+    {
+        loadChecksums();
+        
+        UInt64 total_size = 0;
+        for (const auto & [file_name, checksum] : checksums.files)
+        {
+            total_size += checksum.file_size;
+        }
+        
+        return total_size;
+    }
+    
+    UInt64 getMarksCount() const override
+    {
+        if (marks_count_cache.has_value())
+            return *marks_count_cache;
+        
+        // Calculate marks count from any mark file
+        auto disk = volume->getDisk();
+        String path = getFullPath();
+        
+        for (const auto & [file_name, checksum] : checksums.files)
+        {
+            if (file_name.ends_with(".mrk2"))
+            {
+                auto file_size = disk->getFileSize(path + file_name);
+                marks_count_cache = file_size / sizeof(MarkInCompressedFile);
+                return *marks_count_cache;
+            }
+        }
+        
+        return 0;
+    }
+    
+    void loadPrimaryIndex() override
+    {
+        if (primary_index_loaded)
+            return;
+        
+        auto disk = volume->getDisk();
+        String index_path = getFullPath() + "primary.idx";
+        
+        if (!disk->exists(index_path))
+        {
+            primary_index_loaded = true;
+            return;
+        }
+        
+        auto index_file = disk->readFile(index_path);
+        auto index_size = disk->getFileSize(index_path);
+        
+        // Read primary index
+        primary_index.resize(index_size / storage.getPrimaryKeySize());
+        index_file->read(reinterpret_cast<char*>(primary_index.data()), index_size);
+        
+        primary_index_loaded = true;
+    }
+    
+protected:
+    void loadChecksums() const override
+    {
+        if (checksums_loaded)
+            return;
+        
+        auto disk = volume->getDisk();
+        String checksums_path = getFullPath() + "checksums.txt";
+        
+        if (!disk->exists(checksums_path))
+        {
+            checksums_loaded = true;
+            return;
+        }
+        
+        auto checksums_file = disk->readFile(checksums_path);
+        String checksums_content;
+        readStringUntilEOF(checksums_content, *checksums_file);
+        
+        // Parse checksums file
+        checksums.read(checksums_content);
+        checksums_loaded = true;
+    }
+    
+    void loadColumnsSizes() const override
+    {
+        calculateColumnsSizesOnDisk();
+    }
+    
+private:
+    mutable std::optional<UInt64> marks_count_cache;
+    mutable bool primary_index_loaded = false;
+    mutable PrimaryIndex primary_index;
+};
+```
+
+**Compact Format Implementation:**
+
+```cpp
+class MergeTreeDataPartCompact : public IMergeTreeDataPart
+{
+public:
+    static constexpr auto DATA_FILE_NAME = "data.bin";
+    static constexpr auto DATA_FILE_NAME_WITH_EXTENSION = "data.cmrk2";
+    
+    MergeTreeDataPartCompact(/* parameters */)
+        : IMergeTreeDataPart(/* base parameters */)
+    {}
+    
+    String getTypeName() const override { return "Compact"; }
+    
+    bool hasColumnFiles(const NameAndTypePair & column) const override
+    {
+        // In compact format, all columns are in single data file
+        auto disk = volume->getDisk();
+        String path = getFullPath();
+        
+        return disk->exists(path + DATA_FILE_NAME) && 
+               disk->exists(path + DATA_FILE_NAME_WITH_EXTENSION);
+    }
+    
+    std::optional<String> getFileNameForColumn(const NameAndTypePair & column) const override
+    {
+        // All columns share the same data file in compact format
+        return DATA_FILE_NAME;
+    }
+    
+    UInt64 getBytesOnDisk() const override
+    {
+        loadChecksums();
+        
+        auto it = checksums.files.find(DATA_FILE_NAME);
+        if (it != checksums.files.end())
+            return it->second.file_size;
+        
+        return 0;
+    }
+    
+    UInt64 getMarksCount() const override
+    {
+        if (marks_count_cache.has_value())
+            return *marks_count_cache;
+        
+        auto disk = volume->getDisk();
+        String marks_path = getFullPath() + DATA_FILE_NAME_WITH_EXTENSION;
+        
+        if (!disk->exists(marks_path))
+            return 0;
+        
+        auto file_size = disk->getFileSize(marks_path);
+        auto columns_count = storage.getInMemoryMetadataPtr()->getColumns().size();
+        
+        marks_count_cache = file_size / (columns_count * sizeof(MarkInCompressedFile));
+        return *marks_count_cache;
+    }
+    
+    void loadPrimaryIndex() override
+    {
+        if (primary_index_loaded)
+            return;
+        
+        // Primary index is embedded in the compact marks file
+        loadMarksFile();
+        primary_index_loaded = true;
+    }
+    
+protected:
+    void loadChecksums() const override
+    {
+        if (checksums_loaded)
+            return;
+        
+        auto disk = volume->getDisk();
+        String checksums_path = getFullPath() + "checksums.txt";
+        
+        if (disk->exists(checksums_path))
+        {
+            auto checksums_file = disk->readFile(checksums_path);
+            String checksums_content;
+            readStringUntilEOF(checksums_content, *checksums_file);
+            checksums.read(checksums_content);
+        }
+        
+        checksums_loaded = true;
+    }
+    
+    void loadColumnsSizes() const override
+    {
+        // In compact format, need to parse the data file structure
+        loadMarksFile();
+        calculateColumnsSizesFromMarks();
+    }
+    
+private:
+    mutable std::optional<UInt64> marks_count_cache;
+    mutable bool primary_index_loaded = false;
+    mutable bool marks_loaded = false;
+    
+    struct CompactMark
+    {
+        size_t offset_in_compressed_file;
+        size_t offset_in_decompressed_block;
+        UInt64 rows_in_granule;
+    };
+    
+    mutable std::vector<std::vector<CompactMark>> marks_by_column;
+    
+    void loadMarksFile() const
+    {
+        if (marks_loaded)
+            return;
+        
+        auto disk = volume->getDisk();
+        String marks_path = getFullPath() + DATA_FILE_NAME_WITH_EXTENSION;
+        
+        if (!disk->exists(marks_path))
+        {
+            marks_loaded = true;
+            return;
+        }
+        
+        auto marks_file = disk->readFile(marks_path);
+        auto metadata = storage.getInMemoryMetadataPtr();
+        auto columns = metadata->getColumns().getAllPhysical();
+        
+        marks_by_column.resize(columns.size());
+        
+        size_t marks_count = getMarksCount();
+        
+        for (size_t mark_idx = 0; mark_idx < marks_count; ++mark_idx)
+        {
+            for (size_t col_idx = 0; col_idx < columns.size(); ++col_idx)
+            {
+                CompactMark mark;
+                readBinary(mark.offset_in_compressed_file, *marks_file);
+                readBinary(mark.offset_in_decompressed_block, *marks_file);
+                readBinary(mark.rows_in_granule, *marks_file);
+                
+                marks_by_column[col_idx].push_back(mark);
+            }
+        }
+        
+        marks_loaded = true;
+    }
+    
+    void calculateColumnsSizesFromMarks() const
+    {
+        if (!marks_loaded)
+            return;
+        
+        columns_sizes.clear();
+        auto columns = storage.getInMemoryMetadataPtr()->getColumns().getAllPhysical();
+        
+        for (size_t col_idx = 0; col_idx < columns.size(); ++col_idx)
+        {
+            const auto & column = columns[col_idx];
+            const auto & column_marks = marks_by_column[col_idx];
+            
+            if (column_marks.empty())
+                continue;
+            
+            // Calculate compressed size based on mark offsets
+            size_t compressed_size = 0;
+            if (column_marks.size() > 1)
+            {
+                compressed_size = column_marks.back().offset_in_compressed_file - 
+                                column_marks.front().offset_in_compressed_file;
+            }
+            
+            // Estimate uncompressed size
+            size_t uncompressed_size = 0;
+            for (const auto & mark : column_marks)
+            {
+                uncompressed_size += mark.rows_in_granule * column.type->getSizeOfValueInMemory();
+            }
+            
+            columns_sizes[column.name] = ColumnSize{compressed_size, uncompressed_size};
+        }
+    }
+};
+```
+
+### 2.3.3 Granule Organization and Mark System
+
+The granule system provides the logical organization for data access and indexing:
+
+```cpp
+class MergeTreeMarksLoader
+{
+public:
+    using MarksPtr = std::shared_ptr<MarksInCompressedFile>;
+    
+    struct LoadedMarks
+    {
+        MarksPtr marks;
+        size_t marks_count;
+        size_t granules_count;
+    };
+    
+    static LoadedMarks loadMarks(
+        const MergeTreeDataPartPtr & data_part,
+        const String & stream_name,
+        const MarkCache::Key & cache_key,
+        MarkCache * mark_cache)
+    {
+        // Try to get from cache first
+        if (mark_cache)
+        {
+            auto cached_marks = mark_cache->get(cache_key);
+            if (cached_marks)
+            {
+                return LoadedMarks{
+                    cached_marks,
+                    cached_marks->size(),
+                    cached_marks->size()
+                };
+            }
+        }
+        
+        // Load from disk
+        auto marks = loadMarksFromDisk(data_part, stream_name);
+        
+        // Cache the loaded marks
+        if (mark_cache && marks)
+        {
+            mark_cache->set(cache_key, marks);
+        }
+        
+        return LoadedMarks{
+            marks,
+            marks ? marks->size() : 0,
+            marks ? marks->size() : 0
+        };
+    }
+    
+private:
+    static MarksPtr loadMarksFromDisk(
+        const MergeTreeDataPartPtr & data_part,
+        const String & stream_name)
+    {
+        String marks_file_path = data_part->getFullPath() + stream_name + ".mrk2";
+        auto disk = data_part->volume->getDisk();
+        
+        if (!disk->exists(marks_file_path))
+            return nullptr;
+        
+        auto file_size = disk->getFileSize(marks_file_path);
+        size_t marks_count = file_size / sizeof(MarkInCompressedFile);
+        
+        auto marks = std::make_shared<MarksInCompressedFile>(marks_count);
+        
+        auto marks_file = disk->readFile(marks_file_path);
+        marks_file->read(reinterpret_cast<char*>(marks->data()), file_size);
+        
+        return marks;
+    }
+};
+
+struct MarkInCompressedFile
+{
+    size_t offset_in_compressed_file;
+    size_t offset_in_decompressed_block;
+    
+    bool operator==(const MarkInCompressedFile & other) const
+    {
+        return offset_in_compressed_file == other.offset_in_compressed_file &&
+               offset_in_decompressed_block == other.offset_in_decompressed_block;
+    }
+    
+    bool operator<(const MarkInCompressedFile & other) const
+    {
+        return std::tie(offset_in_compressed_file, offset_in_decompressed_block) <
+               std::tie(other.offset_in_compressed_file, other.offset_in_decompressed_block);
+    }
+};
+
+using MarksInCompressedFile = std::vector<MarkInCompressedFile>;
+```
+
+### 2.3.4 Block-Level Compression and Storage
+
+ClickHouse implements sophisticated block-level compression to optimize storage efficiency:
+
+```cpp
+class CompressedBlockOutputStream
+{
+public:
+    CompressedBlockOutputStream(
+        WriteBuffer & out_,
+        CompressionCodecPtr codec_,
+        size_t max_compressed_block_size_ = DEFAULT_MAX_COMPRESSED_BLOCK_SIZE)
+        : out(out_)
+        , codec(std::move(codec_))
+        , max_compressed_block_size(max_compressed_block_size_)
+    {}
+    
+    void write(const char * data, size_t size)
+    {
+        while (size > 0)
+        {
+            size_t bytes_to_write = std::min(size, max_compressed_block_size - buffer.size());
+            
+            buffer.insert(buffer.end(), data, data + bytes_to_write);
+            data += bytes_to_write;
+            size -= bytes_to_write;
+            
+            if (buffer.size() >= max_compressed_block_size)
+            {
+                flushBuffer();
+            }
+        }
+    }
+    
+    void flush()
+    {
+        if (!buffer.empty())
+            flushBuffer();
+        out.sync();
+    }
+    
+private:
+    WriteBuffer & out;
+    CompressionCodecPtr codec;
+    size_t max_compressed_block_size;
+    
+    std::vector<char> buffer;
+    
+    void flushBuffer()
+    {
+        if (buffer.empty())
+            return;
+        
+        // Compress the buffer
+        auto compressed_data = codec->compress(buffer.data(), buffer.size());
+        
+        // Write compressed block header
+        writeCompressedBlockHeader(out, compressed_data.size(), buffer.size());
+        
+        // Write compressed data
+        out.write(compressed_data.data(), compressed_data.size());
+        
+        buffer.clear();
+    }
+    
+    void writeCompressedBlockHeader(WriteBuffer & out, size_t compressed_size, size_t uncompressed_size)
+    {
+        // ClickHouse compressed block format:
+        // - 16 bytes checksum (CityHash128)
+        // - 1 byte compression method
+        // - 4 bytes compressed size
+        // - 4 bytes uncompressed size
+        
+        UInt128 checksum = CityHash_v1_0_2::CityHash128(
+            reinterpret_cast<const char*>(&compressed_size), 
+            sizeof(compressed_size) + sizeof(uncompressed_size));
+        
+        writeBinary(checksum.low64, out);
+        writeBinary(checksum.high64, out);
+        writeBinary(static_cast<UInt8>(codec->getMethodByte()), out);
+        writeBinary(static_cast<UInt32>(compressed_size), out);
+        writeBinary(static_cast<UInt32>(uncompressed_size), out);
+    }
+};
+
+class CompressedBlockInputStream
+{
+public:
+    CompressedBlockInputStream(ReadBuffer & in_)
+        : in(in_)
+    {}
+    
+    size_t read(char * data, size_t size)
+    {
+        size_t bytes_read = 0;
+        
+        while (bytes_read < size)
+        {
+            if (current_block_pos >= current_block.size())
+            {
+                if (!loadNextBlock())
+                    break;
+            }
+            
+            size_t bytes_to_copy = std::min(
+                size - bytes_read,
+                current_block.size() - current_block_pos);
+            
+            memcpy(data + bytes_read, 
+                   current_block.data() + current_block_pos, 
+                   bytes_to_copy);
+            
+            bytes_read += bytes_to_copy;
+            current_block_pos += bytes_to_copy;
+        }
+        
+        return bytes_read;
+    }
+    
+    bool eof() const
+    {
+        return in.eof() && current_block_pos >= current_block.size();
+    }
+    
+private:
+    ReadBuffer & in;
+    std::vector<char> current_block;
+    size_t current_block_pos = 0;
+    
+    bool loadNextBlock()
+    {
+        if (in.eof())
+            return false;
+        
+        // Read compressed block header
+        UInt128 checksum;
+        UInt8 method;
+        UInt32 compressed_size;
+        UInt32 uncompressed_size;
+        
+        readBinary(checksum.low64, in);
+        readBinary(checksum.high64, in);
+        readBinary(method, in);
+        readBinary(compressed_size, in);
+        readBinary(uncompressed_size, in);
+        
+        // Validate checksum
+        UInt128 expected_checksum = CityHash_v1_0_2::CityHash128(
+            reinterpret_cast<const char*>(&compressed_size),
+            sizeof(compressed_size) + sizeof(uncompressed_size));
+        
+        if (checksum != expected_checksum)
+            throw Exception("Checksum mismatch in compressed block", ErrorCodes::CHECKSUM_DOESNT_MATCH);
+        
+        // Read compressed data
+        std::vector<char> compressed_data(compressed_size);
+        in.read(compressed_data.data(), compressed_size);
+        
+        // Decompress
+        auto codec = CompressionCodecFactory::instance().get(method);
+        current_block = codec->decompress(compressed_data.data(), compressed_size, uncompressed_size);
+        current_block_pos = 0;
+        
+        return true;
+    }
+};
+```
+
+This three-tier storage hierarchy enables ClickHouse to achieve excellent compression ratios, efficient indexing, and high-performance parallel processing while maintaining the flexibility to handle diverse data types and access patterns.
+
+## 2.4 Compression Algorithms and Codecs (3,500 words)
+
+ClickHouse implements a comprehensive compression framework that supports multiple algorithms optimized for different data types and access patterns. The codec system provides both high compression ratios and fast decompression speeds essential for analytical workloads.
+
+### 2.4.1 Compression Codec Architecture
+
+The compression system is built around a flexible codec interface that enables pluggable compression algorithms:
+
+```cpp
+class ICompressionCodec
+{
+public:
+    virtual ~ICompressionCodec() = default;
+    
+    // Core compression interface
+    virtual UInt32 getMaxCompressedDataSize(UInt32 uncompressed_size) const = 0;
+    virtual UInt32 compress(const char * source, UInt32 source_size, char * dest) const = 0;
+    virtual void decompress(const char * source, UInt32 source_size, char * dest, UInt32 uncompressed_size) const = 0;
+    
+    // Codec identification
+    virtual UInt8 getMethodByte() const = 0;
+    virtual String getCodecDesc() const = 0;
+    
+    // Performance characteristics
+    virtual bool isCompression() const { return true; }
+    virtual bool isGenericCompression() const { return true; }
+    virtual bool isNone() const { return false; }
+    
+    // Optimization hints
+    virtual bool isExperimentalCodec() const { return false; }
+    virtual bool isDeltaCodec() const { return false; }
+    virtual bool isFloatingPointTimeSeriesCodec() const { return false; }
+    
+    // Factory method for creating codec instances
+    static CompressionCodecPtr createInstance(UInt8 method_byte);
+    
+protected:
+    // Helper methods for codec implementations
+    static void validateDecompressedSize(UInt32 size_decompressed_must_be, UInt32 size_decompressed);
+    static UInt32 readDecompressedBlockSize(const char * compressed_data);
+    static void writeDecompressedBlockSize(char * compressed_data, UInt32 size_decompressed);
+};
+
+using CompressionCodecPtr = std::shared_ptr<ICompressionCodec>;
+```
+
+### 2.4.2 LZ4 Compression Implementation
+
+LZ4 serves as the default compression algorithm, providing excellent balance between compression ratio and speed:
+
+```cpp
+class CompressionCodecLZ4 : public ICompressionCodec
+{
+public:
+    static constexpr UInt8 METHOD_BYTE = 0x82;
+    static constexpr auto CODEC_NAME = "LZ4";
+    
+    CompressionCodecLZ4() = default;
+    
+    UInt8 getMethodByte() const override { return METHOD_BYTE; }
+    String getCodecDesc() const override { return CODEC_NAME; }
+    
+    UInt32 getMaxCompressedDataSize(UInt32 uncompressed_size) const override
+    {
+        return LZ4_compressBound(uncompressed_size);
+    }
+    
+    UInt32 compress(const char * source, UInt32 source_size, char * dest) const override
+    {
+        return LZ4_compress_default(source, dest, source_size, getMaxCompressedDataSize(source_size));
+    }
+    
+    void decompress(const char * source, UInt32 source_size, char * dest, UInt32 uncompressed_size) const override
+    {
+        int result = LZ4_decompress_safe(source, dest, source_size, uncompressed_size);
+        
+        if (result < 0)
+            throw Exception("Cannot decompress LZ4 block", ErrorCodes::CANNOT_DECOMPRESS);
+        
+        validateDecompressedSize(uncompressed_size, result);
+    }
+    
+    bool isCompression() const override { return true; }
+    bool isGenericCompression() const override { return true; }
+};
+```
+
+### 2.4.3 ZSTD Compression Implementation
+
+ZSTD provides higher compression ratios at the cost of increased CPU usage:
+
+```cpp
+class CompressionCodecZSTD : public ICompressionCodec
+{
+public:
+    static constexpr UInt8 METHOD_BYTE = 0x90;
+    static constexpr auto CODEC_NAME = "ZSTD";
+    
+    explicit CompressionCodecZSTD(int level = 1) : compression_level(level) {}
+    
+    UInt8 getMethodByte() const override { return METHOD_BYTE; }
+    String getCodecDesc() const override 
+    { 
+        return CODEC_NAME + "(" + std::to_string(compression_level) + ")"; 
+    }
+    
+    UInt32 getMaxCompressedDataSize(UInt32 uncompressed_size) const override
+    {
+        return ZSTD_compressBound(uncompressed_size);
+    }
+    
+    UInt32 compress(const char * source, UInt32 source_size, char * dest) const override
+    {
+        size_t compressed_size = ZSTD_compress(dest, getMaxCompressedDataSize(source_size),
+                                             source, source_size, compression_level);
+        
+        if (ZSTD_isError(compressed_size))
+            throw Exception("Cannot compress with ZSTD: " + String(ZSTD_getErrorName(compressed_size)), 
+                          ErrorCodes::CANNOT_COMPRESS);
+        
+        return compressed_size;
+    }
+    
+    void decompress(const char * source, UInt32 source_size, char * dest, UInt32 uncompressed_size) const override
+    {
+        size_t decompressed_size = ZSTD_decompress(dest, uncompressed_size, source, source_size);
+        
+        if (ZSTD_isError(decompressed_size))
+            throw Exception("Cannot decompress ZSTD: " + String(ZSTD_getErrorName(decompressed_size)), 
+                          ErrorCodes::CANNOT_DECOMPRESS);
+        
+        validateDecompressedSize(uncompressed_size, decompressed_size);
+    }
+    
+private:
+    int compression_level;
+};
+```
+
+### 2.4.4 Delta Compression for Time Series
+
+Delta compression is particularly effective for time series and monotonic data:
+
+```cpp
+class CompressionCodecDelta : public ICompressionCodec
+{
+public:
+    static constexpr UInt8 METHOD_BYTE = 0x93;
+    static constexpr auto CODEC_NAME = "Delta";
+    
+    explicit CompressionCodecDelta(UInt8 delta_bytes_size) : delta_bytes_size(delta_bytes_size) {}
+    
+    UInt8 getMethodByte() const override { return METHOD_BYTE; }
+    String getCodecDesc() const override 
+    { 
+        return CODEC_NAME + "(" + std::to_string(delta_bytes_size) + ")"; 
+    }
+    
+    bool isDeltaCodec() const override { return true; }
+    bool isGenericCompression() const override { return false; }
+    
+    UInt32 getMaxCompressedDataSize(UInt32 uncompressed_size) const override
+    {
+        // Delta compression doesn't reduce size, just transforms data
+        return uncompressed_size + sizeof(UInt8); // +1 for delta_bytes_size
+    }
+    
+    UInt32 compress(const char * source, UInt32 source_size, char * dest) const override
+    {
+        if (source_size < delta_bytes_size)
+            throw Exception("Cannot compress with Delta codec: source size too small", 
+                          ErrorCodes::CANNOT_COMPRESS);
+        
+        // Write delta_bytes_size header
+        *dest = delta_bytes_size;
+        dest++;
+        
+        // Copy first value unchanged
+        memcpy(dest, source, delta_bytes_size);
+        dest += delta_bytes_size;
+        source += delta_bytes_size;
+        
+        // Apply delta compression
+        UInt32 compressed_size = sizeof(UInt8) + delta_bytes_size;
+        
+        switch (delta_bytes_size)
+        {
+            case 1:
+                compressed_size += compressDelta<UInt8>(source, dest, source_size - delta_bytes_size);
+                break;
+            case 2:
+                compressed_size += compressDelta<UInt16>(source, dest, source_size - delta_bytes_size);
+                break;
+            case 4:
+                compressed_size += compressDelta<UInt32>(source, dest, source_size - delta_bytes_size);
+                break;
+            case 8:
+                compressed_size += compressDelta<UInt64>(source, dest, source_size - delta_bytes_size);
+                break;
+            default:
+                throw Exception("Unsupported delta bytes size: " + std::to_string(delta_bytes_size), 
+                              ErrorCodes::BAD_ARGUMENTS);
+        }
+        
+        return compressed_size;
+    }
+    
+    void decompress(const char * source, UInt32 source_size, char * dest, UInt32 uncompressed_size) const override
+    {
+        if (source_size < sizeof(UInt8))
+            throw Exception("Cannot decompress Delta: source too small", ErrorCodes::CANNOT_DECOMPRESS);
+        
+        UInt8 stored_delta_bytes_size = *source;
+        source++;
+        
+        if (stored_delta_bytes_size != delta_bytes_size)
+            throw Exception("Delta bytes size mismatch", ErrorCodes::CANNOT_DECOMPRESS);
+        
+        if (source_size < sizeof(UInt8) + delta_bytes_size)
+            throw Exception("Cannot decompress Delta: source too small", ErrorCodes::CANNOT_DECOMPRESS);
+        
+        // Copy first value unchanged
+        memcpy(dest, source, delta_bytes_size);
+        dest += delta_bytes_size;
+        source += delta_bytes_size;
+        
+        // Decompress deltas
+        switch (delta_bytes_size)
+        {
+            case 1:
+                decompressDelta<UInt8>(source, dest, source_size - sizeof(UInt8) - delta_bytes_size,
+                                     uncompressed_size - delta_bytes_size);
+                break;
+            case 2:
+                decompressDelta<UInt16>(source, dest, source_size - sizeof(UInt8) - delta_bytes_size,
+                                      uncompressed_size - delta_bytes_size);
+                break;
+            case 4:
+                decompressDelta<UInt32>(source, dest, source_size - sizeof(UInt8) - delta_bytes_size,
+                                      uncompressed_size - delta_bytes_size);
+                break;
+            case 8:
+                decompressDelta<UInt64>(source, dest, source_size - sizeof(UInt8) - delta_bytes_size,
+                                      uncompressed_size - delta_bytes_size);
+                break;
+            default:
+                throw Exception("Unsupported delta bytes size: " + std::to_string(delta_bytes_size), 
+                              ErrorCodes::BAD_ARGUMENTS);
+        }
+    }
+    
+private:
+    UInt8 delta_bytes_size;
+    
+    template<typename T>
+    UInt32 compressDelta(const char * source, char * dest, UInt32 source_size) const
+    {
+        const T * source_typed = reinterpret_cast<const T *>(source);
+        T * dest_typed = reinterpret_cast<T *>(dest);
+        
+        UInt32 source_count = source_size / sizeof(T);
+        T previous = *reinterpret_cast<const T *>(source - sizeof(T)); // First value
+        
+        for (UInt32 i = 0; i < source_count; ++i)
+        {
+            T current = source_typed[i];
+            dest_typed[i] = current - previous;
+            previous = current;
+        }
+        
+        return source_count * sizeof(T);
+    }
+    
+    template<typename T>
+    void decompressDelta(const char * source, char * dest, UInt32 source_size, UInt32 uncompressed_size) const
+    {
+        const T * source_typed = reinterpret_cast<const T *>(source);
+        T * dest_typed = reinterpret_cast<T *>(dest);
+        
+        UInt32 source_count = source_size / sizeof(T);
+        UInt32 dest_count = uncompressed_size / sizeof(T);
+        
+        if (source_count != dest_count)
+            throw Exception("Delta decompression size mismatch", ErrorCodes::CANNOT_DECOMPRESS);
+        
+        T previous = *reinterpret_cast<const T *>(dest - sizeof(T)); // First value
+        
+        for (UInt32 i = 0; i < source_count; ++i)
+        {
+            T delta = source_typed[i];
+            T current = previous + delta;
+            dest_typed[i] = current;
+            previous = current;
+        }
+    }
+};
+```
+
+### 2.4.5 Double Delta Compression
+
+Double delta compression is highly effective for timestamps and other smoothly changing sequences:
+
+```cpp
+class CompressionCodecDoubleDelta : public ICompressionCodec
+{
+public:
+    static constexpr UInt8 METHOD_BYTE = 0x94;
+    static constexpr auto CODEC_NAME = "DoubleDelta";
+    
+    explicit CompressionCodecDoubleDelta(UInt8 data_bytes_size) : data_bytes_size(data_bytes_size) {}
+    
+    UInt8 getMethodByte() const override { return METHOD_BYTE; }
+    String getCodecDesc() const override 
+    { 
+        return CODEC_NAME + "(" + std::to_string(data_bytes_size) + ")"; 
+    }
+    
+    bool isDeltaCodec() const override { return true; }
+    bool isGenericCompression() const override { return false; }
+    
+    UInt32 getMaxCompressedDataSize(UInt32 uncompressed_size) const override
+    {
+        // Double delta can potentially expand data in worst case
+        return uncompressed_size + (uncompressed_size / 8) + sizeof(UInt8) + 2 * data_bytes_size;
+    }
+    
+    UInt32 compress(const char * source, UInt32 source_size, char * dest) const override
+    {
+        if (source_size < 2 * data_bytes_size)
+            throw Exception("Cannot compress with DoubleDelta: source size too small", 
+                          ErrorCodes::CANNOT_COMPRESS);
+        
+        switch (data_bytes_size)
+        {
+            case 1:
+                return compressDoubleDelta<UInt8>(source, source_size, dest);
+            case 2:
+                return compressDoubleDelta<UInt16>(source, source_size, dest);
+            case 4:
+                return compressDoubleDelta<UInt32>(source, source_size, dest);
+            case 8:
+                return compressDoubleDelta<UInt64>(source, source_size, dest);
+            default:
+                throw Exception("Unsupported data bytes size: " + std::to_string(data_bytes_size), 
+                              ErrorCodes::BAD_ARGUMENTS);
+        }
+    }
+    
+    void decompress(const char * source, UInt32 source_size, char * dest, UInt32 uncompressed_size) const override
+    {
+        if (source_size < sizeof(UInt8))
+            throw Exception("Cannot decompress DoubleDelta: source too small", ErrorCodes::CANNOT_DECOMPRESS);
+        
+        UInt8 stored_data_bytes_size = *source;
+        if (stored_data_bytes_size != data_bytes_size)
+            throw Exception("Data bytes size mismatch", ErrorCodes::CANNOT_DECOMPRESS);
+        
+        switch (data_bytes_size)
+        {
+            case 1:
+                decompressDoubleDelta<UInt8>(source + 1, source_size - 1, dest, uncompressed_size);
+                break;
+            case 2:
+                decompressDoubleDelta<UInt16>(source + 1, source_size - 1, dest, uncompressed_size);
+                break;
+            case 4:
+                decompressDoubleDelta<UInt32>(source + 1, source_size - 1, dest, uncompressed_size);
+                break;
+            case 8:
+                decompressDoubleDelta<UInt64>(source + 1, source_size - 1, dest, uncompressed_size);
+                break;
+            default:
+                throw Exception("Unsupported data bytes size: " + std::to_string(data_bytes_size), 
+                              ErrorCodes::BAD_ARGUMENTS);
+        }
+    }
+    
+private:
+    UInt8 data_bytes_size;
+    
+    template<typename T>
+    UInt32 compressDoubleDelta(const char * source, UInt32 source_size, char * dest) const
+    {
+        const T * source_typed = reinterpret_cast<const T *>(source);
+        UInt32 source_count = source_size / sizeof(T);
+        
+        if (source_count < 2)
+            throw Exception("DoubleDelta requires at least 2 values", ErrorCodes::CANNOT_COMPRESS);
+        
+        // Write header
+        *dest = data_bytes_size;
+        dest++;
+        
+        // Write first two values unchanged
+        memcpy(dest, source_typed, 2 * sizeof(T));
+        dest += 2 * sizeof(T);
+        
+        // Compress double deltas using variable-length encoding
+        UInt32 compressed_size = sizeof(UInt8) + 2 * sizeof(T);
+        
+        T prev_value = source_typed[0];
+        T curr_value = source_typed[1];
+        T prev_delta = curr_value - prev_value;
+        
+        for (UInt32 i = 2; i < source_count; ++i)
+        {
+            T next_value = source_typed[i];
+            T curr_delta = next_value - curr_value;
+            T double_delta = curr_delta - prev_delta;
+            
+            // Variable-length encode the double delta
+            compressed_size += encodeVarint(double_delta, dest);
+            
+            prev_value = curr_value;
+            curr_value = next_value;
+            prev_delta = curr_delta;
+        }
+        
+        return compressed_size;
+    }
+    
+    template<typename T>
+    void decompressDoubleDelta(const char * source, UInt32 source_size, char * dest, UInt32 uncompressed_size) const
+    {
+        if (source_size < 2 * sizeof(T))
+            throw Exception("DoubleDelta source too small", ErrorCodes::CANNOT_DECOMPRESS);
+        
+        T * dest_typed = reinterpret_cast<T *>(dest);
+        UInt32 dest_count = uncompressed_size / sizeof(T);
+        
+        if (dest_count < 2)
+            throw Exception("DoubleDelta destination too small", ErrorCodes::CANNOT_DECOMPRESS);
+        
+        // Read first two values
+        memcpy(dest_typed, source, 2 * sizeof(T));
+        source += 2 * sizeof(T);
+        
+        if (dest_count == 2)
+            return;
+        
+        T prev_value = dest_typed[0];
+        T curr_value = dest_typed[1];
+        T prev_delta = curr_value - prev_value;
+        
+        const char * source_end = source + source_size - 2 * sizeof(T);
+        
+        for (UInt32 i = 2; i < dest_count; ++i)
+        {
+            if (source >= source_end)
+                throw Exception("DoubleDelta source exhausted", ErrorCodes::CANNOT_DECOMPRESS);
+            
+            T double_delta;
+            source += decodeVarint(source, double_delta);
+            
+            T curr_delta = prev_delta + double_delta;
+            T next_value = curr_value + curr_delta;
+            
+            dest_typed[i] = next_value;
+            
+            prev_value = curr_value;
+            curr_value = next_value;
+            prev_delta = curr_delta;
+        }
+    }
+    
+    template<typename T>
+    UInt32 encodeVarint(T value, char *& dest) const
+    {
+        // Simple variable-length encoding
+        UInt32 bytes_written = 0;
+        
+        while (value >= 0x80)
+        {
+            *dest++ = (value & 0x7F) | 0x80;
+            value >>= 7;
+            bytes_written++;
+        }
+        
+        *dest++ = value & 0x7F;
+        bytes_written++;
+        
+        return bytes_written;
+    }
+    
+    template<typename T>
+    UInt32 decodeVarint(const char * source, T & value) const
+    {
+        value = 0;
+        UInt32 shift = 0;
+        UInt32 bytes_read = 0;
+        
+        while (true)
+        {
+            UInt8 byte = *source++;
+            bytes_read++;
+            
+            value |= static_cast<T>(byte & 0x7F) << shift;
+            
+            if ((byte & 0x80) == 0)
+                break;
+            
+            shift += 7;
+        }
+        
+        return bytes_read;
+    }
+};
+```
+
+### 2.4.6 Codec Factory and Selection
+
+The codec factory manages codec registration and selection based on data characteristics:
+
+```cpp
+class CompressionCodecFactory
+{
+public:
+    static CompressionCodecFactory & instance()
+    {
+        static CompressionCodecFactory factory;
+        return factory;
+    }
+    
+    CompressionCodecPtr get(UInt8 method_byte) const
+    {
+        auto it = codecs_by_method_byte.find(method_byte);
+        if (it == codecs_by_method_byte.end())
+            throw Exception("Unknown compression method: " + std::to_string(method_byte), 
+                          ErrorCodes::UNKNOWN_COMPRESSION_METHOD);
+        
+        return it->second();
+    }
+    
+    CompressionCodecPtr get(const String & codec_name, std::optional<int> level = {}) const
+    {
+        auto it = codecs_by_name.find(codec_name);
+        if (it == codecs_by_name.end())
+            throw Exception("Unknown compression codec: " + codec_name, 
+                          ErrorCodes::UNKNOWN_COMPRESSION_METHOD);
+        
+        return it->second(level);
+    }
+    
+    void registerCodec(const String & codec_name, UInt8 method_byte, 
+                      std::function<CompressionCodecPtr()> creator)
+    {
+        codecs_by_name[codec_name] = [creator](std::optional<int>) { return creator(); };
+        codecs_by_method_byte[method_byte] = creator;
+    }
+    
+    void registerParameterizedCodec(const String & codec_name, UInt8 method_byte,
+                                   std::function<CompressionCodecPtr(std::optional<int>)> creator)
+    {
+        codecs_by_name[codec_name] = creator;
+        codecs_by_method_byte[method_byte] = [creator]() { return creator({}); };
+    }
+    
+    // Automatic codec selection based on data characteristics
+    CompressionCodecPtr selectOptimalCodec(const ColumnPtr & column, 
+                                          const CompressionSettings & settings) const
+    {
+        auto type = column->getDataType();
+        
+        // For time series data, prefer delta compression
+        if (settings.enable_time_series_compression && isTimeSeriesCandidate(column))
+        {
+            if (type->isInteger() && type->getSizeOfValueInMemory() <= 8)
+            {
+                return std::make_shared<CompressionCodecDoubleDelta>(type->getSizeOfValueInMemory());
+            }
+        }
+        
+        // For floating point data, use specialized codecs
+        if (type->isFloat())
+        {
+            return std::make_shared<CompressionCodecGorilla>();
+        }
+        
+        // For highly repetitive data, use dictionary compression
+        if (settings.enable_dictionary_compression && isDictionaryCandidate(column))
+        {
+            return std::make_shared<CompressionCodecT64>();
+        }
+        
+        // Default to LZ4 for general purpose compression
+        return std::make_shared<CompressionCodecLZ4>();
+    }
+    
+private:
+    std::unordered_map<String, std::function<CompressionCodecPtr(std::optional<int>)>> codecs_by_name;
+    std::unordered_map<UInt8, std::function<CompressionCodecPtr()>> codecs_by_method_byte;
+    
+    bool isTimeSeriesCandidate(const ColumnPtr & column) const
+    {
+        // Analyze column for time series characteristics
+        if (column->size() < 100)
+            return false;
+        
+        // Check for monotonic or nearly monotonic sequences
+        size_t monotonic_count = 0;
+        for (size_t i = 1; i < std::min(column->size(), size_t(1000)); ++i)
+        {
+            if (column->compareAt(i, i-1, *column, 1) >= 0)
+                monotonic_count++;
+        }
+        
+        return monotonic_count > column->size() * 0.8;
+    }
+    
+    bool isDictionaryCandidate(const ColumnPtr & column) const
+    {
+        // Check cardinality vs size ratio
+        auto cardinality = column->getNumberOfUniqueValues();
+        return cardinality < column->size() * 0.1; // Less than 10% unique values
+    }
+};
+```
+
+This comprehensive compression framework enables ClickHouse to achieve excellent storage efficiency while maintaining the high decompression speeds required for analytical query performance. The automatic codec selection ensures optimal compression for different data patterns without requiring manual tuning.
+
+## 2.5 Index Structures and Skip Indices (3,500 words)
+
+ClickHouse implements a sophisticated indexing system that combines primary indices with various skip indices to accelerate query execution across massive datasets. The indexing architecture is designed to work efficiently with the columnar storage format and support diverse query patterns.
+
+### 2.5.1 Primary Index Implementation
+
+The primary index in ClickHouse provides coarse-grained data location information based on the sorting key:
+
+```cpp
+class MergeTreePrimaryIndex
+{
+public:
+    using IndexType = std::vector<Field>;
+    using IndexPtr = std::shared_ptr<IndexType>;
+    
+    struct IndexEntry
+    {
+        IndexType key_values;
+        size_t granule_number;
+        size_t rows_count;
+        
+        bool operator<(const IndexEntry & other) const
+        {
+            return key_values < other.key_values;
+        }
+    };
+    
+    using IndexEntries = std::vector<IndexEntry>;
+    
+private:
+    IndexEntries entries;
+    KeyDescription key_description;
+    size_t index_granularity;
+    
+public:
+    MergeTreePrimaryIndex(const KeyDescription & key_description_, size_t index_granularity_)
+        : key_description(key_description_), index_granularity(index_granularity_)
+    {}
+    
+    void load(ReadBuffer & in, size_t marks_count)
+    {
+        entries.clear();
+        entries.reserve(marks_count);
+        
+        for (size_t i = 0; i < marks_count; ++i)
+        {
+            IndexEntry entry;
+            entry.granule_number = i;
+            entry.key_values.resize(key_description.column_names.size());
+            
+            // Read key values for this granule
+            for (size_t j = 0; j < key_description.column_names.size(); ++j)
+            {
+                const auto & key_column_type = key_description.data_types[j];
+                key_column_type->deserializeBinary(entry.key_values[j], in);
+            }
+            
+            entries.push_back(std::move(entry));
+        }
+    }
+    
+    void save(WriteBuffer & out) const
+    {
+        for (const auto & entry : entries)
+        {
+            for (size_t j = 0; j < key_description.column_names.size(); ++j)
+            {
+                const auto & key_column_type = key_description.data_types[j];
+                key_column_type->serializeBinary(entry.key_values[j], out);
+            }
+        }
+    }
+    
+    // Range queries using primary index
+    MarkRanges getMarkRanges(const KeyCondition & key_condition) const
+    {
+        MarkRanges ranges;
+        
+        if (entries.empty())
+            return ranges;
+        
+        // Binary search for range start
+        size_t left_bound = 0;
+        size_t right_bound = entries.size();
+        
+        // Find first granule that might contain matching data
+        while (left_bound < right_bound)
+        {
+            size_t middle = left_bound + (right_bound - left_bound) / 2;
+            
+            if (key_condition.mayBeTrueInRange(entries[middle].key_values,
+                                             middle + 1 < entries.size() ? 
+                                             entries[middle + 1].key_values : 
+                                             entries[middle].key_values))
+            {
+                right_bound = middle;
+            }
+            else
+            {
+                left_bound = middle + 1;
+            }
+        }
+        
+        size_t range_start = left_bound;
+        
+        // Find last granule that might contain matching data
+        left_bound = range_start;
+        right_bound = entries.size();
+        
+        while (left_bound < right_bound)
+        {
+            size_t middle = left_bound + (right_bound - left_bound) / 2;
+            
+            if (key_condition.mayBeTrueInRange(entries[middle].key_values,
+                                             middle + 1 < entries.size() ? 
+                                             entries[middle + 1].key_values : 
+                                             entries[middle].key_values))
+            {
+                left_bound = middle + 1;
+            }
+            else
+            {
+                right_bound = middle;
+            }
+        }
+        
+        size_t range_end = left_bound;
+        
+        if (range_start < range_end)
+        {
+            ranges.emplace_back(range_start, range_end);
+        }
+        
+        return ranges;
+    }
+    
+    // Point queries
+    std::optional<size_t> findGranule(const IndexType & key_values) const
+    {
+        auto it = std::lower_bound(entries.begin(), entries.end(), 
+                                  IndexEntry{key_values, 0, 0});
+        
+        if (it != entries.end() && it->key_values == key_values)
+            return it->granule_number;
+        
+        return std::nullopt;
+    }
+    
+    // Statistics
+    size_t getMemorySize() const
+    {
+        size_t size = sizeof(*this);
+        size += entries.size() * sizeof(IndexEntry);
+        
+        for (const auto & entry : entries)
+        {
+            for (const auto & field : entry.key_values)
+            {
+                size += field.size();
+            }
+        }
+        
+        return size;
+    }
+    
+    bool empty() const { return entries.empty(); }
+    size_t size() const { return entries.size(); }
+};
+```
+
+### 2.5.2 Skip Index Framework
+
+Skip indices provide additional indexing capabilities for non-primary key columns:
+
+```cpp
+class IMergeTreeIndex
+{
+public:
+    virtual ~IMergeTreeIndex() = default;
+    
+    // Index identification
+    virtual String getName() const = 0;
+    virtual String getTypeName() const = 0;
+    
+    // Index creation from column data
+    virtual MergeTreeIndexAggregatorPtr createIndexAggregator() const = 0;
+    virtual MergeTreeIndexConditionPtr createIndexCondition(
+        const SelectQueryInfo & query_info, ContextPtr context) const = 0;
+    
+    // Serialization
+    virtual void serializeBinary(const IndexGranules & granules, WriteBuffer & out) const = 0;
+    virtual void deserializeBinary(IndexGranules & granules, ReadBuffer & in) const = 0;
+    
+    // Index properties
+    virtual bool mayBenefitFromIndexForIn(const ASTPtr & node) const { return false; }
+    virtual size_t getIndexGranuleSize() const = 0;
+    
+    // Memory usage
+    virtual size_t getMemorySize() const = 0;
+    
+protected:
+    String index_name;
+    IndexDescription index_description;
+};
+
+class MergeTreeIndexAggregator
+{
+public:
+    virtual ~MergeTreeIndexAggregator() = default;
+    
+    // Update index with new data
+    virtual void update(const Block & block, size_t * pos, size_t limit) = 0;
+    
+    // Finalize current granule
+    virtual IndexGranulePtr getGranuleAndReset() = 0;
+    
+    // Check if granule is ready
+    virtual bool empty() const = 0;
+};
+
+class MergeTreeIndexCondition
+{
+public:
+    virtual ~MergeTreeIndexCondition() = default;
+    
+    // Check if index granule might contain matching data
+    virtual bool mayBeTrueOnGranule(const IndexGranulePtr & granule) const = 0;
+    
+    // Check if index can be used for this condition
+    virtual bool alwaysUnknownOrTrue() const = 0;
+    
+    // Get selectivity estimate
+    virtual Float64 getSelectivity() const { return 1.0; }
+};
+```
+
+### 2.5.3 MinMax Skip Index Implementation
+
+The MinMax index tracks minimum and maximum values for efficient range queries:
+
+```cpp
+class MergeTreeIndexMinMax : public IMergeTreeIndex
+{
+public:
+    explicit MergeTreeIndexMinMax(const IndexDescription & index_description_)
+        : index_description(index_description_)
+    {
+        index_name = index_description.name;
+    }
+    
+    String getName() const override { return index_name; }
+    String getTypeName() const override { return "minmax"; }
+    
+    MergeTreeIndexAggregatorPtr createIndexAggregator() const override
+    {
+        return std::make_shared<MergeTreeIndexAggregatorMinMax>(index_description);
+    }
+    
+    MergeTreeIndexConditionPtr createIndexCondition(
+        const SelectQueryInfo & query_info, ContextPtr context) const override
+    {
+        return std::make_shared<MergeTreeIndexConditionMinMax>(
+            query_info, context, index_description);
+    }
+    
+    void serializeBinary(const IndexGranules & granules, WriteBuffer & out) const override
+    {
+        for (const auto & granule : granules)
+        {
+            auto minmax_granule = std::static_pointer_cast<MergeTreeIndexGranuleMinMax>(granule);
+            
+            for (size_t i = 0; i < minmax_granule->min_values.size(); ++i)
+            {
+                const auto & type = index_description.data_types[i];
+                type->serializeBinary(minmax_granule->min_values[i], out);
+                type->serializeBinary(minmax_granule->max_values[i], out);
+            }
+        }
+    }
+    
+    void deserializeBinary(IndexGranules & granules, ReadBuffer & in) const override
+    {
+        for (auto & granule : granules)
+        {
+            auto minmax_granule = std::static_pointer_cast<MergeTreeIndexGranuleMinMax>(granule);
+            
+            for (size_t i = 0; i < index_description.data_types.size(); ++i)
+            {
+                const auto & type = index_description.data_types[i];
+                type->deserializeBinary(minmax_granule->min_values[i], in);
+                type->deserializeBinary(minmax_granule->max_values[i], in);
+            }
+        }
+    }
+    
+    size_t getIndexGranuleSize() const override
+    {
+        return index_description.data_types.size() * 2 * sizeof(Field);
+    }
+    
+    size_t getMemorySize() const override
+    {
+        return sizeof(*this) + index_description.getMemorySize();
+    }
+};
+
+class MergeTreeIndexGranuleMinMax : public IndexGranule
+{
+public:
+    std::vector<Field> min_values;
+    std::vector<Field> max_values;
+    bool initialized = false;
+    
+    explicit MergeTreeIndexGranuleMinMax(size_t columns_count)
+        : min_values(columns_count), max_values(columns_count)
+    {}
+    
+    void update(const Block & block, size_t * pos, size_t limit) override
+    {
+        if (!initialized)
+        {
+            initialize(block);
+            initialized = true;
+        }
+        
+        for (size_t column_idx = 0; column_idx < block.columns(); ++column_idx)
+        {
+            const auto & column = block.getByPosition(column_idx).column;
+            
+            for (size_t row = *pos; row < *pos + limit; ++row)
+            {
+                Field value;
+                column->get(row, value);
+                
+                if (value < min_values[column_idx])
+                    min_values[column_idx] = value;
+                
+                if (value > max_values[column_idx])
+                    max_values[column_idx] = value;
+            }
+        }
+    }
+    
+    bool empty() const override { return !initialized; }
+    
+private:
+    void initialize(const Block & block)
+    {
+        for (size_t column_idx = 0; column_idx < block.columns(); ++column_idx)
+        {
+            const auto & column = block.getByPosition(column_idx).column;
+            
+            if (column->size() > 0)
+            {
+                column->get(0, min_values[column_idx]);
+                max_values[column_idx] = min_values[column_idx];
+            }
+        }
+    }
+};
+
+class MergeTreeIndexConditionMinMax : public MergeTreeIndexCondition
+{
+public:
+    MergeTreeIndexConditionMinMax(
+        const SelectQueryInfo & query_info,
+        ContextPtr context,
+        const IndexDescription & index_description)
+        : key_condition(query_info, context, index_description.column_names, 
+                       index_description.expression)
+    {}
+    
+    bool mayBeTrueOnGranule(const IndexGranulePtr & granule) const override
+    {
+        auto minmax_granule = std::static_pointer_cast<MergeTreeIndexGranuleMinMax>(granule);
+        
+        if (!minmax_granule->initialized)
+            return true;
+        
+        return key_condition.mayBeTrueInRange(minmax_granule->min_values, 
+                                            minmax_granule->max_values);
+    }
+    
+    bool alwaysUnknownOrTrue() const override
+    {
+        return key_condition.alwaysUnknownOrTrue();
+    }
+    
+    Float64 getSelectivity() const override
+    {
+        return key_condition.getSelectivity();
+    }
+    
+private:
+    KeyCondition key_condition;
+};
+```
+
+### 2.5.4 Bloom Filter Skip Index
+
+Bloom filters provide efficient membership testing for equality and IN queries:
+
+```cpp
+class MergeTreeIndexBloomFilter : public IMergeTreeIndex
+{
+public:
+    explicit MergeTreeIndexBloomFilter(const IndexDescription & index_description_,
+                                      size_t bits_per_row_ = 10.0,
+                                      size_t hash_functions_ = 5)
+        : index_description(index_description_)
+        , bits_per_row(bits_per_row_)
+        , hash_functions(hash_functions_)
+    {
+        index_name = index_description.name;
+    }
+    
+    String getName() const override { return index_name; }
+    String getTypeName() const override { return "bloom_filter"; }
+    
+    MergeTreeIndexAggregatorPtr createIndexAggregator() const override
+    {
+        return std::make_shared<MergeTreeIndexAggregatorBloomFilter>(
+            index_description, bits_per_row, hash_functions);
+    }
+    
+    MergeTreeIndexConditionPtr createIndexCondition(
+        const SelectQueryInfo & query_info, ContextPtr context) const override
+    {
+        return std::make_shared<MergeTreeIndexConditionBloomFilter>(
+            query_info, context, index_description, hash_functions);
+    }
+    
+    bool mayBenefitFromIndexForIn(const ASTPtr & node) const override
+    {
+        return true; // Bloom filters are excellent for IN queries
+    }
+    
+    size_t getIndexGranuleSize() const override
+    {
+        // Approximate size of bloom filter
+        return (bits_per_row * 8192) / 8; // Assume 8192 rows per granule
+    }
+    
+private:
+    size_t bits_per_row;
+    size_t hash_functions;
+};
+
+class BloomFilter
+{
+public:
+    BloomFilter(size_t size_, size_t hash_functions_)
+        : size(size_), hash_functions(hash_functions_)
+    {
+        bits.resize((size + 7) / 8, 0);
+    }
+    
+    void add(const StringRef & value)
+    {
+        for (size_t i = 0; i < hash_functions; ++i)
+        {
+            size_t hash = calculateHash(value, i) % size;
+            setBit(hash);
+        }
+    }
+    
+    bool contains(const StringRef & value) const
+    {
+        for (size_t i = 0; i < hash_functions; ++i)
+        {
+            size_t hash = calculateHash(value, i) % size;
+            if (!getBit(hash))
+                return false;
+        }
+        return true;
+    }
+    
+    void serialize(WriteBuffer & out) const
+    {
+        writeBinary(size, out);
+        writeBinary(hash_functions, out);
+        out.write(reinterpret_cast<const char*>(bits.data()), bits.size());
+    }
+    
+    void deserialize(ReadBuffer & in)
+    {
+        readBinary(size, in);
+        readBinary(hash_functions, in);
+        bits.resize((size + 7) / 8);
+        in.read(reinterpret_cast<char*>(bits.data()), bits.size());
+    }
+    
+private:
+    size_t size;
+    size_t hash_functions;
+    std::vector<UInt8> bits;
+    
+    void setBit(size_t index)
+    {
+        bits[index / 8] |= (1 << (index % 8));
+    }
+    
+    bool getBit(size_t index) const
+    {
+        return (bits[index / 8] & (1 << (index % 8))) != 0;
+    }
+    
+    size_t calculateHash(const StringRef & value, size_t seed) const
+    {
+        // Use CityHash with different seeds
+        return CityHash_v1_0_2::CityHash64WithSeed(value.data, value.size, seed);
+    }
+};
+
+class MergeTreeIndexGranuleBloomFilter : public IndexGranule
+{
+public:
+    std::vector<BloomFilter> bloom_filters;
+    
+    explicit MergeTreeIndexGranuleBloomFilter(
+        size_t columns_count, size_t bits_per_row, size_t hash_functions)
+    {
+        bloom_filters.reserve(columns_count);
+        for (size_t i = 0; i < columns_count; ++i)
+        {
+            bloom_filters.emplace_back(bits_per_row * 8192, hash_functions); // 8192 rows per granule
+        }
+    }
+    
+    void update(const Block & block, size_t * pos, size_t limit) override
+    {
+        for (size_t column_idx = 0; column_idx < block.columns(); ++column_idx)
+        {
+            const auto & column = block.getByPosition(column_idx).column;
+            auto & bloom_filter = bloom_filters[column_idx];
+            
+            for (size_t row = *pos; row < *pos + limit; ++row)
+            {
+                StringRef value = column->getDataAt(row);
+                bloom_filter.add(value);
+            }
+        }
+    }
+    
+    bool empty() const override { return bloom_filters.empty(); }
+};
+```
+
+### 2.5.5 Index Selection and Optimization
+
+ClickHouse includes sophisticated logic for selecting and optimizing index usage:
+
+```cpp
+class IndexSelector
+{
+public:
+    struct IndexCandidate
+    {
+        MergeTreeIndexPtr index;
+        MergeTreeIndexConditionPtr condition;
+        Float64 selectivity;
+        size_t cost;
+        
+        bool operator<(const IndexCandidate & other) const
+        {
+            // Prefer indices with lower selectivity and cost
+            return selectivity * cost < other.selectivity * other.cost;
+        }
+    };
+    
+    static std::vector<IndexCandidate> selectIndices(
+        const std::vector<MergeTreeIndexPtr> & available_indices,
+        const SelectQueryInfo & query_info,
+        ContextPtr context)
+    {
+        std::vector<IndexCandidate> candidates;
+        
+        for (const auto & index : available_indices)
+        {
+            auto condition = index->createIndexCondition(query_info, context);
+            
+            if (condition->alwaysUnknownOrTrue())
+                continue; // Index cannot help with this query
+            
+            IndexCandidate candidate;
+            candidate.index = index;
+            candidate.condition = condition;
+            candidate.selectivity = condition->getSelectivity();
+            candidate.cost = estimateIndexCost(index, query_info);
+            
+            candidates.push_back(candidate);
+        }
+        
+        // Sort by effectiveness (selectivity * cost)
+        std::sort(candidates.begin(), candidates.end());
+        
+        // Remove redundant indices
+        return removeRedundantIndices(candidates, query_info);
+    }
+    
+private:
+    static size_t estimateIndexCost(const MergeTreeIndexPtr & index, 
+                                   const SelectQueryInfo & query_info)
+    {
+        // Simple cost model based on index type and size
+        size_t base_cost = 1;
+        
+        if (index->getTypeName() == "bloom_filter")
+            base_cost = 2; // Bloom filters have higher CPU cost
+        else if (index->getTypeName() == "minmax")
+            base_cost = 1; // MinMax is very cheap
+        
+        return base_cost * index->getIndexGranuleSize();
+    }
+    
+    static std::vector<IndexCandidate> removeRedundantIndices(
+        const std::vector<IndexCandidate> & candidates,
+        const SelectQueryInfo & query_info)
+    {
+        std::vector<IndexCandidate> result;
+        
+        for (const auto & candidate : candidates)
+        {
+            bool is_redundant = false;
+            
+            // Check if this index is made redundant by already selected indices
+            for (const auto & selected : result)
+            {
+                if (isIndexRedundant(candidate, selected, query_info))
+                {
+                    is_redundant = true;
+                    break;
+                }
+            }
+            
+            if (!is_redundant)
+                result.push_back(candidate);
+        }
+        
+        return result;
+    }
+    
+    static bool isIndexRedundant(const IndexCandidate & candidate,
+                                const IndexCandidate & selected,
+                                const SelectQueryInfo & query_info)
+    {
+        // Simple heuristic: if indices cover the same columns and selected has better selectivity
+        // In practice, this would be more sophisticated
+        return candidate.index->getName() == selected.index->getName() &&
+               candidate.selectivity >= selected.selectivity;
+    }
+};
+```
+
+This sophisticated indexing system enables ClickHouse to efficiently handle diverse query patterns across massive datasets, providing the performance characteristics required for real-time analytical workloads.
+
+## Phase 2 Summary
+
+Phase 2 has provided a comprehensive deep dive into ClickHouse's storage engine architecture, covering:
+
+1. **IStorage Interface and Architecture**: The foundational abstraction layer that enables diverse storage engines while maintaining consistent interfaces for query processing.
+
+2. **MergeTree Family Implementation**: The core LSM-tree-inspired storage engines including specialized variants for deduplication, aggregation, and other use cases.
+
+3. **Data Organization**: The three-tier hierarchy of parts, granules, and blocks that enables efficient compression, indexing, and parallel processing.
+
+4. **Compression Framework**: A comprehensive codec system supporting multiple algorithms optimized for different data types and access patterns.
+
+5. **Indexing System**: Primary indices combined with various skip indices that accelerate query execution across massive datasets.
+
+This storage layer foundation provides the robust, high-performance data management capabilities that enable ClickHouse to excel in analytical workloads while maintaining excellent compression ratios and query performance.
