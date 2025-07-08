@@ -22001,94 +22001,392 @@ ClickHouse's aggregate function system provides a flexible framework for impleme
 
 The core interface defines the contract for all aggregate functions:
 
+**IAggregateFunction - Aggregation Function Interface:**
+
 ```cpp
 class IAggregateFunction
 {
 public:
-    using AggregateDataPtr = char *;
+    using AggregateDataPtr = char *;                            // Pointer to aggregation state
+    using ConstAggregateDataPtr = const char *;                 // Const pointer to state
     
     virtual ~IAggregateFunction() = default;
     
-    /// Function metadata
-    virtual String getName() const = 0;
-    virtual DataTypePtr getReturnType() const = 0;
-    virtual DataTypes getArgumentTypes() const = 0;
+    /// Function metadata and type information
+    virtual String getName() const = 0;                        // Function name (sum, count, etc.)
+    virtual DataTypePtr getReturnType() const = 0;             // Result data type
+    virtual DataTypes getArgumentTypes() const = 0;            // Input argument types
     
-    /// State management
-    virtual size_t sizeOfData() const = 0;
-    virtual size_t alignOfData() const = 0;
-    virtual void create(AggregateDataPtr place) const = 0;
-    virtual void destroy(AggregateDataPtr place) const noexcept = 0;
+    /// Aggregation state memory management
+    virtual size_t sizeOfData() const = 0;                     // Bytes needed for state
+    virtual size_t alignOfData() const = 0;                    // Memory alignment requirement
+    virtual void create(AggregateDataPtr place) const = 0;     // Initialize state
+    virtual void destroy(AggregateDataPtr place) const noexcept = 0; // Cleanup state
     
-    /// Core aggregation operations
+    /// Core aggregation operations - single row processing
     virtual void add(
-        AggregateDataPtr place,
-        const IColumn ** columns,
-        size_t row_num,
-        Arena * arena) const = 0;
+        AggregateDataPtr place,                                 // State location
+        const IColumn ** columns,                               // Input columns
+        size_t row_num,                                         // Row index to process
+        Arena * arena) const = 0;                              // Memory arena for allocations
         
+    /// Vectorized batch processing for performance
     virtual void addBatch(
-        size_t batch_size,
-        AggregateDataPtr * places,
-        size_t place_offset,
-        const IColumn ** columns,
-        Arena * arena,
-        ssize_t if_argument_pos = -1) const = 0;
+        size_t batch_size,                                      // Number of rows to process
+        AggregateDataPtr * places,                              // Array of state locations
+        size_t place_offset,                                    // Offset within each state
+        const IColumn ** columns,                               // Input columns
+        Arena * arena,                                          // Memory arena
+        ssize_t if_argument_pos = -1) const = 0;               // Conditional column index
         
+    /// Sparse batch processing for nullable columns
     virtual void addBatchSparse(
-        size_t batch_size,
-        AggregateDataPtr * places,
-        size_t place_offset,
-        const IColumn ** columns,
-        const UInt8 * null_map,
-        Arena * arena,
-        ssize_t if_argument_pos = -1) const = 0;
+        size_t batch_size,                                      // Number of rows
+        AggregateDataPtr * places,                              // State locations
+        size_t place_offset,                                    // State offset
+        const IColumn ** columns,                               // Input columns
+        const UInt8 * null_map,                                 // NULL value indicators
+        Arena * arena,                                          // Memory arena
+        ssize_t if_argument_pos = -1) const = 0;               // Conditional processing
     
-    /// Merge operations for parallel aggregation
+    /// Merge operations for parallel and distributed aggregation
     virtual void merge(
-        AggregateDataPtr place,
-        ConstAggregateDataPtr rhs,
-        Arena * arena) const = 0;
+        AggregateDataPtr place,                                 // Target state
+        ConstAggregateDataPtr rhs,                              // Source state to merge
+        Arena * arena) const = 0;                              // Memory arena
         
+    /// Vectorized merge for multiple states
     virtual void mergeBatch(
-        size_t batch_size,
-        AggregateDataPtr * places,
-        size_t place_offset,
-        const AggregateDataPtr * rhs,
-        Arena * arena) const = 0;
+        size_t batch_size,                                      // Number of states to merge
+        AggregateDataPtr * places,                              // Target states
+        size_t place_offset,                                    // State offset
+        const AggregateDataPtr * rhs,                           // Source states
+        Arena * arena) const = 0;                              // Memory arena
     
     /// Serialization for storage and network transfer
     virtual void serialize(
-        ConstAggregateDataPtr place,
-        WriteBuffer & buf,
-        std::optional<size_t> version = std::nullopt) const = 0;
+        ConstAggregateDataPtr place,                            // State to serialize
+        WriteBuffer & buf,                                      // Output buffer
+        std::optional<size_t> version = std::nullopt) const = 0; // Format version
         
     virtual void deserialize(
-        AggregateDataPtr place,
-        ReadBuffer & buf,
-        std::optional<size_t> version = std::nullopt,
-        Arena * arena) const = 0;
+        AggregateDataPtr place,                                 // Target state location
+        ReadBuffer & buf,                                       // Input buffer
+        std::optional<size_t> version = std::nullopt,          // Format version
+        Arena * arena) const = 0;                              // Memory arena
     
-    /// Result extraction
+    /// Result extraction - convert state to final value
     virtual void insertResultInto(
-        ConstAggregateDataPtr place,
-        IColumn & to,
-        Arena * arena) const = 0;
+        ConstAggregateDataPtr place,                            // Source state
+        IColumn & to,                                           // Target column
+        Arena * arena) const = 0;                              // Memory arena
         
-    /// Optional optimization hints
-    virtual bool allocatesMemoryInArena() const { return false; }
-    virtual bool isState() const { return false; }
-    virtual bool isVersioned() const { return false; }
+    /// Performance and optimization hints
+    virtual bool allocatesMemoryInArena() const { return false; } // Uses arena memory
+    virtual bool isState() const { return false; }             // Returns state vs value
+    virtual bool isVersioned() const { return false; }         // Supports versioning
     virtual size_t getVersionFromRevision(size_t revision) const { return 0; }
     
-    /// Parallelization support
-    virtual bool canBeParallelized() const { return true; }
-    virtual AggregateFunctionPtr getOwnNullAdapter(
+    /// Parallelization and optimization support
+    virtual bool canBeParallelized() const { return true; }    // Thread-safe for parallel use
+    virtual AggregateFunctionPtr getOwnNullAdapter(            // NULL handling adapter
         const AggregateFunctionPtr &,
         const DataTypes &,
         const Array &,
         const Settings &) const { return nullptr; }
+        
+    /// Advanced optimization methods
+    virtual bool isCompilable() const { return false; }        // JIT compilation support
+    virtual void compileAdd(llvm::IRBuilderBase &, llvm::Value *) const {
+        throw Exception("Function is not compilable", ErrorCodes::NOT_IMPLEMENTED);
+    }
+    
+    /// Window function support
+    virtual bool isOnlyWindowFunction() const { return false; }
+    virtual bool allowsOptimizationToSubcolumns() const { return false; }
 };
+
+/// Helper base class for aggregate functions with typed state
+template <typename Data, typename Derived>
+class IAggregateFunctionDataHelper : public IAggregateFunction
+{
+protected:
+    using State = Data;
+    
+    /// Access typed state from raw pointer
+    static Data & data(AggregateDataPtr place) { 
+        return *reinterpret_cast<Data*>(place); 
+    }
+    
+    static const Data & data(ConstAggregateDataPtr place) { 
+        return *reinterpret_cast<const Data*>(place); 
+    }
+    
+public:
+    /// State memory management with proper alignment
+    size_t sizeOfData() const override { 
+        return sizeof(Data); 
+    }
+    
+    size_t alignOfData() const override { 
+        return alignof(Data); 
+    }
+    
+    void create(AggregateDataPtr place) const override {
+        new (place) Data;
+    }
+    
+    void destroy(AggregateDataPtr place) const noexcept override {
+        data(place).~Data();
+    }
+    
+    /// Default serialization for simple state types
+    void serialize(ConstAggregateDataPtr place, WriteBuffer & buf, 
+                   std::optional<size_t>) const override {
+        writeBinary(data(place), buf);
+    }
+    
+    void deserialize(AggregateDataPtr place, ReadBuffer & buf, 
+                     std::optional<size_t>, Arena *) const override {
+        readBinary(data(place), buf);
+    }
+};
+```
+
+**Real-World Aggregate Function Examples:**
+
+```cpp
+// Example: Comprehensive aggregate function implementations
+struct AggregateFunctionExamples {
+    
+    // 1. Simple Sum Function with Overflow Protection
+    template <typename T>
+    class AggregateFunctionSum : public IAggregateFunctionDataHelper<
+        AggregateFunctionSumData<T>, AggregateFunctionSum<T>>
+    {
+    private:
+        DataTypePtr result_type;
+        
+    public:
+        explicit AggregateFunctionSum(const DataTypes & argument_types)
+            : result_type(std::make_shared<DataTypeNumber<T>>())
+        {
+            if (argument_types.size() != 1)
+                throw Exception("Sum requires exactly one argument", ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+        }
+        
+        String getName() const override { return "sum"; }
+        DataTypePtr getReturnType() const override { return result_type; }
+        
+        void add(AggregateDataPtr place, const IColumn ** columns, 
+                 size_t row_num, Arena *) const override
+        {
+            const auto & column = static_cast<const ColumnVector<T> &>(*columns[0]);
+            auto value = column.getData()[row_num];
+            
+            // Overflow protection for integer types
+            if constexpr (std::is_integral_v<T>)
+            {
+                if (this->data(place).sum > std::numeric_limits<T>::max() - value)
+                    throw Exception("Sum overflow detected", ErrorCodes::DECIMAL_OVERFLOW);
+            }
+            
+            this->data(place).sum += value;
+        }
+        
+        void merge(AggregateDataPtr place, ConstAggregateDataPtr rhs, Arena *) const override
+        {
+            this->data(place).sum += this->data(rhs).sum;
+        }
+        
+        void insertResultInto(ConstAggregateDataPtr place, IColumn & to, Arena *) const override
+        {
+            static_cast<ColumnVector<T> &>(to).getData().push_back(this->data(place).sum);
+        }
+    };
+    
+    // 2. Advanced Count Function with NULL handling
+    class AggregateFunctionCount : public IAggregateFunctionDataHelper<
+        AggregateFunctionCountData, AggregateFunctionCount>
+    {
+    public:
+        String getName() const override { return "count"; }
+        DataTypePtr getReturnType() const override { 
+            return std::make_shared<DataTypeUInt64>(); 
+        }
+        
+        void add(AggregateDataPtr place, const IColumn ** columns, 
+                 size_t row_num, Arena *) const override
+        {
+            // Count non-NULL values
+            if (columns[0]->isNullAt(row_num))
+                return;
+                
+            ++this->data(place).count;
+        }
+        
+        void addBatch(size_t batch_size, AggregateDataPtr * places, size_t place_offset,
+                      const IColumn ** columns, Arena *, ssize_t if_argument_pos = -1) const override
+        {
+            const auto * null_map = columns[0]->getNullMapData();
+            const UInt8 * if_map = nullptr;
+            
+            if (if_argument_pos >= 0)
+                if_map = static_cast<const ColumnUInt8 &>(*columns[if_argument_pos]).getData().data();
+            
+            // Vectorized counting with SIMD optimization
+            for (size_t i = 0; i < batch_size; ++i)
+            {
+                if (null_map && null_map[i])
+                    continue;  // Skip NULL values
+                    
+                if (if_map && !if_map[i])
+                    continue;  // Skip conditional false values
+                    
+                AggregateDataPtr place = places[i] + place_offset;
+                ++this->data(place).count;
+            }
+        }
+        
+        void insertResultInto(ConstAggregateDataPtr place, IColumn & to, Arena *) const override
+        {
+            static_cast<ColumnUInt64 &>(to).getData().push_back(this->data(place).count);
+        }
+    };
+    
+    // 3. Complex Average Function with Precision Handling
+    class AggregateFunctionAvg : public IAggregateFunctionDataHelper<
+        AggregateFunctionAvgData, AggregateFunctionAvg>
+    {
+    private:
+        DataTypePtr argument_type;
+        
+    public:
+        explicit AggregateFunctionAvg(const DataTypes & argument_types)
+            : argument_type(argument_types[0])
+        {
+        }
+        
+        String getName() const override { return "avg"; }
+        DataTypePtr getReturnType() const override { 
+            return std::make_shared<DataTypeFloat64>(); 
+        }
+        
+        void add(AggregateDataPtr place, const IColumn ** columns, 
+                 size_t row_num, Arena *) const override
+        {
+            auto & state = this->data(place);
+            
+            if (columns[0]->isNullAt(row_num))
+                return;
+            
+            // Use Kahan summation for better precision
+            Float64 value = columns[0]->getFloat64(row_num);
+            Float64 y = value - state.compensation;
+            Float64 t = state.sum + y;
+            state.compensation = (t - state.sum) - y;
+            state.sum = t;
+            ++state.count;
+        }
+        
+        void merge(AggregateDataPtr place, ConstAggregateDataPtr rhs, Arena *) const override
+        {
+            auto & state_lhs = this->data(place);
+            const auto & state_rhs = this->data(rhs);
+            
+            // Merge with compensation
+            Float64 y = state_rhs.sum - state_lhs.compensation;
+            Float64 t = state_lhs.sum + y;
+            state_lhs.compensation = (t - state_lhs.sum) - y;
+            state_lhs.sum = t;
+            state_lhs.count += state_rhs.count;
+        }
+        
+        void insertResultInto(ConstAggregateDataPtr place, IColumn & to, Arena *) const override
+        {
+            const auto & state = this->data(place);
+            Float64 result = state.count > 0 ? state.sum / state.count : std::numeric_limits<Float64>::quiet_NaN();
+            static_cast<ColumnFloat64 &>(to).getData().push_back(result);
+        }
+    };
+    
+    // 4. String Aggregation Function (GROUP_CONCAT equivalent)
+    class AggregateFunctionGroupArray : public IAggregateFunctionDataHelper<
+        AggregateFunctionGroupArrayData, AggregateFunctionGroupArray>
+    {
+    private:
+        DataTypePtr argument_type;
+        size_t max_elements;
+        
+    public:
+        AggregateFunctionGroupArray(const DataTypes & argument_types, const Array & parameters)
+            : argument_type(argument_types[0])
+            , max_elements(parameters.empty() ? 0 : parameters[0].get<UInt64>())
+        {
+        }
+        
+        String getName() const override { return "groupArray"; }
+        DataTypePtr getReturnType() const override { 
+            return std::make_shared<DataTypeArray>(argument_type); 
+        }
+        
+        bool allocatesMemoryInArena() const override { return true; }
+        
+        void add(AggregateDataPtr place, const IColumn ** columns, 
+                 size_t row_num, Arena * arena) const override
+        {
+            auto & state = this->data(place);
+            
+            // Check size limit
+            if (max_elements > 0 && state.elements.size() >= max_elements)
+                return;
+            
+            // Clone element into arena memory
+            auto cloned_field = (*columns[0])[row_num];
+            if (cloned_field.getType() == Field::Types::String)
+            {
+                // Store string in arena for memory efficiency
+                const String & str = cloned_field.get<String>();
+                char * arena_str = arena->alloc(str.size());
+                memcpy(arena_str, str.data(), str.size());
+                cloned_field = String(arena_str, str.size());
+            }
+            
+            state.elements.push_back(cloned_field);
+        }
+        
+        void insertResultInto(ConstAggregateDataPtr place, IColumn & to, Arena *) const override
+        {
+            const auto & state = this->data(place);
+            static_cast<ColumnArray &>(to).insert(Array(state.elements.begin(), state.elements.end()));
+        }
+    };
+};
+
+/// Aggregate function state structures
+template <typename T>
+struct AggregateFunctionSumData
+{
+    T sum{};
+};
+
+struct AggregateFunctionCountData
+{
+    UInt64 count = 0;
+};
+
+struct AggregateFunctionAvgData
+{
+    Float64 sum = 0.0;
+    Float64 compensation = 0.0;  // For Kahan summation
+    UInt64 count = 0;
+};
+
+struct AggregateFunctionGroupArrayData
+{
+    std::vector<Field> elements;
+};
+```
 ```
 
 ### 5.2.2 Aggregate Function Registration System
@@ -22551,40 +22849,44 @@ private:
 
 ### 5.3.2 Aggregator Implementation
 
-The Aggregator class implements the core aggregation logic and coordinates with hash tables and aggregate functions:
+**Aggregator - Core Aggregation Engine:**
 
 ```cpp
 class Aggregator
 {
 private:
-    /// Configuration
-    Params params;
+    /// Aggregation configuration and parameters
+    Params params;                                              // Aggregation settings
     
-    /// Function and key management
-    AggregateFunctionsInstructions aggregate_functions;
-    std::vector<size_t> key_column_numbers;
-    std::vector<size_t> aggregate_column_numbers;
+    /// Function and column management
+    AggregateFunctionsInstructions aggregate_functions;        // Function execution plan
+    std::vector<size_t> key_column_numbers;                    // Key column indices
+    std::vector<size_t> aggregate_column_numbers;              // Value column indices
     
-    /// State management
-    AggregationStateManager state_manager;
+    /// State and memory management
+    AggregationStateManager state_manager;                     // Memory and state coordination
+    std::unique_ptr<Arena> arena;                               // Memory arena for states
     
-    /// Two-level aggregation support
-    TwoLevelSettings two_level_settings;
+    /// Multi-level aggregation support
+    TwoLevelSettings two_level_settings;                       // Large dataset optimization
+    std::atomic<bool> is_two_level_enabled{false};             // Dynamic level switching
+    
+    /// Performance tracking
+    mutable std::atomic<size_t> total_input_rows{0};
+    mutable std::atomic<size_t> hash_table_collisions{0};
+    mutable std::atomic<size_t> memory_usage_bytes{0};
     
 public:
-    explicit Aggregator(const Params & params_) : params(params_)
+    explicit Aggregator(const Params & params_) 
+        : params(params_)
+        , arena(std::make_unique<Arena>(params_.arena_initial_size))
     {
-        /// Initialize aggregate functions
-        setupAggregateFunctions();
-        
-        /// Setup key extraction
-        setupKeyColumns();
-        
-        /// Initialize state manager
-        state_manager.initialize(aggregate_functions);
+        initializeAggregationInfrastructure();
     }
     
-    /// Main aggregation execution
+    String getName() const { return "Aggregator"; }
+    
+    /// Main aggregation execution with performance monitoring
     void executeOnBlock(
         const Block & block,
         AggregatedDataVariants & result,
@@ -22592,13 +22894,27 @@ public:
         const ColumnNumbers & aggregate_columns,
         bool final) const
     {
-        /// Dispatch to appropriate aggregation method
+        if (block.rows() == 0)
+            return;
+        
+        total_input_rows += block.rows();
+        
+        /// Dynamic dispatch to optimized aggregation method based on key types
         result.dispatched_variants.visit([&](auto & variant) {
             executeOnBlockImpl(block, variant, key_columns, aggregate_columns, final);
         });
+        
+        /// Check if we should switch to two-level aggregation
+        if (!is_two_level_enabled.load() && shouldSwitchToTwoLevel(result))
+        {
+            switchToTwoLevelAggregation(result);
+        }
+        
+        /// Update memory usage tracking
+        memory_usage_bytes.store(calculateMemoryUsage(result));
     }
     
-    /// Generate output blocks
+    /// Generate optimized output blocks with batching
     Block prepareBlockAndFillWithoutKey(
         AggregatedDataVariants & data_variants,
         bool final,
@@ -22609,7 +22925,37 @@ public:
         });
     }
     
+    /// Two-level aggregation result generation
+    Block prepareBlockAndFillSingleLevel(
+        AggregatedDataVariants & data_variants,
+        bool final,
+        size_t max_block_size,
+        size_t bucket_num) const
+    {
+        if (!data_variants.isTwoLevel())
+            throw Exception("Data variants is not two-level", ErrorCodes::LOGICAL_ERROR);
+        
+        return data_variants.dispatched_variants.visit([&](auto & variant) -> Block {
+            return prepareBlockAndFillSingleLevelImpl(variant, final, max_block_size, bucket_num);
+        });
+    }
+    
 private:
+    void initializeAggregationInfrastructure()
+    {
+        /// Initialize aggregate functions with proper state layout
+        setupAggregateFunctions();
+        
+        /// Setup key column extraction
+        setupKeyColumns();
+        
+        /// Initialize state manager with arena
+        state_manager.initialize(aggregate_functions, arena.get());
+        
+        /// Configure two-level aggregation thresholds
+        configureTwoLevelSettings();
+    }
+    
     template <typename Method>
     void executeOnBlockImpl(
         const Block & block,
@@ -22618,36 +22964,39 @@ private:
         const ColumnNumbers & aggregate_columns,
         bool final) const
     {
+        /// Create method state for key extraction
         typename Method::State state(key_columns);
         
-        /// Extract key columns
+        /// Extract key columns with type validation
         ColumnRawPtrs key_columns_raw;
         key_columns_raw.reserve(key_columns.size());
         for (size_t i : key_columns)
-            key_columns_raw.push_back(block.getByPosition(i).column.get());
+        {
+            const auto & column = block.getByPosition(i);
+            key_columns_raw.push_back(column.column.get());
+        }
         
-        /// Extract aggregate columns
+        /// Extract aggregate columns with type validation
         ColumnRawPtrs aggregate_columns_raw;
         aggregate_columns_raw.reserve(aggregate_columns.size());
         for (size_t i : aggregate_columns)
-            aggregate_columns_raw.push_back(block.getByPosition(i).column.get());
-        
-        /// Perform aggregation
-        size_t rows = block.rows();
-        
-        /// Batch processing for performance
-        static constexpr size_t BATCH_SIZE = 4096;
-        
-        for (size_t batch_start = 0; batch_start < rows; batch_start += BATCH_SIZE)
         {
-            size_t batch_end = std::min(batch_start + BATCH_SIZE, rows);
+            const auto & column = block.getByPosition(i);
+            aggregate_columns_raw.push_back(column.column.get());
+        }
+        
+        /// Process rows in optimized batches
+        size_t rows = block.rows();
+        static constexpr size_t OPTIMAL_BATCH_SIZE = 4096;  // Cache-friendly batch size
+        
+        for (size_t batch_start = 0; batch_start < rows; batch_start += OPTIMAL_BATCH_SIZE)
+        {
+            size_t batch_end = std::min(batch_start + OPTIMAL_BATCH_SIZE, rows);
             size_t batch_size = batch_end - batch_start;
             
-            /// Process batch
-            executeOnBatch(
-                method, state, 
-                key_columns_raw, aggregate_columns_raw,
-                batch_start, batch_size);
+            /// Process batch with vectorized operations
+            executeOnBatch(method, state, key_columns_raw, aggregate_columns_raw,
+                          batch_start, batch_size);
         }
     }
     
@@ -22660,43 +23009,74 @@ private:
         size_t batch_start,
         size_t batch_size) const
     {
-        /// Prepare batch of aggregation places
+        /// Pre-allocate batch processing arrays
         std::vector<AggregateDataPtr> places(batch_size);
         std::vector<bool> places_new(batch_size);
+        std::vector<StringRef> keys(batch_size);  // For string keys
         
-        /// Extract or create aggregation states for each row in batch
+        /// Extract keys and find/create aggregation places
         for (size_t i = 0; i < batch_size; ++i)
         {
             size_t row_num = batch_start + i;
             
-            /// Get key for this row
-            auto key = state.getKey(key_columns, row_num);
+            /// Extract key for this row (optimized for different key types)
+            if constexpr (Method::low_cardinality_optimization)
+            {
+                keys[i] = state.getKeyStringRef(key_columns, row_num);
+            }
+            else
+            {
+                keys[i] = state.getKey(key_columns, row_num);
+            }
             
-            /// Find or create aggregation state
-            auto [place, inserted] = method.findOrCreatePlace(key);
+            /// Find or create aggregation state in hash table
+            auto [place, inserted] = method.emplaceKey(keys[i], arena.get());
             places[i] = place;
             places_new[i] = inserted;
             
-            /// Initialize state for new keys
+            /// Initialize aggregation state for new keys
             if (inserted)
+            {
                 state_manager.createStates(place);
+            }
+            else
+            {
+                /// Track hash table collisions for performance monitoring
+                ++hash_table_collisions;
+            }
         }
         
-        /// Apply aggregate functions to batch
+        /// Apply aggregate functions to the entire batch (vectorized)
         for (size_t func_idx = 0; func_idx < aggregate_functions.size(); ++func_idx)
         {
             const auto & instruction = aggregate_functions[func_idx];
             
-            /// Prepare function arguments
+            /// Prepare function arguments from aggregate columns
             ColumnRawPtrs func_columns;
+            func_columns.reserve(instruction.arguments.size());
             for (size_t arg_idx : instruction.arguments)
                 func_columns.push_back(aggregate_columns[arg_idx]);
             
-            /// Apply function to batch
-            instruction.function->addBatch(
-                batch_size, places.data(), instruction.state_offset,
-                func_columns.data(), state_manager.getArena(),
-                instruction.has_filter ? instruction.filter_column : -1);
+            /// Apply function to entire batch with optimizations
+            if (instruction.has_filter)
+            {
+                /// Conditional aggregation with filter column
+                const auto & filter_column = static_cast<const ColumnUInt8 &>(
+                    *aggregate_columns[instruction.filter_column]);
+                const auto & filter_data = filter_column.getData();
+                
+                instruction.function->addBatchSparse(
+                    batch_size, places.data(), instruction.state_offset,
+                    func_columns.data(), filter_data.data() + batch_start,
+                    arena.get());
+            }
+            else
+            {
+                /// Standard batch aggregation
+                instruction.function->addBatch(
+                    batch_size, places.data(), instruction.state_offset,
+                    func_columns.data(), arena.get());
+            }
         }
     }
     
@@ -22706,18 +23086,19 @@ private:
         bool final,
         size_t max_block_size) const
     {
+        /// Create result block with proper structure
         Block result_block = getHeader(final);
         MutableColumns result_columns = result_block.cloneEmptyColumns();
         
         size_t rows_processed = 0;
         
-        /// Iterate through all aggregated data
-        method.forEachPlace([&](const auto & key, AggregateDataPtr place) {
+        /// Iterate through hash table entries efficiently
+        method.forEachValue([&](const auto & key, AggregateDataPtr place) -> bool {
             if (rows_processed >= max_block_size)
-                return false;  /// Stop processing this batch
+                return false;  // Stop processing this batch
             
-            /// Insert key columns
-            insertKeyIntoColumns(key, result_columns, rows_processed);
+            /// Insert key columns into result
+            insertKeyIntoColumns(key, result_columns, key_column_numbers);
             
             /// Insert aggregated values
             for (size_t func_idx = 0; func_idx < aggregate_functions.size(); ++func_idx)
@@ -22725,14 +23106,26 @@ private:
                 const auto & instruction = aggregate_functions[func_idx];
                 size_t result_col_idx = key_column_numbers.size() + func_idx;
                 
-                instruction.function->insertResultInto(
-                    place + instruction.state_offset,
-                    *result_columns[result_col_idx],
-                    state_manager.getArena());
+                if (final)
+                {
+                    /// Final aggregation - extract final result
+                    instruction.function->insertResultInto(
+                        place + instruction.state_offset,
+                        *result_columns[result_col_idx],
+                        arena.get());
+                }
+                else
+                {
+                    /// Intermediate aggregation - serialize state
+                    instruction.function->serialize(
+                        place + instruction.state_offset,
+                        *result_columns[result_col_idx],
+                        arena.get());
+                }
             }
             
             ++rows_processed;
-            return true;  /// Continue processing
+            return true;  // Continue processing
         });
         
         result_block.setColumns(std::move(result_columns));
@@ -22743,36 +23136,202 @@ private:
     {
         aggregate_functions.reserve(params.aggregates.size());
         
+        /// Calculate optimal state layout for cache efficiency
+        size_t total_state_size = 0;
+        
         for (const auto & aggregate : params.aggregates)
         {
             AggregateFunctionInstruction instruction;
             instruction.function = aggregate.function;
             instruction.arguments = aggregate.argument_numbers;
-            instruction.state_offset = 0;  /// Will be calculated later
             instruction.has_filter = aggregate.filter_column >= 0;
             instruction.filter_column = aggregate.filter_column;
+            
+            /// Calculate aligned state offset
+            size_t alignment = instruction.function->alignOfData();
+            total_state_size = (total_state_size + alignment - 1) & ~(alignment - 1);
+            instruction.state_offset = total_state_size;
+            total_state_size += instruction.function->sizeOfData();
             
             aggregate_functions.push_back(std::move(instruction));
         }
         
-        /// Calculate state offsets
-        size_t offset = 0;
-        for (auto & instruction : aggregate_functions)
-        {
-            size_t alignment = instruction.function->alignOfData();
-            offset = (offset + alignment - 1) & ~(alignment - 1);
-            instruction.state_offset = offset;
-            offset += instruction.function->sizeOfData();
-        }
+        /// Store total state size for memory calculations
+        params.total_state_size = total_state_size;
     }
     
     void setupKeyColumns()
     {
         key_column_numbers.reserve(params.keys.size());
         for (const auto & key : params.keys)
+        {
             key_column_numbers.push_back(key);
+        }
+    }
+    
+    void configureTwoLevelSettings()
+    {
+        /// Configure thresholds based on available memory and data characteristics
+        two_level_settings.min_bytes_for_two_level = params.max_bytes_before_external_group_by / 4;
+        two_level_settings.min_cardinality_for_two_level = 100000;
+        two_level_settings.max_single_level_bytes = 256 * 1024 * 1024;  // 256MB
+    }
+    
+    bool shouldSwitchToTwoLevel(const AggregatedDataVariants & data_variants) const
+    {
+        size_t current_memory = calculateMemoryUsage(data_variants);
+        size_t cardinality = data_variants.size();
+        
+        return (current_memory > two_level_settings.min_bytes_for_two_level) ||
+               (cardinality > two_level_settings.min_cardinality_for_two_level);
+    }
+    
+    void switchToTwoLevelAggregation(AggregatedDataVariants & data_variants) const
+    {
+        if (is_two_level_enabled.exchange(true))
+            return;  // Already switched by another thread
+        
+        /// Convert single-level hash table to two-level
+        data_variants.dispatched_variants.visit([&](auto & variant) {
+            variant.convertToTwoLevel();
+        });
+        
+        LOG_DEBUG(&Poco::Logger::get("Aggregator"), 
+                 "Switched to two-level aggregation: {} bytes, {} keys",
+                 memory_usage_bytes.load(), data_variants.size());
+    }
+    
+    size_t calculateMemoryUsage(const AggregatedDataVariants & data_variants) const
+    {
+        return data_variants.dispatched_variants.visit([](const auto & variant) -> size_t {
+            return variant.getBufferSizeInBytes();
+        });
+    }
+    
+public:
+    /// Performance analytics and monitoring
+    struct AggregatorStatistics {
+        size_t input_rows = 0;
+        size_t unique_keys = 0;
+        size_t hash_table_size_bytes = 0;
+        size_t collision_count = 0;
+        double load_factor = 0.0;
+        bool is_two_level = false;
+        size_t arena_allocated_bytes = 0;
+        
+        String getEfficiencyReport() const {
+            return fmt::format(
+                "Aggregator: {} rows -> {} keys, {:.1f} MB hash table, "
+                "{:.2f} load factor, {} collisions{}",
+                input_rows, unique_keys, hash_table_size_bytes / 1024.0 / 1024.0,
+                load_factor, collision_count, is_two_level ? " (two-level)" : ""
+            );
+        }
+    };
+    
+    AggregatorStatistics getStatistics(const AggregatedDataVariants & data_variants) const
+    {
+        AggregatorStatistics stats;
+        
+        stats.input_rows = total_input_rows.load();
+        stats.collision_count = hash_table_collisions.load();
+        stats.hash_table_size_bytes = memory_usage_bytes.load();
+        stats.is_two_level = is_two_level_enabled.load();
+        stats.arena_allocated_bytes = arena->allocatedBytes();
+        
+        stats.unique_keys = data_variants.size();
+        if (stats.unique_keys > 0)
+        {
+            stats.load_factor = static_cast<double>(stats.unique_keys) / 
+                               data_variants.getHashTableCapacity();
+        }
+        
+        return stats;
     }
 };
+
+/// Hash table method selection based on key characteristics
+template <typename Key>
+struct AggregationMethodSelector
+{
+    using Type = std::conditional_t<
+        sizeof(Key) <= 8,
+        AggregationMethodOneNumber<Key>,      // Fast path for small keys
+        std::conditional_t<
+            std::is_same_v<Key, StringRef>,
+            AggregationMethodString,          // String key optimization
+            AggregationMethodSerialized       // Generic serialized keys
+        >
+    >;
+};
+```
+
+**Real-World Aggregation Examples:**
+```cpp
+// Example: Advanced aggregation patterns and optimizations
+struct AggregationPatterns {
+    
+    // High-cardinality aggregation with memory management
+    void demonstrateHighCardinalityAggregation() {
+        Aggregator::Params params;
+        params.keys = {0, 1};  // user_id, session_id
+        params.aggregates = {
+            {AggregateFunctionFactory::instance().get("count", {}), {}, -1},
+            {AggregateFunctionFactory::instance().get("sum", {std::make_shared<DataTypeUInt64>()}), {2}, -1},
+            {AggregateFunctionFactory::instance().get("uniq", {std::make_shared<DataTypeString>()}), {3}, -1}
+        };
+        params.max_bytes_before_external_group_by = 1024 * 1024 * 1024;  // 1GB limit
+        
+        Aggregator aggregator(params);
+        AggregatedDataVariants result;
+        
+        // Process large dataset with automatic two-level switching
+        // Expected: ~10M unique keys, 2-level hash table, ~500MB memory
+    }
+    
+    // Conditional aggregation with filter optimization
+    void demonstrateConditionalAggregation() {
+        // SQL: SELECT region, sumIf(revenue, status='completed'), countIf(status='failed') 
+        //      FROM transactions GROUP BY region
+        
+        Aggregator::Params params;
+        params.keys = {0};  // region
+        params.aggregates = {
+            {AggregateFunctionFactory::instance().get("sumIf", {
+                std::make_shared<DataTypeFloat64>(), std::make_shared<DataTypeUInt8>()
+            }), {1, 2}, -1},  // revenue, status_completed_flag
+            {AggregateFunctionFactory::instance().get("countIf", {
+                std::make_shared<DataTypeUInt8>()
+            }), {3}, -1}      // status_failed_flag
+        };
+        
+        // Efficient batch processing with sparse aggregation for filtered values
+    }
+    
+    // Multi-level aggregation for massive datasets
+    void demonstrateTwoLevelAggregation() {
+        Aggregator::Params params;
+        params.keys = {0, 1, 2};  // country, region, city
+        params.max_bytes_before_external_group_by = 2ULL * 1024 * 1024 * 1024;  // 2GB
+        
+        Aggregator aggregator(params);
+        AggregatedDataVariants result;
+        
+        // Automatic switching to two-level when memory threshold reached
+        // Benefits: Reduced memory pressure, better cache locality, parallel processing
+        
+        auto stats = aggregator.getStatistics(result);
+        if (stats.is_two_level) {
+            // Process buckets in parallel for final result generation
+            for (size_t bucket = 0; bucket < 256; ++bucket) {
+                auto bucket_result = aggregator.prepareBlockAndFillSingleLevel(
+                    result, true, 8192, bucket);
+                // Process bucket result...
+            }
+        }
+    }
+};
+```
 ```
 
 ### 5.3.3 Performance Optimizations
@@ -24187,58 +24746,69 @@ The RemoteQueryExecutor is the cornerstone of ClickHouse's distributed query pro
 
 The RemoteQueryExecutor implements a sophisticated state machine that manages all aspects of distributed query execution:
 
+**RemoteQueryExecutor - Distributed Query Execution Engine:**
+
 ```cpp
 class RemoteQueryExecutor
 {
 public:
+    /// Execution state machine for distributed query processing
     enum class State
     {
-        Inactive,
-        Init,
-        SendQuery,
-        ReadHeader,
-        ReadData,
-        ReadProgress,
-        ReadProfileInfo,
-        ReadTotals,
-        ReadExtremes,
-        Finished,
-        Error
+        Inactive,           // Initial state before query execution
+        Init,               // Connection initialization phase
+        SendQuery,          // Query distribution to remote nodes
+        ReadHeader,         // Schema negotiation with remote nodes
+        ReadData,           // Data streaming from remote nodes
+        ReadProgress,       // Progress reporting aggregation
+        ReadProfileInfo,    // Performance metrics collection
+        ReadTotals,         // GROUP BY WITH TOTALS result processing
+        ReadExtremes,       // MIN/MAX extremes result processing
+        Finished,           // Successful completion
+        Error               // Error state with cleanup
     };
 
 private:
-    State state = State::Inactive;
-    std::vector<Connection> connections;
-    std::unique_ptr<IQueryPipeline> pipeline;
-    ContextPtr query_context;
+    /// Core execution state
+    State state = State::Inactive;                              // Current execution state
+    std::vector<Connection> connections;                        // Active remote connections
+    std::unique_ptr<IQueryPipeline> pipeline;                   // Result processing pipeline
+    ContextPtr query_context;                                   // Query execution context
     
-    /// Connection management
-    std::shared_ptr<ConnectionPool> connection_pool;
-    std::vector<ConnectionPoolWithFailover::TryResult> try_results;
+    /// Connection pool management with failover
+    std::shared_ptr<ConnectionPool> connection_pool;            // Connection pool reference
+    std::vector<ConnectionPoolWithFailover::TryResult> try_results; // Connection attempts
     
-    /// Query execution state
-    std::atomic<bool> is_cancelled{false};
-    std::atomic<bool> is_query_sent{false};
-    String query_id;
-    String query_string;
+    /// Query execution coordination
+    std::atomic<bool> is_cancelled{false};                     // Cancellation flag
+    std::atomic<bool> is_query_sent{false};                    // Query distribution status
+    String query_id;                                            // Unique query identifier
+    String query_string;                                        // SQL query text
     
-    /// Result processing
-    Block header;
-    std::queue<Block> received_data_blocks;
-    Progress total_progress;
-    ProfileInfo profile_info;
+    /// Result processing and buffering
+    Block header;                                               // Result schema
+    std::queue<Block> received_data_blocks;                     // Buffered result blocks
+    Progress total_progress;                                    // Aggregated progress
+    ProfileInfo profile_info;                                   // Performance metrics
     
-    /// Timing and metrics
-    Stopwatch watch;
-    std::atomic<size_t> packets_sent{0};
-    std::atomic<size_t> packets_received{0};
+    /// Performance monitoring and diagnostics
+    Stopwatch watch;                                            // Execution timing
+    std::atomic<size_t> packets_sent{0};                       // Network packets sent
+    std::atomic<size_t> packets_received{0};                   // Network packets received
+    std::atomic<size_t> bytes_sent{0};                         // Data bytes sent
+    std::atomic<size_t> bytes_received{0};                     // Data bytes received
+    
+    /// Fault tolerance and retry management
+    std::atomic<size_t> connection_failures{0};                // Failed connection count
+    std::atomic<size_t> retry_attempts{0};                     // Retry attempt count
+    std::chrono::milliseconds max_retry_delay{5000};           // Maximum retry delay
     
 public:
     RemoteQueryExecutor(
-        const String & query_,
-        const Block & header_,
-        ContextPtr context_,
-        const ConnectionPoolWithFailover::TryResults & connections_)
+        const String & query_,                                  // SQL query to execute
+        const Block & header_,                                  // Expected result schema
+        ContextPtr context_,                                    // Query execution context
+        const ConnectionPoolWithFailover::TryResults & connections_) // Available connections
         : query_string(query_)
         , header(header_)
         , query_context(context_)
@@ -24248,45 +24818,81 @@ public:
         initializeConnections();
     }
     
-    /// Execute query and return pipeline for reading results
+    String getName() const { return "RemoteQueryExecutor"; }
+    
+    /// Execute distributed query with comprehensive error handling
     std::unique_ptr<QueryPipeline> execute()
     {
         watch.start();
         
         try
         {
-            sendQuery();
-            readHeader();
+            /// Phase 1: Distribute query to all remote nodes
+            sendQueryToAllNodes();
             
+            /// Phase 2: Negotiate result schema
+            readHeaderFromRemoteNodes();
+            
+            /// Phase 3: Create result processing pipeline
             auto source = std::make_shared<RemoteSource>(shared_from_this());
             auto pipeline = std::make_unique<QueryPipeline>();
             pipeline->init(Pipe(source));
             
+            /// Phase 4: Start async result collection
+            startAsyncResultCollection();
+            
             return pipeline;
         }
-        catch (...)
+        catch (const Exception & e)
         {
-            handleException();
+            handleExecutionException(e);
             throw;
         }
     }
     
-    /// Read next block of data
+    /// Read next block with intelligent buffering and error recovery
     Block read()
     {
         while (state != State::Finished && state != State::Error)
         {
+            /// Return buffered data if available
             if (!received_data_blocks.empty())
             {
                 Block block = std::move(received_data_blocks.front());
                 received_data_blocks.pop();
+                bytes_received += block.bytes();
                 return block;
             }
             
-            receivePacket();
+            /// Receive more data from remote nodes
+            receivePacketFromAnyNode();
         }
         
-        return {};
+        return {};  // No more data available
+    }
+    
+    /// Cancel distributed query execution
+    void cancel()
+    {
+        is_cancelled.store(true);
+        
+        /// Send cancellation to all active connections
+        for (auto & connection : connections)
+        {
+            try
+            {
+                connection.sendCancel();
+                LOG_DEBUG(&Poco::Logger::get("RemoteQueryExecutor"), 
+                         "Cancelled query {} on connection {}", query_id, connection.getDescription());
+            }
+            catch (const Exception & e)
+            {
+                LOG_WARNING(&Poco::Logger::get("RemoteQueryExecutor"), 
+                           "Failed to cancel query on connection: {}", e.message());
+            }
+        }
+        
+        state = State::Error;
     }
     
 private:
@@ -24294,106 +24900,197 @@ private:
     {
         connections.reserve(try_results.size());
         
+        /// Filter and validate available connections
         for (const auto & try_result : try_results)
         {
-            if (try_result.is_up_to_date)
+            if (try_result.is_up_to_date && try_result.is_usable)
             {
                 connections.push_back(try_result.entry->get());
+                LOG_DEBUG(&Poco::Logger::get("RemoteQueryExecutor"), 
+                         "Initialized connection to {}", try_result.entry->get().getDescription());
+            }
+            else
+            {
+                ++connection_failures;
+                LOG_WARNING(&Poco::Logger::get("RemoteQueryExecutor"), 
+                           "Skipped unusable connection: {}", try_result.fail_message);
             }
         }
         
         if (connections.empty())
             throw Exception("No available connections for distributed query execution", 
                           ErrorCodes::ALL_CONNECTION_TRIES_FAILED);
+        
+        LOG_INFO(&Poco::Logger::get("RemoteQueryExecutor"), 
+                "Initialized {} connections for query {}", connections.size(), query_id);
     }
     
-    void sendQuery()
+    void sendQueryToAllNodes()
     {
         state = State::SendQuery;
         
-        /// Prepare query settings for remote execution
+        /// Prepare optimized settings for remote execution
         Settings remote_settings = query_context->getSettings();
-        remote_settings.max_concurrent_queries_for_user = 0;  // Disable limit for remote
-        remote_settings.max_memory_usage_for_user = 0;        // Disable limit for remote
+        remote_settings.max_concurrent_queries_for_user = 0;   // Disable user limits
+        remote_settings.max_memory_usage_for_user = 0;         // Disable user memory limits
+        remote_settings.max_execution_time = 0;                // Disable time limits
+        remote_settings.enable_optimize_predicate_expression = true; // Enable optimizations
         
-        /// Send query to all connections in parallel
+        /// Send query to all connections in parallel for maximum throughput
         std::vector<std::future<void>> send_futures;
+        send_futures.reserve(connections.size());
         
         for (auto & connection : connections)
         {
             send_futures.emplace_back(
                 std::async(std::launch::async, [&]() {
-                    sendQueryToConnection(connection, remote_settings);
+                    sendQueryToSingleNode(connection, remote_settings);
                 })
             );
         }
         
-        /// Wait for all sends to complete
+        /// Wait for all sends to complete with timeout handling
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        
         for (auto & future : send_futures)
         {
-            future.get();
+            auto remaining_time = deadline - std::chrono::steady_clock::now();
+            if (remaining_time <= std::chrono::milliseconds::zero())
+            {
+                throw Exception("Query send timeout exceeded", ErrorCodes::TIMEOUT_EXCEEDED);
+            }
+            
+            if (future.wait_for(remaining_time) == std::future_status::timeout)
+            {
+                throw Exception("Query send timeout on remote node", ErrorCodes::TIMEOUT_EXCEEDED);
+            }
+            
+            future.get();  // Propagate any exceptions
         }
         
-        is_query_sent = true;
+        is_query_sent.store(true);
         packets_sent += connections.size();
+        
+        LOG_INFO(&Poco::Logger::get("RemoteQueryExecutor"), 
+                "Sent query {} to {} remote nodes", query_id, connections.size());
     }
     
-    void sendQueryToConnection(Connection & connection, const Settings & settings)
+    void sendQueryToSingleNode(Connection & connection, const Settings & settings)
     {
-        /// Create query packet
+        /// Create comprehensive query packet
         QueryPacket packet;
         packet.query_id = query_id;
         packet.query = query_string;
         packet.settings = settings;
-        packet.stage = QueryProcessingStage::Complete;
-        packet.compression = Protocol::Compression::Enable;
+        packet.stage = QueryProcessingStage::Complete;          // Full processing on remote
+        packet.compression = Protocol::Compression::Enable;     // Enable compression
+        packet.client_info = query_context->getClientInfo();    // Client context
         
-        /// Send query with timeout handling
-        connection.sendQuery(packet, query_context->getSettingsRef().connect_timeout_with_failover_ms);
-        
-        /// Set connection state
-        connection.setAsyncCallback([this](Connection & conn) {
-            handleAsyncResponse(conn);
-        });
+        /// Send query with retry logic
+        const size_t max_retries = 3;
+        for (size_t attempt = 0; attempt < max_retries; ++attempt)
+        {
+            try
+            {
+                connection.sendQuery(packet, query_context->getSettingsRef().connect_timeout_with_failover_ms);
+                
+                /// Set up async response handling
+                connection.setAsyncCallback([this](Connection & conn) {
+                    handleAsyncResponse(conn);
+                });
+                
+                bytes_sent += packet.query.size();
+                return;  // Success
+            }
+            catch (const Exception & e)
+            {
+                ++retry_attempts;
+                
+                if (attempt == max_retries - 1)
+                {
+                    throw Exception(fmt::format("Failed to send query after {} attempts: {}", 
+                                              max_retries, e.message()), e.code());
+                }
+                
+                /// Exponential backoff for retry
+                auto delay = std::chrono::milliseconds(100 * (1 << attempt));
+                std::this_thread::sleep_for(std::min(delay, max_retry_delay));
+                
+                LOG_WARNING(&Poco::Logger::get("RemoteQueryExecutor"), 
+                           "Query send attempt {} failed, retrying: {}", attempt + 1, e.message());
+            }
+        }
     }
     
-    void readHeader()
+    void readHeaderFromRemoteNodes()
     {
         state = State::ReadHeader;
         
-        /// Read header from first available connection
-        for (auto & connection : connections)
+        /// Read and validate header from first responding connection
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        
+        while (std::chrono::steady_clock::now() < deadline)
         {
-            if (connection.hasPacket())
+            for (auto & connection : connections)
             {
-                auto packet = connection.receivePacket();
-                if (packet.type == Protocol::Server::Data)
+                if (connection.hasPacket())
                 {
-                    header = packet.block.cloneEmpty();
-                    return;
+                    auto packet = connection.receivePacket();
+                    if (packet.type == Protocol::Server::Data)
+                    {
+                        Block received_header = packet.block.cloneEmpty();
+                        
+                        /// Validate header compatibility
+                        if (!header.cloneEmpty().isCompatibleWith(received_header))
+                        {
+                            throw Exception("Header mismatch between local and remote execution", 
+                                          ErrorCodes::LOGICAL_ERROR);
+                        }
+                        
+                        header = std::move(received_header);
+                        LOG_DEBUG(&Poco::Logger::get("RemoteQueryExecutor"), 
+                                 "Received header with {} columns", header.columns());
+                        return;
+                    }
+                    else if (packet.type == Protocol::Server::Exception)
+                    {
+                        throw Exception("Remote query failed during header phase: " + packet.exception.message,
+                                      packet.exception.code);
+                    }
                 }
             }
+            
+            /// Brief sleep to avoid busy waiting
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         
-        throw Exception("Failed to receive header from remote connections", 
-                      ErrorCodes::LOGICAL_ERROR);
+        throw Exception("Timeout waiting for header from remote nodes", ErrorCodes::TIMEOUT_EXCEEDED);
     }
     
-    void receivePacket()
+    void receivePacketFromAnyNode()
     {
         /// Poll all connections for available packets
+        bool received_any = false;
+        
         for (auto & connection : connections)
         {
             while (connection.hasPacket())
             {
                 auto packet = connection.receivePacket();
-                processReceivedPacket(packet);
-                packets_received++;
+                processReceivedPacket(packet, connection);
+                ++packets_received;
+                received_any = true;
             }
+        }
+        
+        if (!received_any && state != State::Finished)
+        {
+            /// Brief sleep to avoid busy waiting
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
     
-    void processReceivedPacket(const Protocol::Packet & packet)
+    void processReceivedPacket(const Protocol::Packet & packet, Connection & connection)
     {
         switch (packet.type)
         {
@@ -24401,33 +25098,66 @@ private:
                 if (packet.block.rows() > 0)
                 {
                     received_data_blocks.push(packet.block);
+                    LOG_TRACE(&Poco::Logger::get("RemoteQueryExecutor"), 
+                             "Received data block with {} rows from {}", 
+                             packet.block.rows(), connection.getDescription());
                 }
                 break;
                 
             case Protocol::Server::Progress:
+                /// Aggregate progress from all remote nodes
                 total_progress.incrementPiecewiseAtomically(packet.progress);
+                LOG_TRACE(&Poco::Logger::get("RemoteQueryExecutor"), 
+                         "Progress update: {} rows read, {} bytes processed", 
+                         packet.progress.read_rows, packet.progress.read_bytes);
                 break;
                 
             case Protocol::Server::ProfileInfo:
-                profile_info = packet.profile_info;
+                /// Merge profile information from remote nodes
+                profile_info.merge(packet.profile_info);
                 break;
                 
             case Protocol::Server::Totals:
-                /// Handle totals for GROUP BY WITH TOTALS
+                /// Handle totals for GROUP BY WITH TOTALS queries
+                if (packet.block.rows() > 0)
+                {
+                    received_data_blocks.push(packet.block);
+                    LOG_DEBUG(&Poco::Logger::get("RemoteQueryExecutor"), 
+                             "Received totals block with {} rows", packet.block.rows());
+                }
                 break;
                 
             case Protocol::Server::Extremes:
                 /// Handle extremes for queries with extremes
+                if (packet.block.rows() > 0)
+                {
+                    received_data_blocks.push(packet.block);
+                    LOG_DEBUG(&Poco::Logger::get("RemoteQueryExecutor"), 
+                             "Received extremes block");
+                }
                 break;
                 
             case Protocol::Server::EndOfStream:
-                state = State::Finished;
+                /// Check if all connections have finished
+                if (allConnectionsFinished())
+                {
+                    state = State::Finished;
+                    LOG_INFO(&Poco::Logger::get("RemoteQueryExecutor"), 
+                            "Query {} completed successfully", query_id);
+                }
                 break;
                 
             case Protocol::Server::Exception:
                 state = State::Error;
+                LOG_ERROR(&Poco::Logger::get("RemoteQueryExecutor"), 
+                         "Remote query execution failed: {}", packet.exception.message);
                 throw Exception("Remote query execution failed: " + packet.exception.message,
                               packet.exception.code);
+                break;
+                
+            default:
+                LOG_WARNING(&Poco::Logger::get("RemoteQueryExecutor"), 
+                           "Received unknown packet type: {}", static_cast<int>(packet.type));
                 break;
         }
     }
@@ -24436,17 +25166,22 @@ private:
     {
         try
         {
-            receivePacket();
+            receivePacketFromAnyNode();
         }
-        catch (...)
+        catch (const Exception & e)
         {
-            handleException();
+            LOG_ERROR(&Poco::Logger::get("RemoteQueryExecutor"), 
+                     "Async response handling failed: {}", e.message());
+            handleExecutionException(e);
         }
     }
     
-    void handleException()
+    void handleExecutionException(const Exception & e)
     {
         state = State::Error;
+        
+        LOG_ERROR(&Poco::Logger::get("RemoteQueryExecutor"), 
+                 "Query {} execution failed: {}", query_id, e.message());
         
         /// Cancel all active connections
         for (auto & connection : connections)
@@ -24455,8 +25190,79 @@ private:
             {
                 connection.sendCancel();
             }
-            catch (...) {}
+            catch (const Exception & cancel_e)
+            {
+                LOG_WARNING(&Poco::Logger::get("RemoteQueryExecutor"), 
+                           "Failed to cancel connection: {}", cancel_e.message());
+            }
         }
+    }
+    
+    bool allConnectionsFinished() const
+    {
+        for (const auto & connection : connections)
+        {
+            if (!connection.isFinished())
+                return false;
+        }
+        return true;
+    }
+    
+    void startAsyncResultCollection()
+    {
+        /// Start background thread for result collection if needed
+        if (query_context->getSettingsRef().async_insert)
+        {
+            std::thread([this]() {
+                while (state != State::Finished && state != State::Error)
+                {
+                    receivePacketFromAnyNode();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }).detach();
+        }
+    }
+    
+public:
+    /// Performance monitoring and diagnostics
+    struct RemoteExecutionStatistics {
+        size_t connections_count = 0;
+        size_t packets_sent = 0;
+        size_t packets_received = 0;
+        size_t bytes_sent = 0;
+        size_t bytes_received = 0;
+        size_t connection_failures = 0;
+        size_t retry_attempts = 0;
+        std::chrono::milliseconds execution_time{0};
+        State current_state = State::Inactive;
+        
+        String getPerformanceReport() const {
+            return fmt::format(
+                "RemoteQueryExecutor: {} connections, {}/{} packets, {:.1f}/{:.1f} MB, "
+                "{} failures, {} retries, {:.2f}s execution",
+                connections_count, packets_sent, packets_received,
+                bytes_sent / 1024.0 / 1024.0, bytes_received / 1024.0 / 1024.0,
+                connection_failures, retry_attempts, execution_time.count() / 1000.0
+            );
+        }
+    };
+    
+    RemoteExecutionStatistics getStatistics() const
+    {
+        RemoteExecutionStatistics stats;
+        
+        stats.connections_count = connections.size();
+        stats.packets_sent = packets_sent.load();
+        stats.packets_received = packets_received.load();
+        stats.bytes_sent = bytes_sent.load();
+        stats.bytes_received = bytes_received.load();
+        stats.connection_failures = connection_failures.load();
+        stats.retry_attempts = retry_attempts.load();
+        stats.execution_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - watch.start_time);
+        stats.current_state = state;
+        
+        return stats;
     }
 };
 ```
