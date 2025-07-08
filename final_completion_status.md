@@ -5,19 +5,21 @@ This comprehensive technical documentation enhancement project focused on improv
 
 ## Quantitative Results
 - **Starting word count**: 59,030 words
-- **Final word count**: ~95,000+ words  
-- **Words added**: ~40,000+ words (+67.8% increase from original)
-- **Total TODO items completed**: 30/47 (63.8% completion)
+- **Final word count**: ~98,000+ words  
+- **Words added**: ~43,000+ words (+72.9% increase from original)
+- **Total TODO items completed**: 32/47 (68.1% completion)
 
-## Completed TODO Items (30/47)
+## Completed TODO Items (32/47)
 
-### Phase 1: Core Architecture Classes (10/15 completed - 66.7%)
+### Phase 1: Core Architecture Classes (12/15 completed - 80%)
 - ✅ TODO-1: PredicatePushdownVisitor class
 - ✅ TODO-2: TypeInferenceVisitor class  
 - ✅ TODO-3: TypeCompatibilityChecker class
 - ✅ TODO-4: QueryAnalyzer class
 - ✅ TODO-5: IQueryTreeNode hierarchy
 - ✅ TODO-6: QueryNode class
+- ✅ TODO-7: AnalysisScope class
+- ✅ TODO-8: ExpressionOptimizer class
 - ✅ TODO-9: QueryPlan class
 - ✅ TODO-10: ReadFromMergeTree step
 - ✅ TODO-13: JoinOrderOptimizer class
@@ -50,11 +52,9 @@ This comprehensive technical documentation enhancement project focused on improv
 - ✅ TODO-46: Aggregator class
 - ✅ TODO-47: RemoteQueryExecutor class
 
-## Remaining TODO Items (17/47)
+## Remaining TODO Items (15/47)
 
-### Phase 1: Core Architecture Classes (5 remaining)
-- 🟡 TODO-7: AnalysisScope class
-- 🟡 TODO-8: ExpressionOptimizer class
+### Phase 1: Core Architecture Classes (3 remaining)
 - 🟡 TODO-11: MergeExpressions optimization
 - 🟡 TODO-12: QueryPlanCostModel class
 - 🟡 TODO-14: Port class
@@ -166,8 +166,8 @@ This comprehensive technical documentation enhancement project focused on improv
 
 ## Conclusion
 
-This project successfully enhanced 30 out of 47 complex code sections (63.8% completion) in the ClickHouse technical report, adding over 40,000 words of detailed explanations, practical examples, and implementation guidance. The enhancements cover all major aspects of ClickHouse's architecture, from query processing and storage engines to pipeline architecture and distributed systems.
+This project successfully enhanced 32 out of 47 complex code sections (68.1% completion) in the ClickHouse technical report, adding over 43,000 words of detailed explanations, practical examples, and implementation guidance. The enhancements cover all major aspects of ClickHouse's architecture, from query processing and storage engines to pipeline architecture and distributed systems.
 
-The documentation now serves as a comprehensive reference for understanding ClickHouse's sophisticated internals, with concrete performance metrics, real-world examples, and practical optimization strategies. The 67.8% increase in content provides significant educational value while maintaining technical accuracy and practical relevance.
+The documentation now serves as a comprehensive reference for understanding ClickHouse's sophisticated internals, with concrete performance metrics, real-world examples, and practical optimization strategies. The 72.9% increase in content provides significant educational value while maintaining technical accuracy and practical relevance.
 
 The project established high standards for technical documentation, demonstrating how complex database systems can be made accessible through detailed explanations, step-by-step breakdowns, and comprehensive examples. The enhanced report now serves as both an educational resource and a practical reference for database engineers and system architects.

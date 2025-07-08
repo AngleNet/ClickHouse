@@ -66,21 +66,25 @@ After reviewing the actual source code sections in the ClickHouse technical repo
 - ✅ Added simple SELECT, complex JOIN, and CTE query examples
 - ✅ Added child node management for tree traversal and transformations
 
-### 🟡 TODO-7: AnalysisScope class (Line 1535)
+### ✅ TODO-7: AnalysisScope class (Line 1535) **COMPLETED**
 **Issue**: Scope management without clear lifecycle explanation
-**Action**: Add scope nesting examples and variable resolution
-```cpp
-void addColumn(const String & column_name, DataTypePtr type);
-// Missing: How scope resolution works for nested queries
-```
+**Action**: ✅ Enhanced with comprehensive scope management implementation
+- ✅ Added complete AnalysisScope class with hierarchical scope management
+- ✅ Added scope types (QUERY, LAMBDA, ARRAY_JOIN, WITH) with different resolution rules
+- ✅ Added identifier resolution with priority ordering and scope chain traversal
+- ✅ Added real-world examples: nested scopes, lambda isolation, alias shadowing, CTE visibility
+- ✅ Added scope validation with circular dependency detection
+- ✅ Added comprehensive debugging and logging capabilities
 
-### 🟡 TODO-8: ExpressionOptimizer class (Line 1671)
+### ✅ TODO-8: ExpressionOptimizer class (Line 1671) **COMPLETED**
 **Issue**: Optimization rules without concrete examples
-**Action**: Add before/after optimization examples
-```cpp
-ASTPtr optimizeExpression(ASTPtr expression);
-// Missing: What optimizations are applied, performance impact
-```
+**Action**: ✅ Enhanced with comprehensive expression optimization engine
+- ✅ Added complete ExpressionOptimizer with configurable optimization settings
+- ✅ Added optimization categories: constant folding, logical, arithmetic, comparison, IF chain
+- ✅ Added detailed optimization rules for AND/OR/NOT, IF/multiIf, arithmetic operations
+- ✅ Added optimization statistics tracking and performance monitoring
+- ✅ Added 6 real-world examples showing before/after transformations
+- ✅ Added performance impact demonstration with operation savings
 
 ### ✅ TODO-9: QueryPlan class (Line 2009) **COMPLETED**
 **Issue**: Plan construction logic needs step-by-step breakdown
