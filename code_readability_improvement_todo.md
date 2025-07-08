@@ -105,13 +105,13 @@ After reviewing the actual source code sections in the ClickHouse technical repo
 - ✅ Added parallelization decision logic
 - ✅ Added performance characteristics and benefits analysis
 
-### 🟡 TODO-11: MergeExpressions optimization (Line 2298)
+### ✅ TODO-11: MergeExpressions optimization (Line 2298) **COMPLETED**
 **Issue**: Expression merging logic without examples
-**Action**: Add before/after examples of expression merging
-```cpp
-void transformPlan(QueryPlan & plan) override;
-// Missing: What expressions can be merged, performance benefits
-```
+**Action**: ✅ Enhanced with comprehensive MergeExpressions optimization rule
+- ✅ Added detailed motivation and algorithm description
+- ✅ Added real-world impact section with benchmark (-15% CPU time)
+- ✅ Added example showing 3 ExpressionSteps merged into 1
+- ✅ Added performance benefits explanation and logging
 
 ### 🟡 TODO-12: QueryPlanCostModel class (Line 2461)
 **Issue**: Cost calculation without clear examples
