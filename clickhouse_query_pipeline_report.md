@@ -2134,49 +2134,371 @@ query_node->setOrderBy(order_by_list);
 **Specialized Node Implementations:**
 
 ```cpp
-// QUERY Node - Represents complete SELECT statements
+**QueryNode - SQL Query Structure Representation:**
+
+```cpp
 class QueryNode : public IQueryTreeNode
 {
 private:
-    // SQL clause components
-    QueryTreeNodePtr projection;     // SELECT list
-    QueryTreeNodePtr join_tree;      // FROM/JOIN clause
-    QueryTreeNodePtr where;          // WHERE condition
-    QueryTreeNodePtr prewhere;       // PREWHERE condition (ClickHouse specific)
-    QueryTreeNodePtr group_by;       // GROUP BY expressions
-    QueryTreeNodePtr having;         // HAVING condition
-    QueryTreeNodePtr order_by;       // ORDER BY expressions
-    QueryTreeNodePtr limit_by;       // LIMIT BY expressions
-    QueryTreeNodePtr limit;          // LIMIT count
-    QueryTreeNodePtr offset;         // OFFSET count
+    /// SQL clause components mapped directly to query structure
+    QueryTreeNodePtr projection;                               // SELECT list with expressions
+    QueryTreeNodePtr join_tree;                                // FROM/JOIN clause tree
+    QueryTreeNodePtr where;                                    // WHERE condition
+    QueryTreeNodePtr prewhere;                                 // PREWHERE (ClickHouse optimization)
+    QueryTreeNodePtr group_by;                                 // GROUP BY expressions
+    QueryTreeNodePtr having;                                   // HAVING condition
+    QueryTreeNodePtr order_by;                                 // ORDER BY expressions
+    QueryTreeNodePtr limit_by;                                 // LIMIT BY expressions (ClickHouse)
+    QueryTreeNodePtr limit;                                    // LIMIT count
+    QueryTreeNodePtr offset;                                   // OFFSET count
     
-    // Query modifiers
-    bool is_distinct = false;
-    bool has_totals = false;
-    bool is_subquery = false;
-    bool is_cte = false;
+    /// Query modifiers and properties
+    bool is_distinct = false;                                  // DISTINCT keyword
+    bool has_totals = false;                                   // WITH TOTALS modifier
+    bool is_subquery = false;                                  // Nested in another query
+    bool is_cte = false;                                       // Common Table Expression
+    
+    /// Settings and optimization hints
+    SettingsChanges settings_changes;                          // Query-specific settings
+    std::optional<String> sample_size;                         // SAMPLE clause
+    std::optional<String> sample_offset;                       // SAMPLE OFFSET
     
 public:
     NodeType getNodeType() const override { return NodeType::QUERY; }
     String getName() const override { return "Query"; }
     
-    // Each clause accessor validates and maintains tree consistency
+    /// SQL clause accessors with validation
     void setProjection(QueryTreeNodePtr projection_) {
         validateNodeType(projection_, {NodeType::LIST});
         projection = std::move(projection_);
     }
+    
+    const QueryTreeNodePtr & getProjection() const { return projection; }
+    
+    void setJoinTree(QueryTreeNodePtr join_tree_) {
+        validateJoinTree(join_tree_);
+        join_tree = std::move(join_tree_);
+    }
+    
+    const QueryTreeNodePtr & getJoinTree() const { return join_tree; }
     
     void setWhere(QueryTreeNodePtr where_) {
         validateBooleanExpression(where_);
         where = std::move(where_);
     }
     
-    // Result type is determined by projection
+    const QueryTreeNodePtr & getWhere() const { return where; }
+    
+    void setPrewhere(QueryTreeNodePtr prewhere_) {
+        validateBooleanExpression(prewhere_);
+        prewhere = std::move(prewhere_);
+    }
+    
+    const QueryTreeNodePtr & getPrewhere() const { return prewhere; }
+    
+    /// Query property management
+    void setDistinct(bool is_distinct_) { is_distinct = is_distinct_; }
+    bool isDistinct() const { return is_distinct; }
+    
+    void setSubquery(bool is_subquery_) { is_subquery = is_subquery_; }
+    bool isSubquery() const { return is_subquery; }
+    
+    /// Result type is determined by projection columns
     DataTypePtr getResultType() const override {
         if (!projection) return nullptr;
         return buildTupleTypeFromProjection(projection);
     }
+    
+    /// Child node management for tree traversal
+    QueryTreeNodes getChildren() const override {
+        QueryTreeNodes children;
+        
+        if (projection) children.push_back(projection);
+        if (join_tree) children.push_back(join_tree);
+        if (where) children.push_back(where);
+        if (prewhere) children.push_back(prewhere);
+        if (group_by) children.push_back(group_by);
+        if (having) children.push_back(having);
+        if (order_by) children.push_back(order_by);
+        if (limit_by) children.push_back(limit_by);
+        if (limit) children.push_back(limit);
+        if (offset) children.push_back(offset);
+        
+        return children;
+    }
+    
+    void setChildren(QueryTreeNodes children) override {
+        // Reconstruct query from children - used during tree transformations
+        size_t child_index = 0;
+        
+        if (child_index < children.size() && projection)
+            projection = children[child_index++];
+        if (child_index < children.size() && join_tree)
+            join_tree = children[child_index++];
+        if (child_index < children.size() && where)
+            where = children[child_index++];
+        // ... continue for all clauses
+    }
+    
+private:
+    /// Validation helpers ensure tree consistency
+    void validateJoinTree(const QueryTreeNodePtr & node) {
+        if (!node) return;
+        
+        auto node_type = node->getNodeType();
+        if (node_type != NodeType::TABLE && 
+            node_type != NodeType::JOIN && 
+            node_type != NodeType::QUERY &&
+            node_type != NodeType::UNION) {
+            throw Exception("Invalid join tree node type", ErrorCodes::LOGICAL_ERROR);
+        }
+    }
+    
+    void validateBooleanExpression(const QueryTreeNodePtr & node) {
+        if (!node) return;
+        
+        auto result_type = node->getResultType();
+        if (!result_type || !isBool(result_type)) {
+            throw Exception("Expression must return boolean type", ErrorCodes::TYPE_MISMATCH);
+        }
+    }
+    
+    DataTypePtr buildTupleTypeFromProjection(const QueryTreeNodePtr & projection_node) {
+        auto & list_node = projection_node->as<ListNode &>();
+        DataTypes element_types;
+        Strings element_names;
+        
+        for (const auto & element : list_node.getNodes()) {
+            element_types.push_back(element->getResultType());
+            element_names.push_back(element->getAlias().empty() ? 
+                                   element->getName() : element->getAlias());
+        }
+        
+        return std::make_shared<DataTypeTuple>(element_types, element_names);
+    }
 };
+```
+
+**Real-World SQL to QueryNode Mapping Examples:**
+
+```cpp
+// Example: Simple SELECT query mapping
+struct QueryNodeMappingExamples {
+    
+    // SQL: SELECT name, age FROM users WHERE age > 18
+    QueryTreeNodePtr createSimpleSelectQuery() {
+        auto query_node = std::make_shared<QueryNode>();
+        
+        // Build projection: SELECT name, age
+        auto projection_list = std::make_shared<ListNode>();
+        
+        auto name_column = std::make_shared<ColumnNode>();
+        name_column->setColumnIdentifier(ColumnIdentifier("name"));
+        
+        auto age_column = std::make_shared<ColumnNode>();
+        age_column->setColumnIdentifier(ColumnIdentifier("age"));
+        
+        projection_list->getNodes().push_back(name_column);
+        projection_list->getNodes().push_back(age_column);
+        query_node->setProjection(projection_list);
+        
+        // Build join tree: FROM users
+        auto table_node = std::make_shared<TableNode>();
+        table_node->setTableName("users");
+        query_node->setJoinTree(table_node);
+        
+        // Build WHERE clause: WHERE age > 18
+        auto where_function = std::make_shared<FunctionNode>();
+        where_function->setFunctionName("greater");
+        
+        auto age_ref = std::make_shared<ColumnNode>();
+        age_ref->setColumnIdentifier(ColumnIdentifier("age"));
+        
+        auto constant_18 = std::make_shared<ConstantNode>();
+        constant_18->setValue(Field(18L));
+        
+        where_function->getArguments().push_back(age_ref);
+        where_function->getArguments().push_back(constant_18);
+        query_node->setWhere(where_function);
+        
+        return query_node;
+    }
+    
+    // SQL: SELECT u.name, COUNT(*) as post_count 
+    //      FROM users u JOIN posts p ON u.id = p.user_id 
+    //      WHERE u.active = 1 
+    //      GROUP BY u.name 
+    //      HAVING COUNT(*) > 5
+    //      ORDER BY post_count DESC
+    //      LIMIT 10
+    QueryTreeNodePtr createComplexJoinQuery() {
+        auto query_node = std::make_shared<QueryNode>();
+        
+        // Build projection: SELECT u.name, COUNT(*) as post_count
+        auto projection_list = std::make_shared<ListNode>();
+        
+        auto name_column = std::make_shared<ColumnNode>();
+        name_column->setColumnIdentifier(ColumnIdentifier("u", "name"));
+        
+        auto count_function = std::make_shared<FunctionNode>();
+        count_function->setFunctionName("count");
+        count_function->setAlias("post_count");
+        // COUNT(*) - no arguments needed
+        
+        projection_list->getNodes().push_back(name_column);
+        projection_list->getNodes().push_back(count_function);
+        query_node->setProjection(projection_list);
+        
+        // Build join tree: FROM users u JOIN posts p ON u.id = p.user_id
+        auto join_node = std::make_shared<JoinNode>();
+        join_node->setJoinKind(JoinKind::Inner);
+        
+        auto users_table = std::make_shared<TableNode>();
+        users_table->setTableName("users");
+        users_table->setAlias("u");
+        
+        auto posts_table = std::make_shared<TableNode>();
+        posts_table->setTableName("posts");
+        posts_table->setAlias("p");
+        
+        auto join_condition = std::make_shared<FunctionNode>();
+        join_condition->setFunctionName("equals");
+        
+        auto u_id = std::make_shared<ColumnNode>();
+        u_id->setColumnIdentifier(ColumnIdentifier("u", "id"));
+        
+        auto p_user_id = std::make_shared<ColumnNode>();
+        p_user_id->setColumnIdentifier(ColumnIdentifier("p", "user_id"));
+        
+        join_condition->getArguments().push_back(u_id);
+        join_condition->getArguments().push_back(p_user_id);
+        
+        join_node->setLeftTable(users_table);
+        join_node->setRightTable(posts_table);
+        join_node->setJoinCondition(join_condition);
+        query_node->setJoinTree(join_node);
+        
+        // Build WHERE clause: WHERE u.active = 1
+        auto where_condition = std::make_shared<FunctionNode>();
+        where_condition->setFunctionName("equals");
+        
+        auto u_active = std::make_shared<ColumnNode>();
+        u_active->setColumnIdentifier(ColumnIdentifier("u", "active"));
+        
+        auto constant_1 = std::make_shared<ConstantNode>();
+        constant_1->setValue(Field(1L));
+        
+        where_condition->getArguments().push_back(u_active);
+        where_condition->getArguments().push_back(constant_1);
+        query_node->setWhere(where_condition);
+        
+        // Build GROUP BY: GROUP BY u.name
+        auto group_by_list = std::make_shared<ListNode>();
+        auto group_by_name = std::make_shared<ColumnNode>();
+        group_by_name->setColumnIdentifier(ColumnIdentifier("u", "name"));
+        group_by_list->getNodes().push_back(group_by_name);
+        query_node->setGroupBy(group_by_list);
+        
+        // Build HAVING: HAVING COUNT(*) > 5
+        auto having_condition = std::make_shared<FunctionNode>();
+        having_condition->setFunctionName("greater");
+        
+        auto having_count = std::make_shared<FunctionNode>();
+        having_count->setFunctionName("count");
+        
+        auto constant_5 = std::make_shared<ConstantNode>();
+        constant_5->setValue(Field(5L));
+        
+        having_condition->getArguments().push_back(having_count);
+        having_condition->getArguments().push_back(constant_5);
+        query_node->setHaving(having_condition);
+        
+        // Build ORDER BY: ORDER BY post_count DESC
+        auto order_by_list = std::make_shared<ListNode>();
+        auto order_by_expr = std::make_shared<SortColumnNode>();
+        
+        auto post_count_ref = std::make_shared<ColumnNode>();
+        post_count_ref->setColumnIdentifier(ColumnIdentifier("post_count"));
+        
+        order_by_expr->setExpression(post_count_ref);
+        order_by_expr->setSortDirection(SortDirection::Descending);
+        order_by_list->getNodes().push_back(order_by_expr);
+        query_node->setOrderBy(order_by_list);
+        
+        // Build LIMIT: LIMIT 10
+        auto limit_constant = std::make_shared<ConstantNode>();
+        limit_constant->setValue(Field(10L));
+        query_node->setLimit(limit_constant);
+        
+        return query_node;
+    }
+    
+    // SQL: WITH user_stats AS (
+    //        SELECT user_id, COUNT(*) as post_count FROM posts GROUP BY user_id
+    //      )
+    //      SELECT u.name, us.post_count 
+    //      FROM users u 
+    //      JOIN user_stats us ON u.id = us.user_id
+    //      WHERE us.post_count > 10
+    QueryTreeNodePtr createCTEQuery() {
+        // Build CTE subquery first
+        auto cte_query = std::make_shared<QueryNode>();
+        cte_query->setCTE(true);
+        
+        // CTE projection: SELECT user_id, COUNT(*) as post_count
+        auto cte_projection = std::make_shared<ListNode>();
+        
+        auto user_id_column = std::make_shared<ColumnNode>();
+        user_id_column->setColumnIdentifier(ColumnIdentifier("user_id"));
+        
+        auto count_function = std::make_shared<FunctionNode>();
+        count_function->setFunctionName("count");
+        count_function->setAlias("post_count");
+        
+        cte_projection->getNodes().push_back(user_id_column);
+        cte_projection->getNodes().push_back(count_function);
+        cte_query->setProjection(cte_projection);
+        
+        // CTE FROM posts
+        auto posts_table = std::make_shared<TableNode>();
+        posts_table->setTableName("posts");
+        cte_query->setJoinTree(posts_table);
+        
+        // CTE GROUP BY user_id
+        auto cte_group_by = std::make_shared<ListNode>();
+        auto group_by_user_id = std::make_shared<ColumnNode>();
+        group_by_user_id->setColumnIdentifier(ColumnIdentifier("user_id"));
+        cte_group_by->getNodes().push_back(group_by_user_id);
+        cte_query->setGroupBy(cte_group_by);
+        
+        // Main query
+        auto main_query = std::make_shared<QueryNode>();
+        
+        // Register CTE in query context
+        auto cte_node = std::make_shared<CTENode>();
+        cte_node->setCTEName("user_stats");
+        cte_node->setCTEQuery(cte_query);
+        
+        // Main query uses CTE in join tree
+        auto main_join = std::make_shared<JoinNode>();
+        main_join->setJoinKind(JoinKind::Inner);
+        
+        auto users_table = std::make_shared<TableNode>();
+        users_table->setTableName("users");
+        users_table->setAlias("u");
+        
+        auto cte_table = std::make_shared<TableNode>();
+        cte_table->setTableName("user_stats");  // References CTE
+        cte_table->setAlias("us");
+        
+        main_join->setLeftTable(users_table);
+        main_join->setRightTable(cte_table);
+        main_query->setJoinTree(main_join);
+        
+        return main_query;
+    }
+};
+```
 
 // FUNCTION Node - Represents function calls
 class FunctionNode : public IQueryTreeNode  
@@ -14189,20 +14511,44 @@ The port system includes several advanced features that support sophisticated qu
 
 **Multi-input Processors**: Some processors require data from multiple input sources, such as join operations that need both left and right input streams. The port system supports processors with multiple input ports, each potentially operating at different rates and with different data availability patterns.
 
+**JoinProcessor - Multi-Algorithm Join Implementation:**
+
 ```cpp
 class JoinProcessor : public IProcessor
 {
 private:
     enum InputPortIndex { LEFT = 0, RIGHT = 1 };
+    
+    /// Join configuration and state
+    JoinPtr join;                                               // Join algorithm implementation
+    JoinKind join_kind;                                         // INNER, LEFT, RIGHT, FULL
+    JoinStrictness join_strictness;                             // ALL, ANY, ASOF
+    
+    /// Processing state
     bool left_finished = false;
     bool right_finished = false;
+    bool build_phase_finished = false;                          // Hash table build complete
+    bool probe_phase_started = false;                           // Probe phase active
+    
+    /// Performance tracking
+    size_t left_rows_processed = 0;
+    size_t right_rows_processed = 0;
+    size_t result_rows_produced = 0;
+    std::chrono::steady_clock::time_point start_time;
     
 public:
-    JoinProcessor(const Block & left_header, const Block & right_header)
+    JoinProcessor(const Block & left_header, const Block & right_header, 
+                  JoinPtr join_, JoinKind kind_, JoinStrictness strictness_)
+        : join(std::move(join_)), join_kind(kind_), join_strictness(strictness_)
+        , start_time(std::chrono::steady_clock::now())
     {
-        addInputPort(left_header);   /// Port 0: left input
-        addInputPort(right_header);  /// Port 1: right input
+        addInputPort(left_header);                              // Port 0: left input (build side)
+        addInputPort(right_header);                             // Port 1: right input (probe side)
         addOutputPort(createJoinHeader(left_header, right_header));
+    }
+    
+    String getName() const override { 
+        return "JoinProcessor(" + toString(join_kind) + "_" + toString(join_strictness) + ")";
     }
     
     Status prepare() override
@@ -14213,26 +14559,376 @@ public:
         auto & left_input = *std::next(inputs.begin(), LEFT);
         auto & right_input = *std::next(inputs.begin(), RIGHT);
         
-        /// Check output availability
+        /// Output port full - need to wait
         if (output.hasData())
             return Status::PortFull;
         
-        /// Check if both inputs have data or are finished
-        bool left_ready = left_input.hasData() || left_input.isFinished();
-        bool right_ready = right_input.hasData() || right_input.isFinished();
+        /// Check completion conditions
+        if (output.isFinished())
+        {
+            left_input.close();
+            right_input.close();
+            return Status::Finished;
+        }
         
-        if (left_ready && right_ready)
-            return Status::Ready;
-        
-        /// Set needed flags for missing inputs
-        if (!left_ready)
+        /// Phase 1: Build hash table from left side (smaller relation)
+        if (!build_phase_finished)
+        {
+            if (left_input.isFinished())
+            {
+                build_phase_finished = true;
+                join->finalizeBuild();                          // Optimize hash table after build
+                return Status::Ready;                           // Continue to probe phase
+            }
+            
+            if (left_input.hasData())
+                return Status::Ready;                           // Process left data
+            
             left_input.setNeeded();
-        if (!right_ready)
-            right_input.setNeeded();
+            return Status::NeedData;
+        }
         
+        /// Phase 2: Probe hash table with right side data
+        if (right_input.isFinished())
+        {
+            if (!probe_phase_started)
+            {
+                /// Handle special join types that need final processing
+                if (join_kind == JoinKind::Right || join_kind == JoinKind::Full)
+                {
+                    probe_phase_started = true;
+                    return Status::Ready;                       // Process non-matched left rows
+                }
+            }
+            
+            output.finish();
+            return Status::Finished;
+        }
+        
+        if (right_input.hasData())
+        {
+            probe_phase_started = true;
+            return Status::Ready;                               // Process right data
+        }
+        
+        right_input.setNeeded();
         return Status::NeedData;
     }
+    
+    void work() override
+    {
+        auto & inputs = getInputs();
+        auto & output = getOutputs().front();
+        
+        auto & left_input = *std::next(inputs.begin(), LEFT);
+        auto & right_input = *std::next(inputs.begin(), RIGHT);
+        
+        if (!build_phase_finished)
+        {
+            /// Build phase: Add left chunks to hash table
+            processBuildSide(left_input);
+        }
+        else if (right_input.hasData())
+        {
+            /// Probe phase: Join right chunks with hash table
+            auto result_chunk = processProbeSide(right_input);
+            if (!result_chunk.empty())
+                output.push(std::move(result_chunk));
+        }
+        else if (probe_phase_started && (join_kind == JoinKind::Right || join_kind == JoinKind::Full))
+        {
+            /// Final phase: Output non-matched left rows for RIGHT/FULL joins
+            auto result_chunk = processNonMatchedRows();
+            if (!result_chunk.empty())
+                output.push(std::move(result_chunk));
+            else
+                output.finish();
+        }
+    }
+    
+private:
+    void processBuildSide(InputPort & left_input)
+    {
+        auto chunk = left_input.pull();
+        if (chunk.empty())
+            return;
+        
+        left_rows_processed += chunk.getNumRows();
+        
+        /// Convert chunk to block for join interface
+        auto block = getInputs().front().getHeader().cloneWithColumns(chunk.detachColumns());
+        
+        /// Add block to join hash table
+        join->addJoinedBlock(block, /* check_limits */ true);
+        
+        /// Log progress for large joins
+        if (left_rows_processed % 1000000 == 0)
+        {
+            LOG_DEBUG(&Poco::Logger::get("JoinProcessor"), 
+                     "Build phase: processed {} left rows", left_rows_processed);
+        }
+    }
+    
+    Chunk processProbeSide(InputPort & right_input)
+    {
+        auto chunk = right_input.pull();
+        if (chunk.empty())
+            return {};
+        
+        right_rows_processed += chunk.getNumRows();
+        
+        /// Convert chunk to block for join interface
+        auto right_block = std::next(getInputs().begin(), RIGHT)->getHeader()
+                           .cloneWithColumns(chunk.detachColumns());
+        
+        /// Perform join operation
+        auto result_block = performJoinOperation(right_block);
+        
+        result_rows_produced += result_block.rows();
+        
+        /// Convert result back to chunk
+        return Chunk(result_block.getColumns(), result_block.rows());
+    }
+    
+    Block performJoinOperation(const Block & right_block)
+    {
+        Block result_block;
+        
+        switch (join_kind)
+        {
+            case JoinKind::Inner:
+                result_block = join->joinBlock(right_block);
+                break;
+                
+            case JoinKind::Left:
+                result_block = join->joinBlock(right_block, /* add_missing */ true);
+                break;
+                
+            case JoinKind::Right:
+                result_block = join->joinBlock(right_block);
+                // Right join handling is completed in processNonMatchedRows()
+                break;
+                
+            case JoinKind::Full:
+                result_block = join->joinBlock(right_block, /* add_missing */ true);
+                // Full join handling is completed in processNonMatchedRows()
+                break;
+                
+            default:
+                throw Exception("Unsupported join kind: " + toString(join_kind), 
+                              ErrorCodes::LOGICAL_ERROR);
+        }
+        
+        return result_block;
+    }
+    
+    Chunk processNonMatchedRows()
+    {
+        /// For RIGHT and FULL joins, output left rows that didn't match
+        auto non_matched_block = join->createBlockWithDefaults();
+        
+        if (non_matched_block.rows() == 0)
+            return {};  // No more non-matched rows
+        
+        return Chunk(non_matched_block.getColumns(), non_matched_block.rows());
+    }
+    
+    Block createJoinHeader(const Block & left_header, const Block & right_header)
+    {
+        Block result_header;
+        
+        /// Add left columns
+        for (const auto & column : left_header)
+            result_header.insert(column);
+        
+        /// Add right columns (avoid name conflicts)
+        for (const auto & column : right_header)
+        {
+            auto column_name = column.name;
+            if (left_header.has(column_name))
+                column_name = "right_" + column_name;
+            
+            result_header.insert({column.column, column.type, column_name});
+        }
+        
+        return result_header;
+    }
+    
+public:
+    /// Performance monitoring and statistics
+    struct JoinStatistics {
+        size_t left_rows = 0;
+        size_t right_rows = 0;
+        size_t result_rows = 0;
+        double build_duration_ms = 0.0;
+        double probe_duration_ms = 0.0;
+        double selectivity = 0.0;                               // result_rows / (left_rows * right_rows)
+        size_t hash_table_size_bytes = 0;
+        
+        String getEfficiencyReport() const {
+            return fmt::format(
+                "Join Stats: {}/{} -> {} rows ({:.2f}% selectivity), "
+                "Build: {:.1f}ms, Probe: {:.1f}ms, Hash table: {} MB",
+                left_rows, right_rows, result_rows, selectivity * 100,
+                build_duration_ms, probe_duration_ms, hash_table_size_bytes / 1024 / 1024
+            );
+        }
+    };
+    
+    JoinStatistics getStatistics() const
+    {
+        JoinStatistics stats;
+        stats.left_rows = left_rows_processed;
+        stats.right_rows = right_rows_processed;
+        stats.result_rows = result_rows_produced;
+        
+        auto current_time = std::chrono::steady_clock::now();
+        auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            current_time - start_time).count();
+        
+        // Estimate build vs probe time based on completion
+        if (build_phase_finished)
+        {
+            stats.build_duration_ms = total_duration * 0.3;     // Typically ~30% build time
+            stats.probe_duration_ms = total_duration * 0.7;     // Typically ~70% probe time
+        }
+        
+        if (left_rows_processed > 0 && right_rows_processed > 0)
+        {
+            stats.selectivity = static_cast<double>(result_rows_produced) / 
+                               (left_rows_processed * right_rows_processed);
+        }
+        
+        if (join)
+            stats.hash_table_size_bytes = join->getTotalByteCount();
+        
+        return stats;
+    }
 };
+
+/// Specialized join processors for different algorithms
+
+/// Hash Join - Most common implementation
+class HashJoinProcessor : public JoinProcessor
+{
+public:
+    HashJoinProcessor(const Block & left_header, const Block & right_header,
+                     const Names & left_keys, const Names & right_keys,
+                     JoinKind kind, JoinStrictness strictness)
+        : JoinProcessor(left_header, right_header, 
+                       createHashJoin(left_keys, right_keys, kind, strictness),
+                       kind, strictness)
+    {
+    }
+    
+    String getName() const override { return "HashJoinProcessor"; }
+    
+private:
+    static JoinPtr createHashJoin(const Names & left_keys, const Names & right_keys,
+                                 JoinKind kind, JoinStrictness strictness)
+    {
+        auto table_join = std::make_shared<TableJoin>();
+        table_join->setKeys(left_keys, right_keys);
+        table_join->setKind(kind);
+        table_join->setStrictness(strictness);
+        
+        return std::make_shared<HashJoin>(table_join, /* right_sample_block */ Block{});
+    }
+};
+
+/// Sort-Merge Join - Memory efficient for large datasets
+class SortMergeJoinProcessor : public JoinProcessor
+{
+private:
+    SortDescription left_sort_description;
+    SortDescription right_sort_description;
+    
+public:
+    SortMergeJoinProcessor(const Block & left_header, const Block & right_header,
+                          const SortDescription & left_sort, const SortDescription & right_sort,
+                          JoinKind kind, JoinStrictness strictness)
+        : JoinProcessor(left_header, right_header,
+                       createSortMergeJoin(left_sort, right_sort, kind, strictness),
+                       kind, strictness)
+        , left_sort_description(left_sort)
+        , right_sort_description(right_sort)
+    {
+    }
+    
+    String getName() const override { return "SortMergeJoinProcessor"; }
+    
+private:
+    static JoinPtr createSortMergeJoin(const SortDescription & left_sort, 
+                                      const SortDescription & right_sort,
+                                      JoinKind kind, JoinStrictness strictness)
+    {
+        auto table_join = std::make_shared<TableJoin>();
+        table_join->setKind(kind);
+        table_join->setStrictness(strictness);
+        
+        return std::make_shared<SortMergeJoin>(table_join, left_sort, right_sort);
+    }
+};
+```
+
+**Real-World Join Algorithm Selection Examples:**
+```cpp
+// Example: Intelligent join algorithm selection
+struct JoinAlgorithmSelector {
+    
+    // Small table + large table -> Hash join with small table as build side
+    ProcessorPtr selectHashJoin(const Block & small_header, const Block & large_header,
+                               size_t small_rows, size_t large_rows) {
+        if (small_rows * 1000 < large_rows) {  // 1000x size difference
+            // Use smaller table as build side
+            return std::make_shared<HashJoinProcessor>(
+                small_header, large_header,
+                Names{"id"}, Names{"user_id"},
+                JoinKind::Inner, JoinStrictness::All
+            );
+        }
+        return nullptr;
+    }
+    
+    // Both tables large and sorted -> Sort-merge join
+    ProcessorPtr selectSortMergeJoin(const Block & left_header, const Block & right_header,
+                                    bool left_sorted, bool right_sorted) {
+        if (left_sorted && right_sorted) {
+            SortDescription left_sort{{"id", 1, 1}};   // Ascending, nulls first
+            SortDescription right_sort{{"user_id", 1, 1}};
+            
+            return std::make_shared<SortMergeJoinProcessor>(
+                left_header, right_header,
+                left_sort, right_sort,
+                JoinKind::Inner, JoinStrictness::All
+            );
+        }
+        return nullptr;
+    }
+    
+    // Memory constrained environment -> Prefer sort-merge
+    ProcessorPtr selectMemoryEfficientJoin(size_t available_memory_bytes,
+                                          size_t estimated_hash_table_size) {
+        if (estimated_hash_table_size > available_memory_bytes * 0.8) {
+            // Hash table would use >80% of available memory
+            // Use sort-merge join instead
+            return selectSortMergeJoin(/* ... */);
+        }
+        return selectHashJoin(/* ... */);
+    }
+    
+    // High cardinality keys -> Consider bloom filter optimization
+    ProcessorPtr selectBloomFilterJoin(size_t left_cardinality, size_t right_cardinality) {
+        if (left_cardinality > 1000000 && right_cardinality > 1000000) {
+            // Use bloom filter to reduce probe side
+            auto hash_join = selectHashJoin(/* ... */);
+            // Add bloom filter optimization
+            return std::make_shared<BloomFilterOptimizedJoin>(hash_join);
+        }
+        return selectHashJoin(/* ... */);
+    }
+};
+```
 ```
 
 **Conditional Data Flow**: Certain processors implement conditional logic that determines which output ports receive data based on processing results. For example, a filter processor might send matching rows to one output port and non-matching rows to another for further processing.
@@ -15895,38 +16591,89 @@ private:
 
 **Processor-Level Parallelism**: Individual processors can leverage internal parallelism through vectorization, multi-threading, and specialized algorithms:
 
+**ParallelAggregatingTransform - High-Performance Parallel Aggregation:**
+
 ```cpp
 class ParallelAggregatingTransform : public IProcessor
 {
 private:
-    /// Aggregation parameters
-    AggregatingParams params;
-    size_t num_threads;
+    /// Aggregation configuration
+    AggregatingParams params;                                   // Function definitions and settings
+    size_t num_threads;                                         // Parallel aggregation threads
     
-    /// Parallel aggregation state
-    std::vector<std::unique_ptr<Aggregator>> aggregators;
-    std::vector<std::thread> aggregation_threads;
-    ThreadPool thread_pool;
+    /// Thread management and coordination
+    std::vector<std::unique_ptr<Aggregator>> aggregators;      // Per-thread aggregators
+    ThreadPoolWithFallback thread_pool;                        // Dynamic thread scheduling
     
-    /// Synchronization
-    std::mutex result_mutex;
-    std::condition_variable completion_signal;
-    std::atomic<size_t> completed_threads{0};
+    /// Data partitioning and distribution
+    std::unique_ptr<HashPartitioner> partitioner;              // Hash-based data distribution
+    std::vector<HashTableStats> thread_stats;                  // Per-thread performance tracking
+    
+    /// Synchronization and coordination
+    std::mutex result_mutex;                                    // Final result protection
+    std::condition_variable completion_signal;                  // Thread completion notification
+    std::atomic<size_t> completed_threads{0};                  // Active thread counter
+    std::atomic<size_t> total_input_rows{0};                   // Input data tracking
+    std::atomic<size_t> total_output_rows{0};                  // Result data tracking
+    
+    /// Memory management
+    SharedMemoryPool shared_memory;                             // Cross-thread memory sharing
+    std::vector<Arena> thread_arenas;                           // Per-thread memory arenas
+    
+    /// Performance monitoring
+    std::chrono::steady_clock::time_point start_time;
+    mutable std::atomic<size_t> bytes_processed{0};
+    mutable std::atomic<size_t> hash_table_collisions{0};
     
 public:
     ParallelAggregatingTransform(const Block & header_, 
                                 const AggregatingParams & params_,
                                 size_t num_threads_)
         : params(params_), num_threads(num_threads_)
+        , thread_pool(num_threads_)
+        , shared_memory(1024 * 1024 * 1024)  // 1GB shared pool
+        , start_time(std::chrono::steady_clock::now())
     {
         addInputPort(header_);
         addOutputPort(params.getHeader(header_));
         
-        /// Create per-thread aggregators
-        for (size_t i = 0; i < num_threads; ++i)
+        initializeAggregationInfrastructure();
+    }
+    
+    String getName() const override { 
+        return "ParallelAggregatingTransform(" + std::to_string(num_threads) + " threads)";
+    }
+    
+    Status prepare() override
+    {
+        auto & input = getInputs().front();
+        auto & output = getOutputs().front();
+        
+        if (output.isFinished())
         {
-            aggregators.emplace_back(std::make_unique<Aggregator>(params));
+            input.close();
+            return Status::Finished;
         }
+        
+        if (output.hasData())
+            return Status::PortFull;
+        
+        if (input.isFinished())
+        {
+            if (completed_threads.load() < num_threads)
+                return Status::Async;  // Wait for aggregation completion
+            
+            output.finish();
+            return Status::Finished;
+        }
+        
+        if (!input.hasData())
+        {
+            input.setNeeded();
+            return Status::NeedData;
+        }
+        
+        return Status::Ready;
     }
     
     void work() override
@@ -15937,107 +16684,424 @@ public:
         auto chunk = input.pull();
         if (chunk.empty())
         {
-            /// Finalize aggregation
+            /// Initiate aggregation finalization
             finalizeAggregation();
             return;
         }
         
-        /// Distribute chunk across threads
-        distributeChunkForAggregation(chunk);
+        total_input_rows += chunk.getNumRows();
+        bytes_processed += chunk.bytes();
+        
+        /// Distribute chunk across aggregation threads
+        distributeChunkForAggregation(std::move(chunk));
     }
     
 private:
-    void distributeChunkForAggregation(const Chunk & chunk)
+    void initializeAggregationInfrastructure()
     {
-        /// Partition chunk by aggregation key hash
-        auto partitioned_chunks = partitionChunkByHash(chunk, num_threads);
+        /// Create hash partitioner for data distribution
+        partitioner = std::make_unique<HashPartitioner>(
+            params.keys, num_threads, params.keys_size);
         
-        /// Submit aggregation tasks
+        /// Initialize per-thread aggregators and memory arenas
+        aggregators.reserve(num_threads);
+        thread_arenas.reserve(num_threads);
+        thread_stats.resize(num_threads);
+        
+        for (size_t i = 0; i < num_threads; ++i)
+        {
+            /// Create thread-specific memory arena
+            thread_arenas.emplace_back(64 * 1024 * 1024);  // 64MB per thread
+            
+            /// Create aggregator with thread-specific settings
+            auto aggregator_params = params;
+            aggregator_params.arena = &thread_arenas[i];
+            aggregator_params.thread_id = i;
+            
+            aggregators.emplace_back(std::make_unique<Aggregator>(aggregator_params));
+        }
+    }
+    
+    void distributeChunkForAggregation(Chunk chunk)
+    {
+        /// Partition chunk by aggregation key hash for optimal parallelization
+        auto partitioned_chunks = partitioner->partitionChunk(chunk, num_threads);
+        
+        /// Track partitioning statistics
+        size_t total_partitioned_rows = 0;
+        for (const auto & part_chunk : partitioned_chunks)
+            total_partitioned_rows += part_chunk.getNumRows();
+        
+        assert(total_partitioned_rows == chunk.getNumRows());
+        
+        /// Submit aggregation tasks to thread pool
         for (size_t i = 0; i < num_threads; ++i)
         {
             if (!partitioned_chunks[i].empty())
             {
-                thread_pool.submitTask([this, i, chunk = std::move(partitioned_chunks[i])]() {
-                    aggregators[i]->executeOnChunk(chunk);
+                thread_pool.submitTask([this, i, chunk = std::move(partitioned_chunks[i])]() mutable {
+                    processChunkInThread(i, std::move(chunk));
                 });
             }
         }
     }
     
+    void processChunkInThread(size_t thread_id, Chunk chunk)
+    {
+        auto & aggregator = *aggregators[thread_id];
+        auto & stats = thread_stats[thread_id];
+        
+        auto thread_start = std::chrono::steady_clock::now();
+        
+        /// Convert chunk to block for aggregator interface
+        auto block = createBlockFromChunk(chunk);
+        
+        /// Track pre-aggregation state
+        size_t initial_groups = aggregator.getNumberOfKeys();
+        
+        /// Perform aggregation on this chunk
+        bool overflow = false;
+        try {
+            aggregator.executeOnBlock(block, overflow);
+        } catch (const Exception & e) {
+            if (e.code() == ErrorCodes::TOO_MANY_ROWS) {
+                /// Handle aggregation overflow gracefully
+                handleAggregationOverflow(thread_id, block);
+            } else {
+                throw;
+            }
+        }
+        
+        /// Update thread statistics
+        auto thread_end = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
+            thread_end - thread_start).count();
+        
+        stats.update(block.rows(), aggregator.getNumberOfKeys() - initial_groups, 
+                    duration, aggregator.getTotalByteCount());
+        
+        /// Track global collision rate
+        hash_table_collisions += aggregator.getCollisionCount();
+    }
+    
     void finalizeAggregation()
     {
         /// Wait for all aggregation threads to complete
-        thread_pool.waitForAllTasks();
+        thread_pool.waitForCompletion();
         
-        /// Merge aggregation results
+        auto finalization_start = std::chrono::steady_clock::now();
+        
+        /// Merge aggregation results from all threads
         auto merged_result = mergeAggregationResults();
+        
+        auto finalization_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - finalization_start).count();
+        
+        /// Output performance statistics
+        logAggregationStatistics(finalization_duration);
         
         /// Output final result
         auto & output = getOutputs().front();
-        output.push(std::move(merged_result));
-    }
-    
-    std::vector<Chunk> partitionChunkByHash(const Chunk & chunk, size_t num_partitions)
-    {
-        std::vector<Chunk> partitions(num_partitions);
-        
-        /// Get key columns for hashing
-        auto key_columns = extractKeyColumns(chunk);
-        
-        /// Calculate hash for each row
-        std::vector<size_t> row_hashes(chunk.getNumRows());
-        for (size_t row = 0; row < chunk.getNumRows(); ++row)
+        if (!merged_result.empty())
         {
-            row_hashes[row] = calculateRowHash(key_columns, row) % num_partitions;
+            total_output_rows += merged_result.getNumRows();
+            output.push(std::move(merged_result));
         }
-        
-        /// Distribute rows to partitions
-        for (size_t partition = 0; partition < num_partitions; ++partition)
+        else
         {
-            std::vector<size_t> partition_rows;
-            for (size_t row = 0; row < chunk.getNumRows(); ++row)
-            {
-                if (row_hashes[row] == partition)
-                {
-                    partition_rows.push_back(row);
-                }
-            }
-            
-            if (!partition_rows.empty())
-            {
-                partitions[partition] = extractRowsFromChunk(chunk, partition_rows);
-            }
+            output.finish();
         }
-        
-        return partitions;
     }
     
     Chunk mergeAggregationResults()
     {
-        /// Merge results from all aggregators
-        std::vector<BlocksList> aggregated_blocks;
+        /// Create final aggregator for merging thread results
+        auto merge_arena = Arena(256 * 1024 * 1024);  // 256MB for final merge
+        auto merge_params = params;
+        merge_params.arena = &merge_arena;
         
-        for (auto & aggregator : aggregators)
+        auto final_aggregator = std::make_unique<Aggregator>(merge_params);
+        
+        /// Collect and merge results from all thread aggregators
+        std::vector<BlocksList> thread_results;
+        size_t total_intermediate_groups = 0;
+        
+        for (size_t i = 0; i < num_threads; ++i)
         {
-            auto blocks = aggregator->convertToBlocks();
-            aggregated_blocks.push_back(std::move(blocks));
+            auto & aggregator = *aggregators[i];
+            auto blocks = aggregator.convertToBlocks();
+            
+            for (const auto & block : blocks)
+                total_intermediate_groups += block.rows();
+            
+            thread_results.push_back(std::move(blocks));
         }
         
-        /// Merge blocks using final aggregation
-        auto final_aggregator = std::make_unique<Aggregator>(params);
-        
-        for (auto & blocks : aggregated_blocks)
+        /// Merge intermediate results
+        for (auto & blocks : thread_results)
         {
             for (auto & block : blocks)
             {
-                final_aggregator->mergeOnBlock(block);
+                if (block.rows() > 0)
+                {
+                    final_aggregator->mergeOnBlock(block);
+                }
             }
         }
         
+        /// Convert final aggregation to result blocks
         auto result_blocks = final_aggregator->convertToBlocks();
-        return mergeBlocksIntoChunk(result_blocks);
+        auto final_chunk = mergeBlocksIntoChunk(result_blocks);
+        
+        /// Log merge efficiency
+        double compression_ratio = total_intermediate_groups > 0 ? 
+            static_cast<double>(final_chunk.getNumRows()) / total_intermediate_groups : 1.0;
+        
+        LOG_DEBUG(&Poco::Logger::get("ParallelAggregatingTransform"), 
+                 "Aggregation merge: {} intermediate groups -> {} final groups (compression: {:.2f}x)",
+                 total_intermediate_groups, final_chunk.getNumRows(), 1.0 / compression_ratio);
+        
+        return final_chunk;
+    }
+    
+    void handleAggregationOverflow(size_t thread_id, const Block & block)
+    {
+        /// Implement two-level aggregation on overflow
+        auto & aggregator = *aggregators[thread_id];
+        
+        /// Convert to two-level hash table
+        aggregator.convertToTwoLevel();
+        
+        /// Retry aggregation with larger capacity
+        bool overflow = false;
+        aggregator.executeOnBlock(block, overflow);
+        
+        if (overflow)
+        {
+            /// Spill to disk if still overflowing
+            spillAggregationToDisk(thread_id, block);
+        }
+    }
+    
+    void spillAggregationToDisk(size_t thread_id, const Block & block)
+    {
+        /// Create temporary file for spilled data
+        auto temp_file = createTemporaryFile("aggregation_spill_" + std::to_string(thread_id));
+        
+        /// Write current aggregation state to disk
+        auto & aggregator = *aggregators[thread_id];
+        auto spilled_blocks = aggregator.convertToBlocks();
+        
+        for (const auto & spilled_block : spilled_blocks)
+        {
+            writeBlockToFile(temp_file, spilled_block);
+        }
+        
+        /// Reset aggregator and continue with current block
+        aggregator.reset();
+        bool overflow = false;
+        aggregator.executeOnBlock(block, overflow);
+        
+        /// Mark this thread as having spilled data
+        thread_stats[thread_id].has_spilled_data = true;
+        thread_stats[thread_id].spill_file = temp_file;
+    }
+    
+    void logAggregationStatistics(size_t finalization_duration_ms)
+    {
+        auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+        
+        size_t total_hash_table_bytes = 0;
+        size_t total_unique_groups = 0;
+        
+        for (const auto & aggregator : aggregators)
+        {
+            total_hash_table_bytes += aggregator->getTotalByteCount();
+            total_unique_groups += aggregator->getNumberOfKeys();
+        }
+        
+        double throughput_mb_per_sec = bytes_processed.load() / 1024.0 / 1024.0 / 
+                                      (total_duration / 1000.0);
+        
+        double aggregation_efficiency = total_input_rows.load() > 0 ?
+            static_cast<double>(total_output_rows.load()) / total_input_rows.load() : 0.0;
+        
+        LOG_INFO(&Poco::Logger::get("ParallelAggregatingTransform"),
+                "Aggregation completed: {} input rows -> {} output rows ({:.2f}% compression)\n"
+                "Performance: {:.1f} MB/s throughput, {} ms total ({} ms finalization)\n"
+                "Hash tables: {} MB total, {} unique groups, {} collisions\n"
+                "Threads: {} parallel aggregators, {:.1f} MB/thread average",
+                total_input_rows.load(), total_output_rows.load(), (1.0 - aggregation_efficiency) * 100,
+                throughput_mb_per_sec, total_duration, finalization_duration_ms,
+                total_hash_table_bytes / 1024 / 1024, total_unique_groups, hash_table_collisions.load(),
+                num_threads, (total_hash_table_bytes / 1024.0 / 1024.0) / num_threads);
+    }
+    
+public:
+    /// Performance analytics and monitoring
+    struct AggregationStatistics {
+        size_t input_rows = 0;
+        size_t output_rows = 0;
+        size_t unique_groups = 0;
+        size_t hash_table_size_bytes = 0;
+        size_t collision_count = 0;
+        double compression_ratio = 0.0;
+        double throughput_mb_per_sec = 0.0;
+        size_t processing_duration_ms = 0;
+        size_t finalization_duration_ms = 0;
+        
+        String getEfficiencyReport() const {
+            return fmt::format(
+                "Aggregation Efficiency: {:.1f}% compression ({}/{} rows), "
+                "{:.1f} MB/s, {} groups, {:.1f} MB hash tables",
+                (1.0 - compression_ratio) * 100, output_rows, input_rows,
+                throughput_mb_per_sec, unique_groups, hash_table_size_bytes / 1024.0 / 1024.0
+            );
+        }
+    };
+    
+    AggregationStatistics getStatistics() const
+    {
+        AggregationStatistics stats;
+        
+        stats.input_rows = total_input_rows.load();
+        stats.output_rows = total_output_rows.load();
+        stats.collision_count = hash_table_collisions.load();
+        
+        for (const auto & aggregator : aggregators)
+        {
+            stats.unique_groups += aggregator->getNumberOfKeys();
+            stats.hash_table_size_bytes += aggregator->getTotalByteCount();
+        }
+        
+        if (stats.input_rows > 0)
+            stats.compression_ratio = static_cast<double>(stats.output_rows) / stats.input_rows;
+        
+        auto current_time = std::chrono::steady_clock::now();
+        auto duration_sec = std::chrono::duration_cast<std::chrono::seconds>(
+            current_time - start_time).count();
+        
+        if (duration_sec > 0)
+            stats.throughput_mb_per_sec = bytes_processed.load() / 1024.0 / 1024.0 / duration_sec;
+        
+        return stats;
     }
 };
+
+/// Hash-based data partitioner for optimal parallel distribution
+class HashPartitioner
+{
+private:
+    Names key_columns;                                          // Columns to hash for partitioning
+    size_t num_partitions;                                      // Target partition count
+    SipHashKey hash_key;                                        // Consistent hashing key
+    
+public:
+    HashPartitioner(const Names & keys, size_t partitions, const SipHashKey & key)
+        : key_columns(keys), num_partitions(partitions), hash_key(key) {}
+    
+    std::vector<Chunk> partitionChunk(const Chunk & input_chunk, size_t partitions)
+    {
+        std::vector<Chunk> result_partitions(partitions);
+        
+        if (input_chunk.empty())
+            return result_partitions;
+        
+        /// Extract key columns for hashing
+        auto key_column_indices = findKeyColumnIndices(input_chunk);
+        
+        /// Calculate partition for each row
+        std::vector<size_t> row_partitions(input_chunk.getNumRows());
+        for (size_t row = 0; row < input_chunk.getNumRows(); ++row)
+        {
+            auto hash = calculateRowHash(input_chunk, key_column_indices, row);
+            row_partitions[row] = hash % partitions;
+        }
+        
+        /// Distribute rows to partitions
+        for (size_t partition = 0; partition < partitions; ++partition)
+        {
+            std::vector<size_t> partition_rows;
+            
+            for (size_t row = 0; row < input_chunk.getNumRows(); ++row)
+            {
+                if (row_partitions[row] == partition)
+                    partition_rows.push_back(row);
+            }
+            
+            if (!partition_rows.empty())
+            {
+                result_partitions[partition] = extractRowsFromChunk(input_chunk, partition_rows);
+            }
+        }
+        
+        return result_partitions;
+    }
+    
+private:
+    UInt64 calculateRowHash(const Chunk & chunk, const std::vector<size_t> & key_indices, size_t row)
+    {
+        SipHash hash(hash_key);
+        
+        for (size_t key_idx : key_indices)
+        {
+            const auto & column = chunk.getColumns()[key_idx];
+            column->updateHashWithValue(row, hash);
+        }
+        
+        return hash.get64();
+    }
+};
+```
+
+**Real-World Parallel Aggregation Examples:**
+```cpp
+// Example: Adaptive parallel aggregation based on data characteristics
+struct ParallelAggregationPatterns {
+    
+    // Low cardinality aggregation: Use fewer threads to reduce merge overhead
+    ProcessorPtr createLowCardinalityAggregation(const Block & header, size_t estimated_groups) {
+        size_t optimal_threads = estimated_groups < 10000 ? 
+            std::min(4UL, std::thread::hardware_concurrency()) :  // Low cardinality
+            std::thread::hardware_concurrency();                  // High cardinality
+        
+        AggregatingParams params;
+        params.keys = Names{"category", "region"};
+        params.aggregates = {makeAggregateFunction("sum", {makeDataType<UInt64>()})};
+        
+        return std::make_shared<ParallelAggregatingTransform>(header, params, optimal_threads);
+    }
+    
+    // Memory-constrained aggregation: Limit memory per thread
+    ProcessorPtr createMemoryConstrainedAggregation(size_t available_memory_bytes) {
+        size_t memory_per_thread = 256 * 1024 * 1024;  // 256MB base
+        size_t max_threads = available_memory_bytes / memory_per_thread;
+        size_t num_threads = std::min(max_threads, std::thread::hardware_concurrency());
+        
+        AggregatingParams params;
+        params.max_bytes_before_external_group_by = memory_per_thread;
+        params.spill_to_disk_enabled = true;
+        
+        return std::make_shared<ParallelAggregatingTransform>(
+            Block{}, params, std::max(1UL, num_threads));
+    }
+    
+    // High-throughput streaming aggregation
+    ProcessorPtr createStreamingAggregation(bool real_time_requirements) {
+        AggregatingParams params;
+        params.compile_aggregate_expressions = true;    // JIT compilation
+        params.min_hit_rate_to_use_consecutive_keys_optimization = 0.1;
+        
+        size_t num_threads = real_time_requirements ? 
+            std::thread::hardware_concurrency() / 2 :  // Reserve cores for other work
+            std::thread::hardware_concurrency();       // Use all available cores
+        
+        return std::make_shared<ParallelAggregatingTransform>(
+            Block{}, params, num_threads);
+    }
+};
+```
 ```
 
 ### NUMA Awareness and Memory Locality
